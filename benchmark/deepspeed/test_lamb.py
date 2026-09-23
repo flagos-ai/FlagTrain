@@ -15,9 +15,9 @@
 import pytest
 import torch
 
-import flag_gems
+import flag_train
 
-from . import base
+from .. import base
 
 # One-dimensional parameter tensors of realistic optimizer sizes. LAMB (like the
 # other fused optimizers) operates on a flattened parameter array, so the element
@@ -125,8 +125,8 @@ def test_lamb_perf():
     if _deepspeed_lamb is None:
         pytest.skip(_BASELINE_UNAVAILABLE_MSG)
 
-    def gems_op(p, p_copy, m, v, g):
-        return flag_gems.lamb(
+    def train_op(p, p_copy, m, v, g):
+        return flag_train.lamb(
             p,
             p_copy,
             m,
@@ -152,5 +152,5 @@ def test_lamb_perf():
         # fused_lamb only supports float32 parameters/state.
         dtypes=[torch.float32],
     )
-    bench.set_gems(gems_op)
+    bench.set_train(train_op)
     bench.run()

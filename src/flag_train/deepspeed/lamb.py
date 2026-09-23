@@ -18,9 +18,9 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
-from flag_gems.utils import triton_lang_extension as tle
+from flag_train.runtime import torch_device_fn
+from flag_train.utils import libentry
+from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +217,7 @@ def lamb(
     Returns:
         Tensor: the per-layer trust ratio as a one-element fp32 tensor.
     """
-    logger.debug("GEMS LAMB")
+    logger.debug("TRAIN LAMB")
 
     assert p.dtype == torch.float32, "lamb only supports float32 parameters"
     assert p.is_cuda, "lamb only supports CUDA tensors"

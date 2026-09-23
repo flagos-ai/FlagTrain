@@ -28,6 +28,11 @@ dist/
 .coverage.*
 htmlcov/
 
+# Test harness reports
+/*.json
+tests/*.json
+benchmark/*.json
+
 # Local training artifacts
 checkpoints/
 runs/

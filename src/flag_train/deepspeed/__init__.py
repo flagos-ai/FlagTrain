@@ -1,6 +1,6 @@
-"""Namespace reserved for DeepSpeed-related implementations; currently empty."""
+"""DeepSpeed-related implementations."""
 
-from flag_gems.ops.lamb import lamb
+from .lamb import lamb
 
 __all__ = [
     "lamb",
