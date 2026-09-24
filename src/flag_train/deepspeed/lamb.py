@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+import flag_train
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
@@ -220,7 +221,13 @@ def lamb(
     logger.debug("TRAIN LAMB")
 
     assert p.dtype == torch.float32, "lamb only supports float32 parameters"
-    assert p.is_cuda, "lamb only supports CUDA tensors"
+    # Accept whatever the active backend calls its device -- 'cuda' on
+    # nvidia/hygon, 'npu' on ascend -- rather than hard-coding CUDA. A CPU
+    # tensor still has to be rejected: the kernels would be launched against
+    # memory the accelerator cannot see.
+    assert (
+        p.device.type == flag_train.device
+    ), f"lamb only supports {flag_train.device} tensors"
 
     n = p.numel()
     assert m.numel() == n and v.numel() == n and g.numel() == n
