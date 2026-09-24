@@ -13,16 +13,25 @@
 # limitations under the License.
 """Correctness tests for the LAMB operator.
 
-The reference is DeepSpeed's ``fused_lamb`` -- the operator this implementation
-ports -- rather than a re-derivation of its formula in PyTorch. That keeps the
-comparison anchored to the actual reference implementation and its version
-(``_DEEPSPEED_VERSION``), as tests/deepspeed/README.md requires, and it catches
-the documented behaviours a hand-written formula has to be told about one by one
-(``mode``, ``bias_correction``, the zero-norm trust-ratio fallback).
+Two oracles, because they fail differently:
 
-The reference only exists on CUDA hosts with the ``deepspeed`` package
-installed, so the module skips as a whole where it is unavailable.
+* ``lamb_ref`` -- a plain-torch composition of the same contract. It is the
+  primary check and runs on any device, so the operator is testable off NVIDIA.
+* DeepSpeed's ``fused_lamb`` -- the operator this implementation ports. It is an
+  independent implementation and its version is recorded in
+  ``_DEEPSPEED_VERSION``, as tests/deepspeed/README.md asks for, but it needs the
+  ``deepspeed`` package, and on a backend in ``_DEEPSPEED_BASELINE_VENDORS`` below
+  it is *required* -- if it will not load there the module raises rather than
+  losing the check quietly. On other backends it is an additional check that is
+  skipped.
+
+Checking both is not redundant: ``lamb_ref`` is the same arithmetic written from
+the same reading of the kernel, so a shared misreading of the contract would
+survive it. DeepSpeed's operator is the only oracle that can disagree with that
+reading.
 """
+
+import math
 
 import pytest
 import torch
@@ -42,55 +51,139 @@ _EPS = 1e-8
 _GRAD_SCALE = 1.0
 _DECAY = 0.01
 
+# ---------------------------------------------------------------------------
+# Reference implementation
+#
+# Exists so the operator can be checked against a plain-torch composition of the
+# same contract on any device. The DeepSpeed oracle (``fused_lamb``) needs the
+# ``deepspeed`` package and a CUDA device, so without a torch reference the
+# operator would be untestable off NVIDIA.
+# ---------------------------------------------------------------------------
+
+
+def lamb_ref(
+    p,
+    p_copy,
+    m,
+    v,
+    g,
+    lr,
+    beta1,
+    beta2,
+    max_coeff,
+    min_coeff,
+    eps,
+    grad_scale,
+    step,
+    mode,
+    bias_correction,
+    decay,
+):
+    """Reference for the LAMB operator, composed from plain torch ops.
+
+    Steps ``p``/``m``/``v`` in place and returns the trust ratio, matching the
+    operator's contract including the order of operations, since the two are
+    compared bit-for-bit-ish rather than through a fuzzy formula.
+    """
+    p_old = p.clone()
+    scaled_grad = g / grad_scale
+    m_new = beta1 * m + (1 - beta1) * scaled_grad
+    v_new = beta2 * v + (1 - beta2) * scaled_grad * scaled_grad
+
+    if mode == 0:
+        denom = torch.sqrt(v_new + eps)
+    else:
+        denom = torch.sqrt(v_new) + eps
+    update = m_new / denom + decay * p_old
+
+    # The trust ratio is taken from the *incoming* weights and the update built
+    # from them, which is why ``p_old`` is kept rather than reusing ``p``.
+    w_norm = torch.sqrt(torch.sum(p_old * p_old))
+    u_norm = torch.sqrt(torch.sum(update * update))
+    # Either norm being zero leaves the ratio at 1.0 rather than clamped, matching
+    # lamb_cuda_kernel_part3.
+    if w_norm.item() == 0.0 or u_norm.item() == 0.0:
+        coeff = torch.ones((), dtype=p.dtype, device=p.device)
+    else:
+        coeff = torch.clamp(w_norm / u_norm, min_coeff, max_coeff)
+
+    if bias_correction == 1:
+        step_size = lr * math.sqrt(1 - beta2**step) / (1 - beta1**step)
+    else:
+        step_size = lr
+
+    p_new = p_old - step_size * coeff * update
+    p.copy_(p_new)
+    m.copy_(m_new)
+    v.copy_(v_new)
+    if p_copy.numel() > 0:
+        p_copy.copy_(p_new)
+
+    return coeff.reshape(1).to(torch.float32)
+
 
 _DEEPSPEED_UNAVAILABLE_MSG = (
-    "DeepSpeed's fused_lamb reference is unavailable; install the deepspeed package "
-    "(pip install deepspeed) to run the LAMB correctness tests."
+    "DeepSpeed's fused_lamb reference is unavailable; install the deepspeed "
+    "package on a CUDA host to run this check."
 )
 
 
-def _load_deepspeed_lamb():
-    """Return ``(op, version)`` for DeepSpeed's fused ``lamb``, or ``(None, None)``.
+# Backends whose reference is DeepSpeed. fused_lamb ships as a CUDA op builder, so
+# only a backend that can compile and execute one can host it. On these the
+# reference is not optional -- a missing one is an environment fault, and skipping
+# quietly would thin the suite without saying so.
+_DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
 
-    The operator comes from the installed ``deepspeed`` package; ``FusedLambBuilder``
-    JIT-compiles the CUDA source that ships inside it on first use, then reuses the
-    build cached under ``torch_extensions``. ``None`` (rather than ``pytest.skip``)
-    is returned on failure because this is called at module import time, where a
-    skip aborts collection of the whole module.
+
+def _load_deepspeed_lamb():
+    """``(op, version)`` for DeepSpeed's fused_lamb, or ``(None, None)``.
+
+    ``FusedLambBuilder`` JIT-compiles the CUDA source shipped inside the
+    ``deepspeed`` package, then reuses the build cached under ``torch_extensions``.
     """
+    if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
+        return None, None
+
     try:
         import deepspeed
         from deepspeed.ops.op_builder import FusedLambBuilder
 
         return FusedLambBuilder().load().lamb, deepspeed.__version__
-    except Exception:
-        return None, None
+    except Exception as exc:
+        raise RuntimeError(
+            f"{flag_train.vendor_name!r} must use DeepSpeed's fused_lamb as its "
+            f"reference, but it could not be loaded: {exc!r}. Build deepspeed, or "
+            f"drop the backend from _DEEPSPEED_BASELINE_VENDORS."
+        ) from exc
 
 
-# Resolve the reference implementation once, at module import time.
+# Resolved once, at module import time.
 _deepspeed_lamb, _DEEPSPEED_VERSION = _load_deepspeed_lamb()
 
-# Only the tests that read the reference need it; the p_copy contract below is
-# checked against the operator's own output and runs without DeepSpeed.
+# The torch reference is always available, so only the DeepSpeed checks skip.
 requires_deepspeed_reference = pytest.mark.skipif(
     _deepspeed_lamb is None, reason=_DEEPSPEED_UNAVAILABLE_MSG
 )
 
 
 def _no_p_copy(dtype):
-    """The empty placeholder that tells both operators to skip the weight copy."""
+    """The empty placeholder that tells every implementation to skip the copy."""
     return torch.empty((0,), dtype=dtype, device=flag_train.device)
 
 
-def _deepspeed_step(param, exp_avg, exp_avg_sq, grad, step, mode, bias_correction):
-    """One in-place step of the reference implementation.
+def _step(
+    op, param, exp_avg, exp_avg_sq, grad, step, mode, bias_correction, p_copy=None
+):
+    """Run one in-place step through ``op`` with the shared hyper-parameters.
 
-    ``fused_lamb`` updates ``param``/``exp_avg``/``exp_avg_sq`` in place and
-    returns the layer's trust ratio, so callers pass tensors they own.
+    Every implementation updates its tensors in place and returns the layer's
+    trust ratio, so callers pass tensors they own.
     """
-    return _deepspeed_lamb(
+    if p_copy is None:
+        p_copy = _no_p_copy(param.dtype)
+    return op(
         param,
-        _no_p_copy(param.dtype),
+        p_copy,
         exp_avg,
         exp_avg_sq,
         grad,
@@ -108,35 +201,39 @@ def _deepspeed_step(param, exp_avg, exp_avg_sq, grad, step, mode, bias_correctio
     )
 
 
-def _train_step(param, exp_avg, exp_avg_sq, grad, step, mode, bias_correction):
-    """The same step through the operator under test."""
-    return flag_train.lamb(
-        param,
-        _no_p_copy(param.dtype),
-        exp_avg,
-        exp_avg_sq,
-        grad,
-        _LR,
-        _BETA1,
-        _BETA2,
-        _MAX_COEFF,
-        _MIN_COEFF,
-        _EPS,
-        _GRAD_SCALE,
-        step,
-        mode,
-        int(bias_correction),
-        _DECAY,
+def _assert_step_matches(
+    train_coeff,
+    train_p,
+    train_m,
+    train_v,
+    other_coeff,
+    other_p,
+    other_m,
+    other_v,
+    dtype,
+):
+    """The trust ratio and the three updated tensors must all agree."""
+    utils.train_assert_close(
+        utils.to_reference(train_coeff), utils.to_reference(other_coeff), dtype
+    )
+    utils.train_assert_close(
+        utils.to_reference(train_p), utils.to_reference(other_p), dtype
+    )
+    utils.train_assert_close(
+        utils.to_reference(train_m), utils.to_reference(other_m), dtype
+    )
+    utils.train_assert_close(
+        utils.to_reference(train_v), utils.to_reference(other_v), dtype
     )
 
 
 @pytest.mark.lamb
-@requires_deepspeed_reference
 @pytest.mark.parametrize("shape", [(1024,), (4096,), (16384,)])
 @pytest.mark.parametrize("mode", [0, 1])
 @pytest.mark.parametrize("bias_correction", [0, 1])
 def test_lamb(shape, mode, bias_correction):
-    """A single LAMB step must match DeepSpeed's fused_lamb."""
+    """A single LAMB step must match the torch reference, and DeepSpeed's
+    fused_lamb when it is available."""
     dtype = torch.float32
 
     p = torch.randn(shape, dtype=dtype, device=flag_train.device)
@@ -144,22 +241,20 @@ def test_lamb(shape, mode, bias_correction):
     m = torch.zeros(shape, dtype=dtype, device=flag_train.device)
     v = torch.zeros(shape, dtype=dtype, device=flag_train.device)
 
-    # The reference steps in place, so it runs on its own copies.
-    ref_p, ref_m, ref_v = p.clone(), m.clone(), v.clone()
-    ref_coeff = _deepspeed_step(ref_p, ref_m, ref_v, g, 1, mode, bias_correction)
+    # Every implementation steps in place, so each runs on its own copies.
+    train = [p.clone(), m.clone(), v.clone()]
+    train_coeff = _step(flag_train.lamb, *train, g, 1, mode, bias_correction)
 
-    train_coeff = _train_step(p, m, v, g, 1, mode, bias_correction)
+    torch_ref = [p.clone(), m.clone(), v.clone()]
+    torch_coeff = _step(lamb_ref, *torch_ref, g, 1, mode, bias_correction)
+    _assert_step_matches(train_coeff, *train, torch_coeff, *torch_ref, dtype)
 
-    # The trust ratio reported by the operator must match the reference.
-    utils.train_assert_close(
-        utils.to_reference(train_coeff),
-        utils.to_reference(ref_coeff),
-        dtype,
-    )
-    # The updated parameters and moments must match the reference.
-    utils.train_assert_close(utils.to_reference(p), utils.to_reference(ref_p), dtype)
-    utils.train_assert_close(utils.to_reference(m), utils.to_reference(ref_m), dtype)
-    utils.train_assert_close(utils.to_reference(v), utils.to_reference(ref_v), dtype)
+    if _deepspeed_lamb is not None:
+        deepspeed = [p.clone(), m.clone(), v.clone()]
+        deepspeed_coeff = _step(
+            _deepspeed_lamb, *deepspeed, g, 1, mode, bias_correction
+        )
+        _assert_step_matches(train_coeff, *train, deepspeed_coeff, *deepspeed, dtype)
 
 
 @pytest.mark.lamb
@@ -167,11 +262,10 @@ def test_lamb(shape, mode, bias_correction):
 def test_lamb_p_copy(shape):
     """The optional output copy must mirror the updated parameter.
 
-    This is the one case here with no DeepSpeed oracle: fused_lamb_cuda_kernel.cu
-    passes NULL for p_copy on fp32 operands ("don't output p_copy for fp32, it's
-    wasted write"), so the reference leaves the copy untouched at every precision
-    these tests run at -- comparing against it would compare against garbage. The
-    contract left to check is that the copy tracks the parameter it copies.
+    DeepSpeed cannot serve as the oracle here: fused_lamb_cuda_kernel.cu passes
+    NULL for p_copy on fp32 operands ("don't output p_copy for fp32, it's wasted
+    write"), so its copy is never written at any precision these tests run at.
+    The torch reference does write it, so it is the oracle.
     """
     dtype = torch.float32
 
@@ -179,38 +273,28 @@ def test_lamb_p_copy(shape):
     g = torch.randn(shape, dtype=dtype, device=flag_train.device)
     m = torch.zeros(shape, dtype=dtype, device=flag_train.device)
     v = torch.zeros(shape, dtype=dtype, device=flag_train.device)
+
+    torch_p, torch_m, torch_v = p.clone(), m.clone(), v.clone()
+    torch_copy = torch.empty(shape, dtype=dtype, device=flag_train.device)
+    _step(lamb_ref, torch_p, torch_m, torch_v, g, 1, 1, 1, p_copy=torch_copy)
+
     p_copy = torch.empty(shape, dtype=dtype, device=flag_train.device)
+    _step(flag_train.lamb, p, m, v, g, 1, 1, 1, p_copy=p_copy)
 
-    flag_train.lamb(
-        p,
-        p_copy,
-        m,
-        v,
-        g,
-        _LR,
-        _BETA1,
-        _BETA2,
-        _MAX_COEFF,
-        _MIN_COEFF,
-        _EPS,
-        _GRAD_SCALE,
-        1,
-        1,
-        1,
-        _DECAY,
+    utils.train_assert_close(
+        utils.to_reference(p_copy), utils.to_reference(torch_copy), dtype
     )
-
+    # The copy must also mirror the parameter the same call produced.
     utils.train_assert_close(utils.to_reference(p_copy), utils.to_reference(p), dtype)
 
 
 @pytest.mark.lamb
-@requires_deepspeed_reference
 @pytest.mark.parametrize("mode", [0, 1], ids=["eps_inside_sqrt", "eps_outside_sqrt"])
 @pytest.mark.parametrize(
     "bias_correction", [True, False], ids=["bias_corr", "no_bias_corr"]
 )
 def test_lamb_matches_reference(mode, bias_correction):
-    """Run several LAMB steps and compare against DeepSpeed's fused_lamb.
+    """Run several LAMB steps and compare against the torch reference.
 
     Mirrors DeepSpeed's ``test_fused_adam_matches_reference``: multiple parameter
     tensors, fresh gradients each step, accumulating first/second moments, with
@@ -232,7 +316,8 @@ def test_lamb_matches_reference(mode, bias_correction):
         for i in range(len(train_params)):
             grad = torch.randn_like(train_params[i])
 
-            _deepspeed_step(
+            _step(
+                lamb_ref,
                 ref_params[i],
                 ref_m[i],
                 ref_v[i],
@@ -241,7 +326,8 @@ def test_lamb_matches_reference(mode, bias_correction):
                 mode,
                 bias_correction,
             )
-            _train_step(
+            _step(
+                flag_train.lamb,
                 train_params[i],
                 train_m[i],
                 train_v[i],
@@ -265,3 +351,25 @@ def test_lamb_matches_reference(mode, bias_correction):
             utils.to_reference(ref_exp_avg_sq),
             dtype,
         )
+
+
+@pytest.mark.lamb
+@requires_deepspeed_reference
+@pytest.mark.parametrize("mode", [0, 1], ids=["eps_inside_sqrt", "eps_outside_sqrt"])
+@pytest.mark.parametrize("shape", [(1024,), (16384,)])
+def test_matches_deepspeed_oracle(mode, shape):
+    """Pin the DeepSpeed oracle explicitly, so a run that quietly stopped
+    reaching it (deepspeed missing) is visible rather than silently thinner."""
+    dtype = torch.float32
+
+    p = torch.randn(shape, dtype=dtype, device=flag_train.device)
+    g = torch.randn(shape, dtype=dtype, device=flag_train.device)
+    m = torch.zeros(shape, dtype=dtype, device=flag_train.device)
+    v = torch.zeros(shape, dtype=dtype, device=flag_train.device)
+
+    train = [p.clone(), m.clone(), v.clone()]
+    train_coeff = _step(flag_train.lamb, *train, g, 1, mode, 1)
+
+    deepspeed = [p.clone(), m.clone(), v.clone()]
+    deepspeed_coeff = _step(_deepspeed_lamb, *deepspeed, g, 1, mode, 1)
+    _assert_step_matches(train_coeff, *train, deepspeed_coeff, *deepspeed, dtype)
