@@ -1,1 +1,7 @@
-"""Namespace reserved for DeepSpeed-related implementations; currently empty."""
+"""DeepSpeed-related implementations."""
+
+from .lamb import lamb
+
+__all__ = [
+    "lamb",
+]
