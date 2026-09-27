@@ -11,6 +11,7 @@ from .mixed_moe_gemm import mixed_moe_gemm
 from .packbits import packbits
 from .unpackbits import unpackbits
 from .wf6af16_linear import wf6af16_linear
+from .multi_tensor_adam import multi_tensor_adam
 
 __all__ = [
     "blocked_flash",
@@ -21,6 +22,7 @@ __all__ = [
     "packbits",
     "unpackbits",
     "wf6af16_linear",
+    "multi_tensor_adam",
 ]
 
 SpecOpRegistrar(registry=globals(), vendor=runtime_device.vendor_name).apply()
