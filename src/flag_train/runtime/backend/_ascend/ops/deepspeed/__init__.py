@@ -20,5 +20,6 @@ which is what ``SpecOpRegistrar`` registers.
 """
 
 from .blocked_flash import blocked_flash
+from .evoformer_attn import evoformer_attn
 
-__all__ = ["blocked_flash"]
+__all__ = ["blocked_flash", "evoformer_attn"]
