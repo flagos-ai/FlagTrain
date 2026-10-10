@@ -20,9 +20,11 @@ which is what ``SpecOpRegistrar`` registers.
 """
 
 from .blocked_flash import blocked_flash
+from .evoformer_attn import evoformer_attn
 from .packbits import packbits
 
 __all__ = [
     "blocked_flash",
+    "evoformer_attn",
     "packbits",
 ]
