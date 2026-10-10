@@ -1,13 +1,14 @@
 # gpu-runner image for FlagTrain CI — the nvidia-cuda133 backend (H20, CUDA 13.3).
 #
-# Unlike flaggems-runner.dockerfile (pure-CPU lint/registry pre-checks), the
-# suites under tests/deepspeed/ execute real Triton kernels and compare them
-# against DeepSpeed's own CUDA ops, so this image starts from the vendor base
-# image and is only useful on a host with an NVIDIA device passed through.
+# Unlike FlagGems' CPU runner image (`.github/docker/cpu-runner.Dockerfile`,
+# pure-CPU lint/registry pre-checks), the suites under tests/deepspeed/ execute
+# real Triton kernels and compare them against DeepSpeed's own CUDA ops, so
+# this image starts from the vendor base image and is only useful on a host
+# with an NVIDIA device passed through.
 #
-# This reproduces the container recipe verified in ci.md, with the versions
-# backends.yaml pins, and bakes it in so the workflows install NOTHING at run
-# time:
+# This is the container recipe that was verified by hand on the H20 host
+# before this image existed, with the versions backends.yaml pins, baked in so
+# the workflows install NOTHING at run time:
 #
 #   - nvcc from cuda-toolkit-13-3. The base is the NGC *runtime* tag: CUDA
 #     runtime libraries, no compiler. Both DeepSpeed ops the tests import
@@ -47,18 +48,20 @@
 #
 # Package indexes: pypi.org is not reliably reachable from the networks these
 # images are built and run on (connections to it time out), so the aliyun
-# mirror plus the FlagOS nexus are the only sources. torch's +cu130 build, flagtree and flagcx exist
-# only on the nexus. The mirror is exported as ENV too, so pip behaves the
-# same way at run time.
+# mirror plus the FlagOS nexus are the only sources. torch's +cu130 build,
+# flagtree and flagcx exist only on the nexus. The mirror is exported as ENV
+# too, so pip behaves the same way at run time.
 #
-# Sources of truth: ci.md (the flow this file reproduces step for step) and
-# backends.yaml (the backend's version pins). Rebuild this image when either
-# moves. One known drift: backends.yaml pins deepspeed-kernels==0.0.1, which
+# Sources of truth: backends.yaml (the backend's version pins). The install
+# order below — torch, drop upstream triton, flagtree, flagcx, then DeepSpeed —
+# is the one that recipe settled on; keep the order if the pins move.
+# Rebuild this image when the pins move.
+# One known drift: backends.yaml pins deepspeed-kernels==0.0.1, which
 # does not resolve — PyPI has only 0.0.1.dev* wheels — so it is installed
 # unpinned here (see the DeepSpeed section).
 #
 # Build — there is no COPY and the context is unused, so any directory works:
-#   docker build -f flagtrain-runner.dockerfile -t <registry>/flagtrain-runner:cuda13.3.0 .
+#   docker build -f .github/docker/gpu-runner.Dockerfile -t <registry>/flagtrain-gpu-runner:cuda13.3.0 .
 
 FROM harbor.baai.ac.cn/flagos-base/flagos-base-nvidia-cuda13.3:2.2.0
 
@@ -89,9 +92,9 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
 # --- compiler: nvcc for the DeepSpeed JIT builds ---------------------------
 # cuda-toolkit-13-3, not the unversioned cuda-toolkit: the latter tracks the
 # newest 13.x NVIDIA publishes and would drift away from this image's 13.3
-# runtime libraries and torch's cu130 build. The full toolkit is what ci.md
-# verified; if the image size becomes a problem, the pieces the JIT builds
-# actually need are cuda-nvcc-13-3 + cuda-cudart-dev-13-3.
+# runtime libraries and torch's cu130 build. The full toolkit is what the
+# host-verified recipe used; if the image size becomes a problem, the pieces
+# the JIT builds actually need are cuda-nvcc-13-3 + cuda-cudart-dev-13-3.
 # python3.12-venv: the base ships the interpreter, but neither venv nor pip.
 RUN set -eux; \
     apt-get update; \
@@ -130,7 +133,7 @@ RUN set -eux; \
 # nexus (0.7.0+tileir3.6, 0.7.0+metax3.6, ...) and pip picks one of those
 # arbitrary variants; `===0.7.0` is the exact-string match that selects the
 # plain CUDA wheel.
-# The removal loop is ci.md's "repeat until fully uninstalled": one uninstall
+# The removal loop repeats until nothing is left: one uninstall
 # can leave a dist-info behind, and both distribution names are covered
 # because upstream ships as `triton` while NVIDIA's build of it ships as
 # `pytorch-triton`. Failing the build if any survives is deliberate — a
@@ -151,7 +154,7 @@ RUN set -eux; \
         "flagtree===0.7.0"
 
 # --- flagcx ----------------------------------------------------------------
-# Part of the environment ci.md verified end to end. Nothing in FlagTrain
+# Part of the environment the host-verified recipe installed. Nothing in FlagTrain
 # imports it yet (no test or source file names it), so it is here to keep this
 # image equal to the verified recipe; drop the line if that stops being worth
 # the size.
@@ -215,7 +218,7 @@ print("dskernels ", dskernels.library_path())'; \
 # (TRITON_CACHE_DIR) default under $HOME, which differs per job inside a
 # runner container and dies with it. Pinning both to fixed world-writable
 # paths lets a job that mounts a host directory there keep them across jobs on
-# that node — the same trick as PRE_COMMIT_HOME in flaggems-runner.dockerfile.
+# that node — the same trick as PRE_COMMIT_HOME in FlagGems' cpu-runner image.
 # A mounted cache outlives the code that filled it: TORCH_EXTENSIONS_DIR is
 # keyed by op name and nvcc command line, not by DeepSpeed version, so clear
 # it when deepspeed is bumped. Without a mount these are ordinary
@@ -227,9 +230,9 @@ ENV TORCH_EXTENSIONS_DIR=/opt/torch-extensions \
     TRITON_CACHE_DIR=/opt/triton-cache
 
 # --- runtime environment ---------------------------------------------------
-# ci.md exports the CUDA 13.3 compat directory ahead of the library path. If
-# the base image carries the userspace driver shims there, this is what lets
-# the image run on hosts whose driver predates 13.3; an absent directory in
-# LD_LIBRARY_PATH costs nothing. The base image already puts
-# /usr/local/cuda/bin on PATH.
+# The CUDA 13.3 compat directory goes ahead of the library path (the recipe
+# this image reproduces did the same). If the base image carries the userspace
+# driver shims there, this is what lets the image run on hosts whose driver
+# predates 13.3; an absent directory in LD_LIBRARY_PATH costs nothing. The
+# base image already puts /usr/local/cuda/bin on PATH.
 ENV LD_LIBRARY_PATH=/usr/local/cuda-13.3/compat:${LD_LIBRARY_PATH}
