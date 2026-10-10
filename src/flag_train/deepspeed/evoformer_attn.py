@@ -293,7 +293,13 @@ def _device_capability():
         return None
 
 
-def _check_launch_arguments(q, k, v, bias1, bias2):
+# The per-dimension grid limit. A launch's z axis cannot be wider than this on
+# any backend's driver, which is what makes it the flattened (batch, pair)
+# dimension's ceiling for a kernel that puts that dimension in the grid.
+_GRID_Z_MAX = 65535
+
+
+def _check_launch_arguments(q, k, v, bias1, bias2, max_slices=_GRID_Z_MAX):
     """Reject inputs the kernels cannot serve.
 
     Mirrors the assertions upstream makes around ``_attention`` -- in it and in
@@ -312,6 +318,12 @@ def _check_launch_arguments(q, k, v, bias1, bias2):
       because its kernel loads 128-bit vectors. This port's Triton loads do not
       need that, but it *does* require contiguous operands (see the docstring of
       ``evoformer_attn``).
+
+    ``max_slices`` is the one argument here that is a property of the *kernel*
+    rather than of the inputs. A kernel that puts the flattened (batch, pair)
+    dimension in its grid is capped at that axis's width; one that *walks* the
+    dimension instead pays the cap on the walk's width and can serve any number
+    of slices at all. A backend doing the latter passes ``None``.
     """
     if q.dim() < 3:
         raise ValueError(
@@ -342,10 +354,10 @@ def _check_launch_arguments(q, k, v, bias1, bias2):
     # says nothing about which argument. So this is upstream's own ceiling, said
     # out loud. Chunking the batch is the way around it.
     num_slices = _batch_of(q)
-    if num_slices > 65535:
+    if max_slices is not None and num_slices > max_slices:
         raise ValueError(
             f"the flattened (batch, pair) dimension has {num_slices} slices, but "
-            f"it is the kernel's grid z axis and CUDA allows 65535 there "
+            f"it is the kernel's grid z axis and allows only {max_slices} there "
             f"(upstream's grid is shaped the same way); split the batch"
         )
 
@@ -458,9 +470,13 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
         of that contract rather than an extra: it is the second half of what the
         forward is defined to produce, and it is what a gradient would need.
 
-    Requires ``L > 16`` and ``D <= 64``, both of which are upstream's own limits:
-    its forward asserts the first and is compiled for the second. ``k`` and ``v``
-    must have the same ``L`` as ``q`` -- upstream sets
+    Requires ``D <= 64``, which is upstream's own limit: its forward is compiled
+    for it. ``L`` is *not* bounded below here. Upstream asserts ``L > 16``, but
+    that is an assertion about the kernel being ported, not about this one -- the
+    tiles are masked and the arithmetic is the same at any ``L``, so this port
+    serves ``L`` down to 1 where upstream refuses it. Accepting a superset of what
+    upstream accepts keeps the port a drop-in replacement; the reverse would not.
+    ``k`` and ``v`` must have the same ``L`` as ``q`` -- upstream sets
     ``num_queries = num_keys = seq_length`` from the query, so a cross-attention
     with different lengths is not something it supports either.
 
@@ -476,12 +492,6 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
     bias2 = _normalize_bias(bias2, q)
 
     _check_launch_arguments(q, k, v, bias1, bias2)
-
-    if q.shape[-3] <= 16:
-        raise ValueError(
-            f"seq_len must be greater than 16; got {q.shape[-3]} (upstream "
-            f"asserts this in _attention)"
-        )
 
     seq_len = q.shape[-3]
     heads = q.shape[-2]

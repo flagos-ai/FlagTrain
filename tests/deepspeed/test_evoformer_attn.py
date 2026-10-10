@@ -185,8 +185,10 @@ def _assert_max_err(name, res, ref, atol):
 #     ``bias2`` is shared across it and ``bias1`` is indexed by it, and the two
 #     axes are flattened together for the kernel, so the cases vary B and N
 #     *separately* -- a swap of the two would survive ``B == N``.
-#   * ``L`` meets three boundaries: the 32 the lse is padded to, the 64 of both
-#     tiles, and "not a multiple of either".
+#   * ``L`` meets four boundaries: the 32 the lse is padded to, the 64 of both
+#     tiles, "not a multiple of either", and 16 -- the floor upstream asserts and
+#     this port does not, so the shapes just below it are part of the contract
+#     too (``test_sequences_below_upstreams_floor`` walks them individually).
 #   * ``D`` is the head size, capped at 64 upstream; the case that matters is the
 #     one where ``D`` is not a power of two, because that is the only time the
 #     kernel's head-size mask masks anything (at D = 8/16/32/64 the tile width is
@@ -199,6 +201,9 @@ _SHAPES = [
     (2, 3, 64, 4, 32),
     (1, 1, 17, 1, 64),
     (1, 4, 65, 2, 16),
+    # The old floor itself, so both the forward and the lse padding below 16
+    # (16 of the 32 padded columns are +inf here) are covered at this size too.
+    (1, 4, 16, 2, 32),
     (1, 4, 100, 2, 24),
     # lse needs no padding at all when L is already a multiple of 32.
     (1, 4, 32, 2, 32),
@@ -278,6 +283,14 @@ _DEEPSPEED_UNAVAILABLE_MSG = (
 # is not optional -- a missing one is an environment fault, and skipping quietly
 # would thin the suite without saying so.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
+
+# Backends whose kernel walks the flattened (batch, pair) dimension over a grid
+# axis of its own instead of placing it in the grid. Such a kernel is bounded by
+# the walk's width rather than by the driver's 65535-per-axis limit, so it serves
+# a slice count the generic kernel refuses. Ascend's is the only one: the walk is
+# there to keep the launch under its Cube's 32768-program ceiling, and the same
+# restructure happens to remove the z ceiling with it.
+_WALKING_SLICE_VENDORS = {"ascend"}
 
 
 def _load_deepspeed_evoformer():
@@ -562,14 +575,20 @@ def test_large_shapes_match_reference(shape, dtype):
 
 @pytest.mark.evoformer_attn
 def test_the_pair_dimension_has_a_grid_ceiling():
-    """``B*N`` is the kernel's grid z axis, and CUDA caps that at 65535.
+    """``B*N`` is the kernel's grid z axis, and an axis is capped at 65535.
 
     The ceiling is upstream's as well -- its forward grid is
-    ``(queries/64, heads, batches)`` -- so this is the same limit reported the
-    same way upstream's launcher would report it, rather than the driver's
+    ``(queries/64, heads, batches)`` -- so on a kernel that *puts* the flattened
+    (batch, pair) dimension in the grid this is the same limit reported the same
+    way upstream's launcher would report it, rather than the driver's
     "[CUDA]: invalid argument", which does not say which argument. Both sides of
     the boundary are checked: 65535 must run, because a limit that rejects one
     less than it allows would be worse than no check.
+
+    A kernel that *walks* that dimension instead -- the Ascend one does -- is
+    bounded by the walk's width rather than by the axis, so it serves past the
+    ceiling and this becomes a test of that instead. Which of the two a backend
+    is, is not something the caller can see, so the branch is on the vendor.
 
     The operands are deliberately tiny (L = 17, H = 1, D = 8): what is being
     tested is the grid, not the arithmetic, and 65536 slices of anything is
@@ -592,8 +611,91 @@ def test_the_pair_dimension_has_a_grid_ceiling():
     assert bool(torch.isfinite(out).all())
 
     q, k, v = operands(slices + 1)
-    with pytest.raises(ValueError, match="65535"):
-        evoformer_attn(q, k, v)
+    if flag_train.vendor_name in _WALKING_SLICE_VENDORS:
+        out, lse = evoformer_attn(q, k, v)
+        assert out.shape == q.shape
+        assert bool(torch.isfinite(out).all())
+    else:
+        with pytest.raises(ValueError, match="65535"):
+            evoformer_attn(q, k, v)
+
+
+@pytest.mark.evoformer_attn
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("seq_len", [1, 2, 3, 5, 8, 15, 16])
+def test_sequences_below_upstreams_floor(seq_len, dtype):
+    """``L`` below the 16 upstream asserts must be *served*, not refused.
+
+    Upstream's forward asserts ``L > 16``. That is a statement about the kernel
+    being ported -- its tiles are sized for it -- and not about this one, whose
+    tiles are masked, so below the floor is the same arithmetic over fewer
+    columns. Refusing it would make the port reject inputs upstream's API
+    description does not mention, and the direction that breaks a drop-in
+    replacement is refusing, not accepting.
+
+    The whole range is walked rather than sampled, because the failures this
+    would catch are not arithmetic: they are the masks and the lse padding. At
+    ``L`` = 1 the sequence is a single key, and the padding the kernel writes
+    past it is 31 of the 32 lse columns.
+
+    No ``bias1`` here. It is a *key* mask, and at these lengths a random one
+    zeroes a whole row often enough to matter -- at ``L`` = 1 it does so half the
+    time -- which is the fully-masked-row NaN that
+    ``test_a_fully_masked_query_row_is_nan`` pins on its own terms. Composing the
+    two would test that contract here without saying so.
+    """
+    shape = (1, 4, seq_len, 2, 32)
+    q, k, v, bias1, bias2 = _inputs(shape, dtype, bias1=False)
+    out, lse = evoformer_attn(q, k, v, bias1, bias2)
+
+    rq, rk, rv, rb1, rb2 = _reference_operands(q, k, v, bias1, bias2)
+    ref_out, ref_lse = _reference(rq, rk, rv, rb1, rb2)
+
+    atol = _ATOL[dtype]
+    _assert_max_err("out", out, ref_out, atol)
+    batch, pairs, _, heads, _ = shape
+    _assert_max_err(
+        "lse",
+        lse[..., :seq_len],
+        ref_lse.reshape(batch * pairs, heads, seq_len),
+        atol,
+    )
+    assert bool(torch.isinf(lse[..., seq_len:]).all()), "the padding must be +inf"
+
+
+@pytest.mark.evoformer_attn
+def test_more_heads_than_one_launch_can_hold():
+    """Heads beyond a launch's width are split across launches, not refused.
+
+    A kernel using the Cube cannot launch more than 32768 programs on this
+    device, and the head axis is one of the two a launch spends that on (the
+    other is the query tiles). So heads do not have a ceiling here -- past one
+    launch's worth, the host splits the axis and launches once per chunk.
+
+    ``L`` = 64, ``D`` = 8 makes the query one tile, so heads alone have to carry
+    the launch past 32768: the chunk is 32768 wide and the second launch holds
+    the single remaining head. That ragged tail is the part worth testing -- an
+    implementation that only handled an exact multiple of the chunk would look
+    right at 32768 and wrong here.
+    """
+    dtype = torch.float16
+    batch, pairs, seq_len, heads, head_size = 1, 1, 64, 32769, 8
+    shape = (batch, pairs, seq_len, heads, head_size)
+    q, k, v, bias1, bias2 = _inputs(shape, dtype)
+    out, lse = evoformer_attn(q, k, v, bias1, bias2)
+
+    assert out.shape == q.shape
+    assert lse.shape == (batch * pairs, heads, seq_len)
+
+    rq, rk, rv, rb1, rb2 = _reference_operands(q, k, v, bias1, bias2)
+    ref_out, ref_lse = _reference(rq, rk, rv, rb1, rb2)
+    _assert_max_err("out", out, ref_out, _ATOL[dtype])
+    _assert_max_err(
+        "lse",
+        lse[..., :seq_len],
+        ref_lse.reshape(batch * pairs, heads, seq_len),
+        _ATOL[dtype],
+    )
 
 
 @pytest.mark.evoformer_attn
@@ -711,13 +813,15 @@ def test_rejects_inputs_outside_the_contract():
     None of these is this port inventing a limit: each is an assertion or a
     ``TORCH_CHECK`` in the code being ported, and the point of raising here is
     that the alternative is a Triton compile error or a silent wrong answer.
+
+    What is *not* here is upstream's ``L > 16`` assert. That one is about the
+    kernel being ported rather than about this one -- the tiles are masked, so a
+    shorter ``L`` is the same arithmetic over fewer columns -- and this port
+    serves it rather than repeating a limit it does not have. See
+    ``test_sequences_below_upstreams_floor``.
     """
     dtype = torch.float16
     q, k, v, bias1, bias2 = _inputs((1, 4, 64, 2, 32), dtype)
-
-    short = _inputs((1, 4, 16, 2, 32), dtype)
-    with pytest.raises(ValueError, match="greater than 16"):
-        evoformer_attn(*short)
 
     wide = torch.randn(1, 4, 64, 2, 128, dtype=dtype, device=flag_train.device)
     with pytest.raises(ValueError, match="head_size"):

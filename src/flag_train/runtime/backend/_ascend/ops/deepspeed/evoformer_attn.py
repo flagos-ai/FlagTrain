@@ -25,7 +25,10 @@ stores exactly the same rows.
 A kernel containing a ``tl.dot`` cannot launch more than 32768 programs; above
 exactly 2**15, whatever the grid shape or ``num_warps``, it hangs rather than
 failing. Vector-only kernels at 40000 programs are fine. So the grid is capped
-and the ``(batch, pair)`` axis is walked with a stride instead.
+and the ``(batch, pair)`` axis is walked with a stride instead. That walk is what
+makes the *head* axis the launch's only other pressure point, and it is chunked
+across several launches when heads x query tiles would not fit -- so the operator
+serves any number of heads, and any number of slices, rather than refusing them.
 
 Everything else -- tiles, ``_LOG2E``, bias loaders, checks, shape helpers -- is
 imported from the generic module so the two cannot drift.
@@ -272,18 +275,20 @@ def _tiles_for(seq_len):
     return _BLOCK_M, _BLOCK_N, False
 
 
-def _grid_for(m_tiles, heads, num_slices):
+def _grid_for(m_tiles, head_axis, num_slices):
     """``(grid, n_iters, needs_guard)``: the launch shape and how far it walks.
 
-    The z axis is as wide as ``_MAX_PROGRAMS`` allows and each program walks the
-    rest; where the natural grid fits, it is the generic kernel's and the walk is
-    the identity. It is then narrowed to ``_TARGET_PROGRAMS``. ``needs_guard`` is
-    whether the last pass runs past the slice count.
+    ``head_axis`` is the width of this launch's head axis -- the caller's head
+    chunk, not the operand's head count; the two differ only when heads had to be
+    split. The z axis is as wide as ``_MAX_PROGRAMS`` allows and each program
+    walks the rest; where the natural grid fits, it is the generic kernel's and
+    the walk is the identity. It is then narrowed to ``_TARGET_PROGRAMS``.
+    ``needs_guard`` is whether the last pass runs past the slice count.
     """
-    per_slice = m_tiles * heads
+    per_slice = m_tiles * head_axis
     slots = min(num_slices, max(1, min(_TARGET_PROGRAMS, _MAX_PROGRAMS) // per_slice))
     n_iters = triton.cdiv(num_slices, slots)
-    return (m_tiles, heads, slots), n_iters, n_iters * slots != num_slices
+    return (m_tiles, head_axis, slots), n_iters, n_iters * slots != num_slices
 
 
 def evoformer_attn(q, k, v, bias1=None, bias2=None):
@@ -297,13 +302,9 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
     bias1 = _normalize_bias(bias1, q)
     bias2 = _normalize_bias(bias2, q)
 
-    _check_launch_arguments(q, k, v, bias1, bias2)
-
-    if q.shape[-3] <= 16:
-        raise ValueError(
-            f"seq_len must be greater than 16; got {q.shape[-3]} (upstream "
-            f"asserts this in _attention)"
-        )
+    # ``max_slices=None``: the (batch, pair) dimension is walked here, not placed
+    # in the grid, so the z axis width is not this kernel's ceiling.
+    _check_launch_arguments(q, k, v, bias1, bias2, max_slices=None)
 
     seq_len = q.shape[-3]
     heads = q.shape[-2]
@@ -314,13 +315,11 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
     block_m, block_n, even = _tiles_for(seq_len)
 
     m_tiles = triton.cdiv(seq_len, block_m)
-    if m_tiles * heads > _MAX_PROGRAMS:
+    if m_tiles > _MAX_PROGRAMS:
         raise ValueError(
-            f"{seq_len} queries x {heads} heads is {m_tiles * heads} programs per "
-            f"(batch, pair) slice, but a kernel using the Cube cannot launch more "
-            f"than {_MAX_PROGRAMS} programs on this device and the "
-            f"(batch, pair) dimension has to fit in the grid alongside them; use "
-            f"a shorter sequence or fewer heads"
+            f"{seq_len} queries is {m_tiles} query tiles at {block_m} rows each, "
+            f"but a kernel using the Cube cannot launch more than {_MAX_PROGRAMS} "
+            f"programs on this device; use a shorter sequence"
         )
 
     out = torch.empty_like(q)
@@ -338,42 +337,64 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
     block_d = max(16, triton.next_power_of_2(head_size))
     num_warps = max(4, (block_m * block_d) // 2048)
 
-    grid, n_iters, needs_guard = _grid_for(m_tiles, heads, batch)
+    # A launch cannot hold more than ``_MAX_PROGRAMS`` programs, so when the head
+    # axis and the query tiles together would not fit, the head axis is split
+    # across launches. The split is done by *slicing the operands*, not by handing
+    # the kernel a head offset: a slice of a contiguous tensor keeps every stride
+    # and moves only the base pointer, so the kernel is compiled from the same
+    # source either way and the one-chunk case every shape takes today is
+    # untouched. Passing an offset instead is worth -1.1% on (1, 8, 1024, 4, 32)
+    # -- the same unfoldable-address cost the slice clamp below is branched away
+    # from.
+    head_chunk = max(1, min(heads, _MAX_PROGRAMS // max(1, m_tiles)))
 
     with torch_device_fn.device(q.device):
-        _evoformer_fwd_kernel[grid](
-            out,
-            q,
-            k,
-            v,
+        for head0 in range(0, heads, head_chunk):
+            n_heads_here = min(head_chunk, heads - head0)
+            head_slice = slice(head0, head0 + n_heads_here)
+
+            q_here = q[..., head_slice, :]
+            k_here = k[..., head_slice, :]
+            v_here = v[..., head_slice, :]
+            out_here = out[..., head_slice, :]
+            lse_here = lse[..., head_slice, :]
             # An absent bias borrows the query's pointer; never dereferenced.
-            bias1 if has_bias1 else q,
-            bias2 if has_bias2 else q,
-            lse,
-            head_size**-0.5,
-            seq_len,
-            lse.shape[-1],
-            batch,
-            n_pairs,
-            _stride_bn(q),
-            q.stride(-3),
-            q.stride(-2),
-            _stride_bn(out),
-            out.stride(-3),
-            out.stride(-2),
-            bias2_stride_b,
-            bias2_stride_h,
-            lse.stride(-3),
-            lse.stride(-2),
-            HAS_BIAS1=has_bias1,
-            HAS_BIAS2=has_bias2,
-            HEAD_SIZE=head_size,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_D=block_d,
-            NITERS=n_iters,
-            NEEDS_GUARD=needs_guard,
-            EVEN=even,
-            num_warps=num_warps,
-        )
+            bias1_here = bias1 if has_bias1 else q_here
+            bias2_here = bias2[..., head_slice, :, :] if has_bias2 else q_here
+
+            grid, n_iters, needs_guard = _grid_for(m_tiles, n_heads_here, batch)
+            _evoformer_fwd_kernel[grid](
+                out_here,
+                q_here,
+                k_here,
+                v_here,
+                bias1_here,
+                bias2_here,
+                lse_here,
+                head_size**-0.5,
+                seq_len,
+                lse_here.shape[-1],
+                batch,
+                n_pairs,
+                _stride_bn(q_here),
+                q_here.stride(-3),
+                q_here.stride(-2),
+                _stride_bn(out_here),
+                out_here.stride(-3),
+                out_here.stride(-2),
+                bias2_stride_b,
+                bias2_stride_h,
+                lse_here.stride(-3),
+                lse_here.stride(-2),
+                HAS_BIAS1=has_bias1,
+                HAS_BIAS2=has_bias2,
+                HEAD_SIZE=head_size,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_D=block_d,
+                NITERS=n_iters,
+                NEEDS_GUARD=needs_guard,
+                EVEN=even,
+                num_warps=num_warps,
+            )
     return out, lse
