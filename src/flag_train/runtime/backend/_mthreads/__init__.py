@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Moore Threads (摩尔线程) MUSA Backend Configuration
+"""Moore Threads MUSA Backend Configuration
 
 The device is reached through ``torch.musa``, the module its ``torch_musa``
 package registers, and ``MUSA_VISIBLE_DEVICES`` selects the cards. Its operator
