@@ -131,7 +131,9 @@ costs more than it hides at every value above 1); ``num_warps`` 4, 8 and 16
 (16 collapses); ``maxnreg`` 64 to 255 (spilling below about 96, no gain above);
 ``TRITON_DISABLE_SME`` both ways; expressing the KV loop as a nested ``range``,
 a ``tl.static_range`` and a single flat loop (identical to within noise, so the
-one-trip inner loop is not the cost); dropping the load masks, which are
+one-trip inner loop is not the cost -- the flat one is what ships, but for a
+compiler reason the loop's own comment gives, not a performance one);
+dropping the load masks, which are
 provably all-true here (0.3%); and halving ``BLOCK_M`` (much worse). Pointing
 every iteration at a single cached cache block, which removes the DRAM traffic
 and leaves the access pattern intact, recovers 3.4% -- that measurement is what
@@ -426,15 +428,34 @@ def _widest_tile_that_fits(
     dots.
     """
     last = None
+    narrowest = None
+    compile_error = None
     for candidate in candidates:
-        last = needed_for_tile(candidate)
-        if last <= limit:
+        try:
+            size = needed_for_tile(candidate)
+        except Exception as exc:
+            # A tiling this compiler will not compile is not a tiling the device
+            # can hold, so narrow and ask again rather than fail the launch.
+            # Which widths compile is not monotone in the tile width -- a newer
+            # FlagTree than the one this was tuned on failed in a TTGIR pass at
+            # the 64-row tile of a 256-token cache block while every narrower
+            # one compiled -- so the candidates below are worth trying. If none
+            # of them compile, the first such error is the real explanation and
+            # is what gets raised; a shared-memory figure would not be.
+            if compile_error is None:
+                compile_error = exc
+            continue
+        last = size
+        narrowest = candidate
+        if size <= limit:
             return candidate
+    if last is None:
+        raise compile_error
     raise RuntimeError(
         "blocked flash needs %d bytes of shared memory even at the narrowest KV "
         "tile this kernel compiles with (%d rows), for a %d-row query tile at "
         "head_size %d, and the device has %d. Build the atoms with a smaller "
-        "q_block_size." % (last, candidates[-1], block_m, head_size, limit)
+        "q_block_size." % (last, narrowest, block_m, head_size, limit)
     )
 
 
@@ -536,75 +557,90 @@ def _blocked_flash_fwd_kernel(
     # peeled here because on this part it does not compute: two sequential loops
     # over one accumulator return wrong numbers, and one always-masked loop is
     # the whole of the difference. The module docstring has the measurement.
-    for b in range(0, kv_blocks):
+    #
+    # The blocks and the tiles inside a block are one flat loop, not a loop
+    # nested in a loop. ``BLOCK_N`` is chosen to divide the cache block (see
+    # ``_block_n_candidates``), so tile ``i`` belongs to block
+    # ``i // TILES_PER_BLOCK`` at offset ``(i % TILES_PER_BLOCK) * BLOCK_N`` and
+    # the two structures visit the same tiles in the same order. The nesting is
+    # what has to go: the compiler in CI (a newer FlagTree than the one this was
+    # tuned on) fails in its ``mma-reduce-thread-locality`` TTGIR pass -- a
+    # PassManager error at compile time, not a miscompile -- for any cache block
+    # holding more than one tile. Block sizes 32 and 64 pass there, where the
+    # inner loop runs once; 256 at a 64-row tile is four tiles per block and
+    # fails. Flattened, the loop that carries the accumulators is the one
+    # dynamic loop that compiler already takes for the other cases. The cost is
+    # one extra scalar load of the block index per tile instead of per block,
+    # and a divide by a constant: the flat form was already one of the three
+    # loop shapes the sweep in the module docstring found indistinguishable from
+    # the nested one on this part.
+    TILES_PER_BLOCK: tl.constexpr = (KV_BLOCK_SIZE + BLOCK_N - 1) // BLOCK_N
+    for i in range(0, kv_blocks * TILES_PER_BLOCK):
+        b = i // TILES_PER_BLOCK
+        t0 = (i % TILES_PER_BLOCK) * BLOCK_N
         block = tl.load(block_idx_ptr + block_offset + b)
         block_row_base = block * k_row_stride * KV_BLOCK_SIZE
 
-        # A KV block holds kv_block_size tokens; walk it in BLOCK_N tiles so the
-        # tile does not have to know the cache's block size.
-        for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
-            offs_n = t0 + tl.arange(0, BLOCK_N)
-            kv_pos = b * KV_BLOCK_SIZE + offs_n
-            n_mask = kv_pos < total_extent
+        offs_n = t0 + tl.arange(0, BLOCK_N)
+        kv_pos = b * KV_BLOCK_SIZE + offs_n
+        n_mask = kv_pos < total_extent
 
-            # Both tiles are loaded here, before the first dot, and the value one
-            # goes first. Source order is the schedule: this part's Triton does
-            # not reorder global loads across the shared-memory traffic the dots
-            # need, so a load issued after a dot waits for it, and at one
-            # pipeline stage there is nothing else in flight to wait behind.
-            # Issuing the value tile first puts its whole latency under the key
-            # dot and the softmax, which is the longest dependency chain in the
-            # iteration. Worth 8% at 4096 tokens and head 128 (2880 us against
-            # 3125) and less or nothing on the short and 64-head shapes, where
-            # there is less chain to hide it under; see the docstring.
-            v_ptrs = (
-                v_ptr
-                + block_row_base
-                + offs_n[:, None] * k_row_stride
-                + hk * HEAD_SIZE
-                + offs_d[None, :]
-            )
-            v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+        # Both tiles are loaded here, before the first dot, and the value one
+        # goes first. Source order is the schedule: this part's Triton does
+        # not reorder global loads across the shared-memory traffic the dots
+        # need, so a load issued after a dot waits for it, and at one
+        # pipeline stage there is nothing else in flight to wait behind.
+        # Issuing the value tile first puts its whole latency under the key
+        # dot and the softmax, which is the longest dependency chain in the
+        # iteration. Worth 8% at 4096 tokens and head 128 (2880 us against
+        # 3125) and less or nothing on the short and 64-head shapes, where
+        # there is less chain to hide it under; see the docstring.
+        v_ptrs = (
+            v_ptr
+            + block_row_base
+            + offs_n[:, None] * k_row_stride
+            + hk * HEAD_SIZE
+            + offs_d[None, :]
+        )
+        v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
 
-            # The key is loaded already transposed, as a (BLOCK_D, BLOCK_N) tile,
-            # rather than loaded as (BLOCK_N, BLOCK_D) and transposed here. The
-            # two are the same bytes; the difference is where the transpose
-            # happens. ``tl.trans`` on this backend is a shared-memory round trip
-            # with the layout the compiler picks for it (a store with
-            # ``order=[0, 1]``), and the dot's operand is going through shared
-            # anyway -- so the explicit load and the implicit one pay the same
-            # traffic, and this one lets the load vectorise along the head
-            # dimension, which is the contiguous one. Measured at 4096 tokens,
-            # head 128, a 64-row tile: 3284 us against 3941.
-            kt_ptrs = (
-                k_ptr
-                + block_row_base
-                + hk * HEAD_SIZE
-                + offs_d[:, None]
-                + offs_n[None, :] * k_row_stride
-            )
-            kt = tl.load(kt_ptrs, mask=d_mask[:, None] & n_mask[None, :], other=0.0)
+        # The key is loaded already transposed, as a (BLOCK_D, BLOCK_N) tile,
+        # rather than loaded as (BLOCK_N, BLOCK_D) and transposed here. The
+        # two are the same bytes; the difference is where the transpose
+        # happens. ``tl.trans`` on this backend is a shared-memory round trip
+        # with the layout the compiler picks for it (a store with
+        # ``order=[0, 1]``), and the dot's operand is going through shared
+        # anyway -- so the explicit load and the implicit one pay the same
+        # traffic, and this one lets the load vectorise along the head
+        # dimension, which is the contiguous one. Measured at 4096 tokens,
+        # head 128, a 64-row tile: 3284 us against 3941.
+        kt_ptrs = (
+            k_ptr
+            + block_row_base
+            + hk * HEAD_SIZE
+            + offs_d[:, None]
+            + offs_n[None, :] * k_row_stride
+        )
+        kt = tl.load(kt_ptrs, mask=d_mask[:, None] & n_mask[None, :], other=0.0)
 
-            qk = tl.dot(q, kt) * qk_scale
-            if IS_CAUSAL:
-                # A query attends to every KV position up to and including its own.
-                qk = tl.where(
-                    kv_pos[None, :] <= global_q_pos[:, None], qk, float("-inf")
-                )
-            qk = tl.where(n_mask[None, :], qk, float("-inf"))
+        qk = tl.dot(q, kt) * qk_scale
+        if IS_CAUSAL:
+            # A query attends to every KV position up to and including its own.
+            qk = tl.where(kv_pos[None, :] <= global_q_pos[:, None], qk, float("-inf"))
+        qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
-            m_new = tl.maximum(m_i, tl.max(qk, 1))
-            alpha = tl.exp2(m_i - m_new)
-            p = tl.exp2(qk - m_new[:, None])
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(qk - m_new[:, None])
 
-            l_i = l_i * alpha + tl.sum(p, 1)
-            # ``p`` is rounded into the compute dtype here. That is deliberate:
-            # the bar for this operator is the reference implementation's own
-            # tolerance, which this clears with room to spare, and carrying the
-            # rounding residual in a second dot buys accuracy the requirement
-            # does not ask for at a cost the benchmark would show.
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-            m_i = m_new
+        l_i = l_i * alpha + tl.sum(p, 1)
+        # ``p`` is rounded into the compute dtype here. That is deliberate:
+        # the bar for this operator is the reference implementation's own
+        # tolerance, which this clears with room to spare, and carrying the
+        # rounding residual in a second dot buys accuracy the requirement
+        # does not ask for at a cost the benchmark would show.
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
 
     # A row whose keys were all masked out has no contribution to renormalize.
     l_i = tl.where(l_i == 0.0, 1.0, l_i)
