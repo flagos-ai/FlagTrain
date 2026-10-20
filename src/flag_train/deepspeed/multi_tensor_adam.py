@@ -52,7 +52,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
@@ -231,9 +230,9 @@ def multi_tensor_adam(
 
     device = g_list[0].device
     dtype = g_list[0].dtype
-    assert dtype in _DTYPE_MAP, (
-        f"multi_tensor_adam only supports fp16/bf16/fp32, got {dtype}"
-    )
+    assert (
+        dtype in _DTYPE_MAP
+    ), f"multi_tensor_adam only supports fp16/bf16/fp32, got {dtype}"
 
     if bias_correction == 1:
         bc1 = 1.0 - beta1**step
