@@ -26,24 +26,20 @@ import torch
 import flag_train
 from flag_train.megatron import quick_gelu
 
-from .. import base, consts
-from ..conftest import Config
+from .. import base
 
 # Megatron-LM coefficient. See tests/megatron/test_quick_gelu.py.
 _ALPHA = 1.702
 
 # Small, medium, and a Megatron-MLP-sized activation tensor (tokens, hidden).
 _CORE_SHAPES = [
-    (1024,),
-    (1024, 1024),
-    (8, 4096, 11008),
-]
-
-_MORE_SHAPES = [
     (1,),
+    (1024,),
     (64, 64),
+    (1024, 1024),
     (4096, 4096),
     (4, 8192, 4096),
+    (8, 4096, 11008),
 ]
 
 
@@ -68,13 +64,7 @@ class QuickGeluBenchmark(base.GenericBenchmark):
     DEFAULT_SHAPES = _CORE_SHAPES
 
     def set_shapes(self, shape_file=None):
-        shapes = list(_CORE_SHAPES)
-        if Config.bench_level == consts.BenchLevel.COMPREHENSIVE and not Config.query:
-            shapes.extend(self.set_more_shapes())
-        self.shapes = list(dict.fromkeys(shapes))
-
-    def set_more_shapes(self):
-        return list(_MORE_SHAPES)
+        self.shapes = list(_CORE_SHAPES)
 
 
 def quick_gelu_input_fn(shape, dtype, device):
@@ -95,11 +85,9 @@ def _run(is_backward):
 
 @pytest.mark.quick_gelu
 def test_quick_gelu_perf():
-    print("\nBaseline: torch quick_gelu (x * sigmoid(1.702 * x))")
     _run(is_backward=False)
 
 
 @pytest.mark.quick_gelu
 def test_quick_gelu_backward_perf():
-    print("\nBaseline: torch.autograd of x * sigmoid(1.702 * x)")
     _run(is_backward=True)
