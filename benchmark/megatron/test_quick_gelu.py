@@ -20,6 +20,8 @@ in kernel mode). ``--level core`` runs the small, medium and large shapes below;
 ``--level comprehensive`` adds the extra shapes.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -80,6 +82,11 @@ def _run(is_backward):
         is_backward=is_backward,
     )
     bench.set_train(quick_gelu)
+    # On Ascend, enable parallel scheduling of all blocks to avoid excessive logical cores
+    # and reduce scheduling overhead when the logical core count exceeds 65,535.
+    # See https://github.com/flagos-ai/FlagGems/pull/7304
+    if flag_train.vendor_name == "ascend":
+        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
     bench.run()
 
 
