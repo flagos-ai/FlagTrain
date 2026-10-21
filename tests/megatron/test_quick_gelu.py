@@ -23,7 +23,7 @@ than a second run of the device kernel. Tolerances are
 ``flag_train.testing.RESOLUTION``).
 """
 
-import logging
+import warnings
 
 import pytest
 import torch
@@ -32,8 +32,6 @@ import flag_train
 from flag_train.megatron import quick_gelu as flag_train_quick_gelu
 
 from .. import accuracy_utils as utils
-
-logger = logging.getLogger(__name__)
 
 # Scalar, empty, unaligned, and the ranks pointwise_dynamic specializes on.
 _SHAPES = [
@@ -59,9 +57,11 @@ def base_op():
 
         return megatron.core.activations.quick_gelu
     except ImportError:
-        logger.warning(
+        warnings.warn(
             "Megatron-LM is unavailable; using the PyTorch Quick GELU "
-            "composition as the correctness reference"
+            "composition as the correctness reference",
+            RuntimeWarning,
+            stacklevel=2,
         )
         return quick_gelu_ref
 

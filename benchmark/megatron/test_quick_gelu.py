@@ -22,8 +22,8 @@ PyTorch composition. Timing, warmup and synchronization come from
 ``--level comprehensive`` adds the extra shapes.
 """
 
-import logging
 import os
+import warnings
 
 import pytest
 import torch
@@ -32,8 +32,6 @@ import flag_train
 from flag_train.megatron import quick_gelu as flag_train_quick_gelu
 
 from .. import base
-
-logger = logging.getLogger(__name__)
 
 # Small, medium, and a Megatron-MLP-sized activation tensor (tokens, hidden).
 _CORE_SHAPES = [
@@ -57,9 +55,11 @@ def base_op():
 
         return megatron.core.activations.quick_gelu
     except ImportError:
-        logger.warning(
+        warnings.warn(
             "Megatron-LM is unavailable; using the PyTorch Quick GELU "
-            "composition as the benchmark baseline"
+            "composition as the benchmark baseline",
+            RuntimeWarning,
+            stacklevel=2,
         )
         return quick_gelu_ref
 
