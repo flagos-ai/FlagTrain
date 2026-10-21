@@ -13,28 +13,27 @@
 # limitations under the License.
 """Correctness tests for Megatron Quick GELU.
 
-The reference is the formula in Megatron-LM ``megatron/core/activations.py``:
-
-    quick_gelu(x) = x * sigmoid(1.702 * x)
-
-It is evaluated with PyTorch, independently of the Triton kernels. Under
-``--ref cpu`` the reference operands are moved to the CPU and upcast, so the
-comparison is against a higher-precision CPU result rather than a second run
-of the device kernel. Tolerances are ``train_assert_close``'s defaults
-(``atol=1e-4``, dtype rtol from ``flag_train.testing.RESOLUTION``).
+The preferred reference is Megatron-LM's official
+``megatron.core.activations.quick_gelu`` interface. If Megatron-LM is not
+installed, the tests log a warning and fall back to the equivalent PyTorch
+composition. Under ``--ref cpu`` the reference operands are moved to the CPU
+and upcast, so the comparison is against a higher-precision CPU result rather
+than a second run of the device kernel. Tolerances are
+``train_assert_close``'s defaults (``atol=1e-4``, dtype rtol from
+``flag_train.testing.RESOLUTION``).
 """
+
+import logging
 
 import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import quick_gelu
+from flag_train.megatron import quick_gelu as flag_train_quick_gelu
 
 from .. import accuracy_utils as utils
 
-# Megatron-LM coefficient. Kept here, not imported from the kernel, so a wrong
-# constant in the implementation cannot satisfy this reference.
-_ALPHA = 1.702
+logger = logging.getLogger(__name__)
 
 # Scalar, empty, unaligned, and the ranks pointwise_dynamic specializes on.
 _SHAPES = [
@@ -51,8 +50,23 @@ _SHAPES = [
 
 
 def quick_gelu_ref(x):
-    """Megatron Quick GELU, composed from PyTorch ops."""
-    return x * torch.sigmoid(_ALPHA * x)
+    return x * torch.sigmoid(1.702 * x)
+
+
+def base_op():
+    try:
+        import megatron.core.activations
+
+        return megatron.core.activations.quick_gelu
+    except ImportError:
+        logger.warning(
+            "Megatron-LM is unavailable; using the PyTorch Quick GELU "
+            "composition as the correctness reference"
+        )
+        return quick_gelu_ref
+
+
+reference_quick_gelu = base_op()
 
 
 def _reference(tensor):
@@ -65,19 +79,19 @@ def _assert_close(actual, expected, dtype):
 
 def _check_forward_and_backward(x):
     dtype = x.dtype
-    y = quick_gelu(x)
+    y = flag_train_quick_gelu(x)
     assert y.shape == x.shape
     assert y.dtype == dtype
 
     x_ref = _reference(x)
-    _assert_close(y, quick_gelu_ref(x_ref), dtype)
+    _assert_close(y, reference_quick_gelu(x_ref), dtype)
 
     grad_out = torch.randn_like(y)
     x_train = x.detach().requires_grad_(True)
-    quick_gelu(x_train).backward(grad_out)
+    flag_train_quick_gelu(x_train).backward(grad_out)
 
     x_ref = _reference(x).requires_grad_(True)
-    quick_gelu_ref(x_ref).backward(_reference(grad_out))
+    reference_quick_gelu(x_ref).backward(_reference(grad_out))
     _assert_close(x_train.grad, x_ref.grad, dtype)
 
 

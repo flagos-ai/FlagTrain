@@ -13,25 +13,27 @@
 # limitations under the License.
 """Performance benchmark for Megatron Quick GELU.
 
-The baseline is the same PyTorch composition the correctness tests use,
-``x * sigmoid(1.702 * x)``, on the same device, shape and dtype. Timing,
-warmup and synchronization come from ``benchmark/base.py`` (``triton.testing.do_bench``
-in kernel mode). ``--level core`` runs the small, medium and large shapes below;
+The preferred baseline is Megatron-LM's official
+``megatron.core.activations.quick_gelu`` interface. If Megatron-LM is not
+installed, the benchmark logs a warning and falls back to the equivalent
+PyTorch composition. Timing, warmup and synchronization come from
+``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode).
+``--level core`` runs the small, medium and large shapes below;
 ``--level comprehensive`` adds the extra shapes.
 """
 
+import logging
 import os
 
 import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import quick_gelu
+from flag_train.megatron import quick_gelu as flag_train_quick_gelu
 
 from .. import base
 
-# Megatron-LM coefficient. See tests/megatron/test_quick_gelu.py.
-_ALPHA = 1.702
+logger = logging.getLogger(__name__)
 
 # Small, medium, and a Megatron-MLP-sized activation tensor (tokens, hidden).
 _CORE_SHAPES = [
@@ -46,7 +48,20 @@ _CORE_SHAPES = [
 
 
 def quick_gelu_ref(x):
-    return x * torch.sigmoid(_ALPHA * x)
+    return x * torch.sigmoid(1.702 * x)
+
+
+def base_op():
+    try:
+        import megatron.core.activations
+
+        return megatron.core.activations.quick_gelu
+    except ImportError:
+        logger.warning(
+            "Megatron-LM is unavailable; using the PyTorch Quick GELU "
+            "composition as the benchmark baseline"
+        )
+        return quick_gelu_ref
 
 
 def _dtypes():
@@ -77,11 +92,11 @@ def _run(is_backward):
     bench = QuickGeluBenchmark(
         input_fn=quick_gelu_input_fn,
         op_name="quick_gelu_backward" if is_backward else "quick_gelu",
-        torch_op=quick_gelu_ref,
+        torch_op=base_op(),
         dtypes=_dtypes(),
         is_backward=is_backward,
     )
-    bench.set_train(quick_gelu)
+    bench.set_train(flag_train_quick_gelu)
     # On Ascend, enable parallel scheduling of all blocks to avoid excessive logical cores
     # and reduce scheduling overhead when the logical core count exceeds 65,535.
     # See https://github.com/flagos-ai/FlagGems/pull/7304
