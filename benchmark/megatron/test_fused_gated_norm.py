@@ -13,38 +13,15 @@
 # limitations under the License.
 """Performance benchmark for the fused output RMSNorm/SiLU gating operator.
 
-The baseline follows ``_MCORE_BASELINE_VENDORS`` below, in the same
-platform-first shape ``benchmark/deepspeed/test_blocked_flash.py`` uses for its
-own upstream kernel:
+The baseline is Megatron-LM's ``fused_gated_norm`` on the backends in
+``_MCORE_BASELINE_VENDORS`` when the installed megatron-core provides it -- the
+kernel this port is a port *of* -- and ``fused_gated_norm_ref``, a plain-torch
+composition of the same contract, everywhere else and when that import fails.
+``_BASELINE`` records which one was measured.
 
-* on a listed backend, Megatron-LM's ``megatron.core.fusions.fused_gated_norm``
-  **is** the baseline when the installed ``megatron-core`` provides it, imported
-  directly from that package. It is the kernel this port is a port *of*, which
-  makes it the only baseline that answers "what did the port cost". The module
-  is newer than the 0.19.2 PyPI release, so older installs do not have it; when
-  the import fails the module warns and falls back to ``fused_gated_norm_ref``,
-  and the reported baseline name records which one was actually measured;
-* on any other backend the baseline is ``fused_gated_norm_ref``, the plain-torch
-  composition of the same contract. It is not a competitor, and the speedup
-  there says how far the kernel is from *a* correct implementation rather than
-  from the best one.
-
-The baseline is upstream verbatim, ``enable_fp_fusion=True`` included, so the
-comparison is against the kernel as it ships. The FlagTrain port drops that flag
-to align its reductions to FP32 -- a correctness matter (tested under
-``tests/megatron/``), not a benchmark one: latency is measured, not compared.
-
-Both the baseline and the operator take the same ``(x, gate, weight)`` tuple, so
-there is nothing to pre-compute outside the timed region.  Both are forward-only;
-the operator has no backward implementation.
-
-Representative shapes are also measured with the optional ``zero_centered``
-weight, an FP32 gate with a half-precision activation, and transposed
-non-contiguous inputs (the kernel's strided path). Those variants are extra rows
-of the same dtype table -- the variant travels as a fourth operand and labels
-the Size Detail column -- so each dtype emits one record rather than one record
-per variant. Latency is reported together with GB/s, since the operation is
-memory-bound.
+Both take the same ``(x, gate, weight)`` tuple, so there is nothing to
+pre-compute outside the timed region; both are forward-only. Latency is reported
+with GB/s, since the operation is memory-bound.
 """
 
 import warnings
@@ -58,12 +35,11 @@ import flag_train.megatron
 from .. import base
 
 # GDN (Gated Delta Net) attention-output shapes, ``[batch, sequence, heads, dim]``.
-# dim is a power of two (the kernel addresses it with ``tl.arange(0, D)``).
-#
-# The sweep walks the axes that change the kernel's cost: a decode step (one
-# row), short-to-long prefill sequences, batch and head counts, and both head
-# widths GDN uses. Sizes stay within CI GPU memory (the largest is ~67 MB per
-# fp16 tensor).
+# dim is a power of two (the kernel addresses it with ``tl.arange(0, D)``). The
+# sweep walks the axes that change the kernel's cost: a decode step (one row),
+# short-to-long prefill sequences, batch and head counts, and both head widths
+# GDN uses. Sizes stay within CI GPU memory (the largest is ~67 MB per fp16
+# tensor).
 _GATED_NORM_SHAPES = [
     (1, 1, 16, 128),
     (2, 1024, 16, 128),
@@ -78,15 +54,14 @@ _GATED_NORM_SHAPES = [
     (2, 512, 16, 512),
 ]
 
-# The variant configurations (zero-centred weight, FP32 gate, strided views) are
-# measured on a representative subset of the shapes above.
+# The variants are measured on a representative subset of the shapes above, as
+# extra rows of the same dtype table; the variant travels as a fourth operand and
+# labels the Size Detail column.
 _VARIANT_SHAPES = [
     (1, 1, 16, 128),
     (2, 1024, 16, 128),
     (2, 1024, 16, 256),
 ]
-
-# Measured in addition to the plain case for each shape in ``_VARIANT_SHAPES``.
 _VARIANTS = ("zero_centered", "fp32_gate", "strided")
 
 _EPS = 1e-5
@@ -108,29 +83,14 @@ def fused_gated_norm_ref(x, gate, weight, eps, zero_centered=False):
     return (norm * (gate_f * torch.sigmoid(gate_f))).to(x.dtype)
 
 
-# Backends whose baseline is Megatron-LM's fused_gated_norm when the installed
-# megatron-core provides it. The upstream kernel is a Triton kernel, and these
-# are the two platforms this repository runs it on; elsewhere, or where the
-# module is absent, the torch composition stands in.
-_MCORE_BASELINE_VENDORS = {"nvidia", "hygon"}
+# Backends whose baseline is Megatron-LM's kernel; it cannot run elsewhere.
+_MCORE_BASELINE_VENDORS = {"nvidia"}
 
 
 def _load_mcore_fused_gated_norm():
-    """Megatron-LM's fused_gated_norm, or ``None`` when it is not the baseline.
-
-    Imported from the installed ``megatron-core`` package, so the benchmark
-    measures whatever upstream version the platform ships rather than a copy
-    kept here. The module is self-contained Triton (it imports only torch and
-    triton); importing it through the package does pull in
-    ``megatron.core.__init__``, which is acceptable because this runs before any
-    timed region.
-
-    A missing module is not an error: the module warns and falls back to
-    ``fused_gated_norm_ref``, and ``_BASELINE`` reports which one was measured.
-    """
+    """Megatron-LM's fused_gated_norm, or ``None`` when it is not the baseline."""
     if flag_train.vendor_name not in _MCORE_BASELINE_VENDORS:
         return None
-
     try:
         from megatron.core.fusions.fused_gated_norm import fused_gated_norm
 
@@ -148,7 +108,6 @@ def _load_mcore_fused_gated_norm():
 # Resolved once, so the first-use Triton JIT compile is not counted in the
 # measurement.
 _mcore_fused_gated_norm = _load_mcore_fused_gated_norm()
-
 _BASELINE = (
     "megatron-core fused_gated_norm"
     if _mcore_fused_gated_norm is not None
@@ -160,10 +119,9 @@ class FusedGatedNormBenchmark(base.GenericBenchmark):
     DEFAULT_SHAPES = _GATED_NORM_SHAPES
 
     def set_shapes(self, shape_file=None):
-        # Three tensors per case (x, gate, weight) plus an output; the explicit
-        # list keeps memory bounded on CI GPUs, and the variant rows reuse these
-        # shapes.
-        self.shapes = list(_GATED_NORM_SHAPES)
+        # Three input tensors per case plus an output; the explicit list keeps
+        # memory bounded on CI GPUs.
+        self.shapes = list(self.DEFAULT_SHAPES)
 
     def set_more_shapes(self):
         return []
@@ -184,57 +142,38 @@ class FusedGatedNormBenchmark(base.GenericBenchmark):
 def _make_operands(shape, dtype, device, variant):
     """Build ``(x, gate, weight, variant)`` for one measured configuration."""
     dim = shape[-1]
+    # ``fp32_gate`` keeps the activation narrow but the gate and weight FP32.
+    wide = torch.float32 if variant == "fp32_gate" else dtype
     if variant == "strided":
         # A ``[batch, sequence, heads, dim]`` view obtained by transposing the
         # base allocation, so the kernel reads it through strides.
         base_shape = (shape[0], shape[2], shape[1], dim)
         x = torch.randn(base_shape, dtype=dtype, device=device).permute(0, 2, 1, 3)
-        gate = torch.randn(base_shape, dtype=dtype, device=device).permute(0, 2, 1, 3)
-        weight = torch.randn((dim,), dtype=dtype, device=device)
-    elif variant == "fp32_gate":
-        # Half-precision activation with an FP32 gate and norm weight.
+        gate = torch.randn(base_shape, dtype=wide, device=device).permute(0, 2, 1, 3)
+    else:
         x = torch.randn(shape, dtype=dtype, device=device)
-        gate = torch.randn(shape, dtype=torch.float32, device=device)
-        weight = torch.randn((dim,), dtype=torch.float32, device=device)
-    else:  # the plain and zero_centered cases share their operand dtypes
-        x = torch.randn(shape, dtype=dtype, device=device)
-        gate = torch.randn(shape, dtype=dtype, device=device)
-        weight = torch.randn((dim,), dtype=dtype, device=device)
-    return x, gate, weight, variant
+        gate = torch.randn(shape, dtype=wide, device=device)
+    return x, gate, torch.randn((dim,), dtype=wide, device=device), variant
 
 
 def fused_gated_norm_input_fn(shape, dtype, device):
-    """The plain case for every shape, plus labeled variants where configured.
-
-    Yielding several tuples per shape is what folds the variants into the shape
-    sweep: the harness groups inputs by dtype, so all of them land in one
-    record. The label is a string operand that the ops below interpret and the
-    Size Detail column prints.
-    """
+    """The plain case for every shape, plus labeled variants where configured."""
     yield _make_operands(shape, dtype, device, "regular")
     if shape in _VARIANT_SHAPES:
         for variant in _VARIANTS:
             yield _make_operands(shape, dtype, device, variant)
 
 
-def _baseline(x, gate, weight, zero_centered=False):
-    impl = _mcore_fused_gated_norm or fused_gated_norm_ref
-    return impl(x, gate, weight, _EPS, zero_centered)
-
-
-def _is_zero_centered(variant):
-    return variant == "zero_centered"
-
-
 def torch_op(x, gate, weight, variant):
     """Baseline, chosen by platform. See the module docstring."""
-    return _baseline(x, gate, weight, _is_zero_centered(variant))
+    impl = _mcore_fused_gated_norm or fused_gated_norm_ref
+    return impl(x, gate, weight, _EPS, variant == "zero_centered")
 
 
 def train_op(x, gate, weight, variant):
     """The operator under test."""
     return flag_train.megatron.fused_gated_norm(
-        x, gate, weight, _EPS, _is_zero_centered(variant)
+        x, gate, weight, _EPS, variant == "zero_centered"
     )
 
 

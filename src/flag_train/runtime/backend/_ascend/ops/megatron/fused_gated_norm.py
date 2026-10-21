@@ -62,6 +62,8 @@ contiguously; the same tile also overflows the unified buffer past 1024
 elements. A copy is a semantic no-op, so the kernel never sees that layout.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -70,6 +72,8 @@ from flag_train.megatron.fused_gated_norm import _check_arguments, _row_offset
 from flag_train.runtime import torch_device_fn
 from flag_train.runtime.backend._ascend.utils import CORE_NUM
 from flag_train.utils import libentry
+
+logger = logging.getLogger(__name__)
 
 # Elements in one program's tile; see the module docstring for why this size
 # and why BT is capped.
@@ -192,6 +196,8 @@ def fused_gated_norm(
     ``flag_train.megatron.fused_gated_norm``; only the launch differs -- see this
     module's docstring.
     """
+    logger.debug("TRAIN_ASCEND FUSED_GATED_NORM")
+
     dim = _check_arguments(x, gate, weight)
 
     batch, sequence, heads, _ = x.shape

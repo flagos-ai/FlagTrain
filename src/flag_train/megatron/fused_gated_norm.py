@@ -28,6 +28,8 @@ heads, dim]`` views, addressing logical rows through the per-dimension strides.
 It has no backward: it is the forward/inference path.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -35,6 +37,8 @@ import triton.language as tl
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
+
+logger = logging.getLogger(__name__)
 
 # Row count past which a 128-wide head is large enough to saturate DRAM; from
 # there on the wider one-warp tile measures faster than the smaller two-warp
@@ -188,6 +192,8 @@ def fused_gated_norm(
         eps: RMSNorm epsilon.
         zero_centered: If ``True``, apply ``weight + 1`` before gating.
     """
+    logger.debug("TRAIN FUSED_GATED_NORM")
+
     dim = _check_arguments(x, gate, weight)
 
     batch, sequence, heads, _ = x.shape
