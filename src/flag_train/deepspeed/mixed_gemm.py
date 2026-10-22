@@ -252,53 +252,39 @@ _DEFAULT_TILE = {
     "num_stages": 3,
 }
 
+# Hygon's warp is 64 lanes where NVIDIA's is 32, and on gfx936 the sweep above inverts:
+# 128/64/32 beats the shipped tile on all nine shapes measured, by 1.3x to 2.4x
+# (4096 cubed int4: 2.307 ms / 59.6 TFLOP/s against 4.829 ms / 28.5 TFLOP/s), with
+# bit-identical output. ``BLOCK_N`` 32 -> 64 is the lever there -- the two tiles that
+# change it differ by up to 12%, while ``num_stages`` 1 and 3 agree within 0.06% and 4
+# and 8 warps at one tile are indistinguishable. Why the warp width flips the ranking is
+# not established (a 64-lane warp distributes MMA operands differently), so this is a
+# calibrated value, not a derived one. Only ``BLOCK_M``/``BLOCK_N`` are overridden, so
+# the caller's keyword arguments and the rest of the shipped tile still apply.
+#
+# The thin shapes (m = 1, m = 64) are where the sweep's absolute readings are least
+# trustworthy: outside the benchmark framework the L2 flush is too small there to mask
+# host dispatch, which on Hygon costs about as much as the kernel. The margin between
+# the two tiles survives that, since both are measured with the same host path.
+if runtime_device.vendor_name == "hygon":
+    _DEFAULT_TILE["BLOCK_M"] = 128
+    _DEFAULT_TILE["BLOCK_N"] = 64
 
-def mixed_gemm(
-    output,
-    hidden_states,
-    weight,
-    scales,
-    bias,
-    num_bits,
-    activation_raw,
-    *,
-    BLOCK_M=None,
-    BLOCK_N=None,
-    BLOCK_K=None,
-    num_warps=None,
-    num_stages=None,
+
+def _check_launch_arguments(
+    output, hidden_states, weight, scales, bias, num_bits, activation_raw
 ):
-    """Mixed-precision GEMM with weight-only integer quantization.
+    """Validate one ``mixed_gemm`` call and return ``(m, n, k)``.
 
-    Faithful port of DeepSpeed's ``mixed_gemm`` launcher. Computes
-    ``output = act(hidden_states @ dequantize(weight) + bias)`` writing into
-    ``output`` in place; ``hidden_states`` is never quantized, which is what makes
-    this a weight-only scheme.
+    Kept out of the operator because a backend may replace the kernel without
+    replacing the contract: a vendor override imports this function rather than
+    restating the checks, so no backend can accept a call another one rejects.
 
-    Args:
-        output (Tensor): ``[m, n]``, same dtype as ``hidden_states``; written in
-            place.
-        hidden_states (Tensor): activations ``[m, k]`` (fp16 or bf16).
-        weight (Tensor): packed quantized weight ``[k, ceil(n/2)]`` uint8 for
-            int4 or ``[k, n]`` uint8 for int8. Already quantized and packed.
-        scales (Tensor): ``[n]`` per-output-channel scales, in the activation
-            dtype.
-        bias (Tensor or None): ``[n]`` bias, in the activation dtype. May be
-            ``None``.
-        num_bits (int): 4 or 8.
-        activation_raw (int): an ``ActivationType`` value. See the module
-            constants.
-
-    Returns:
-        Tensor: ``output``, updated in place.
-
-    The checks below reproduce the launcher's ``TORCH_CHECK``s so a caller gets
-    the same diagnosis the reference gives rather than a failure inside the Triton
-    compiler or the driver. The device check is the one addition: upstream is
-    CUDA-only and so has no other device to name.
+    These reproduce the launcher's ``TORCH_CHECK``s, so a caller gets the same
+    diagnosis the reference gives rather than a failure inside the Triton compiler
+    or the driver. The device check is the one addition: upstream is CUDA-only and
+    so has no other device to name.
     """
-    logger.debug("TRAIN MIXED_GEMM")
-
     if num_bits not in (4, 8):
         raise ValueError(f"Data width must be 4 or 8, got {num_bits}")
     if output.dtype != hidden_states.dtype:
@@ -349,6 +335,58 @@ def mixed_gemm(
     # flat, so the tensor's own 2-D shape carries no meaning here.
     if not weight.is_contiguous():
         raise ValueError("weight must be contiguous")
+
+    return m, n, k
+
+
+def mixed_gemm(
+    output,
+    hidden_states,
+    weight,
+    scales,
+    bias,
+    num_bits,
+    activation_raw,
+    *,
+    BLOCK_M=None,
+    BLOCK_N=None,
+    BLOCK_K=None,
+    num_warps=None,
+    num_stages=None,
+):
+    """Mixed-precision GEMM with weight-only integer quantization.
+
+    Faithful port of DeepSpeed's ``mixed_gemm`` launcher. Computes
+    ``output = act(hidden_states @ dequantize(weight) + bias)`` writing into
+    ``output`` in place; ``hidden_states`` is never quantized, which is what makes
+    this a weight-only scheme.
+
+    Args:
+        output (Tensor): ``[m, n]``, same dtype as ``hidden_states``; written in
+            place.
+        hidden_states (Tensor): activations ``[m, k]`` (fp16 or bf16).
+        weight (Tensor): packed quantized weight ``[k, ceil(n/2)]`` uint8 for
+            int4 or ``[k, n]`` uint8 for int8. Already quantized and packed.
+        scales (Tensor): ``[n]`` per-output-channel scales, in the activation
+            dtype.
+        bias (Tensor or None): ``[n]`` bias, in the activation dtype. May be
+            ``None``.
+        num_bits (int): 4 or 8.
+        activation_raw (int): an ``ActivationType`` value. See the module
+            constants.
+
+    Returns:
+        Tensor: ``output``, updated in place.
+
+    The checks are ``_check_launch_arguments`` above, shared with the backends
+    that override this operator, so the contract cannot differ from one device to
+    the next.
+    """
+    logger.debug("TRAIN MIXED_GEMM")
+
+    m, n, k = _check_launch_arguments(
+        output, hidden_states, weight, scales, bias, num_bits, activation_raw
+    )
 
     # Keyword-only and defaulted, so the seven-argument call every caller uses still
     # gets one fixed configuration. Overriding them is for measuring on a new part, not
