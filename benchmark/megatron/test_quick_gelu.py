@@ -29,7 +29,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import quick_gelu as flag_train_quick_gelu
 
 from .. import base
 
@@ -96,7 +95,7 @@ def _run(is_backward):
         dtypes=_dtypes(),
         is_backward=is_backward,
     )
-    bench.set_train(flag_train_quick_gelu)
+    bench.set_train(flag_train.megatron.quick_gelu)
     # On Ascend, enable parallel scheduling of all blocks to avoid excessive logical cores
     # and reduce scheduling overhead when the logical core count exceeds 65,535.
     # See https://github.com/flagos-ai/FlagGems/pull/7304

@@ -29,7 +29,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import quick_gelu as flag_train_quick_gelu
 
 from .. import accuracy_utils as utils
 
@@ -79,7 +78,7 @@ def _assert_close(actual, expected, dtype):
 
 def _check_forward_and_backward(x):
     dtype = x.dtype
-    y = flag_train_quick_gelu(x)
+    y = flag_train.megatron.quick_gelu(x)
     assert y.shape == x.shape
     assert y.dtype == dtype
 
@@ -88,7 +87,7 @@ def _check_forward_and_backward(x):
 
     grad_out = torch.randn_like(y)
     x_train = x.detach().requires_grad_(True)
-    flag_train_quick_gelu(x_train).backward(grad_out)
+    flag_train.megatron.quick_gelu(x_train).backward(grad_out)
 
     x_ref = _reference(x).requires_grad_(True)
     reference_quick_gelu(x_ref).backward(_reference(grad_out))
