@@ -98,6 +98,10 @@ class BackendState:
         self.vendor_extra_lib_imported = False
         self.device_fn_cache = {}
         self.customized_ops = None
+        # True while ``get_customized_ops`` imports the vendor's packages, and
+        # the registrars that asked to run during that window.
+        self.customized_ops_loading = False
+        self.pending_spec_ops = []
 
     def is_available(self):
         return True
@@ -291,6 +295,17 @@ class SpecOpRegistrar:
 
     def apply(self, vendor=None):
         vendor = vendor or self.vendor
+        if _state.customized_ops_loading:
+            # Importing a vendor operator module can pull in a generic package,
+            # whose own registrar runs here while the vendor's ops package is
+            # still half imported: every operator of the subpackage being built
+            # would be missing from the list it registers. Defer to the
+            # outermost ``get_customized_ops``, which replays this.
+            _state.pending_spec_ops.append((self._globals, vendor))
+            return
+        self._register(vendor)
+
+    def _register(self, vendor):
         spec_events = self._get_specific_events()
         for event in spec_events:
             if not event.is_available():
@@ -443,9 +458,19 @@ def get_customized_ops(vendor_name=None):
     import_vendor_extra_lib(vendor_name)
     if _state.customized_ops is not None:
         return _state.customized_ops
-    _state.customized_ops = list(iter_package_functions(_state.ops_module))
-    _state.customized_ops += iter_package_functions(_state.fused_module)
-    return _state.customized_ops
+    _state.customized_ops_loading = True
+    try:
+        ops = list(iter_package_functions(_state.ops_module))
+        ops += list(iter_package_functions(_state.fused_module))
+    finally:
+        _state.customized_ops_loading = False
+    _state.customized_ops = ops
+    # Registrars that ran during that import saw a half-built ops package; now
+    # that it is complete, register them against it.
+    pending, _state.pending_spec_ops = _state.pending_spec_ops, []
+    for registry, vendor in pending:
+        SpecOpRegistrar(registry, vendor)._register(vendor)
+    return ops
 
 
 def get_ops(vendor_name=None):
