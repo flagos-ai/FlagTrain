@@ -9,9 +9,10 @@ versions and hardware actually verified are in ``docs/compatibility.md``.
 
 # ``deepspeed`` is imported for the attribute after a bare ``import flag_train``,
 # and for its side effect: importing that package is what runs the vendor-operator
-# registration that decides which ``blocked_flash`` its names receive. ``testing``
-# is a re-export. ``runtime`` is used just below.
-from flag_train import deepspeed, runtime, testing  # noqa: F401
+# registration that decides which ``blocked_flash`` its names receive. ``megatron``
+# works the same way for its own names. ``testing`` is a re-export. ``runtime`` is
+# used just below.
+from flag_train import deepspeed, megatron, runtime, testing  # noqa: F401
 
 device = runtime.device.name
 vendor_name = runtime.device.vendor_name

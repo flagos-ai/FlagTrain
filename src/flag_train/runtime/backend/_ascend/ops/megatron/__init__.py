@@ -24,4 +24,6 @@ To specialise an operator, define it under this package, re-export it here
 overrides.
 """
 
-__all__ = []
+from .fused_pad_routing_map import fused_pad_routing_map
+
+__all__ = ["fused_pad_routing_map"]
