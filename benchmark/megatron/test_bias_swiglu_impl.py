@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Performance benchmark for fused bias + SwiGLU.
+"""Performance benchmark for bias_swiglu_impl / weighted_bias_swiglu_impl.
 
 The baseline is Megatron-LM's own ``bias_swiglu_impl`` /
 ``weighted_bias_swiglu_impl`` when it is installed. Those functions are
@@ -249,70 +249,74 @@ def _run(is_backward, input_fn, torch_op, train_op, op_name, op_kwargs=None):
 
 
 @pytest.mark.bias_swiglu_impl
-def test_bias_swiglu_perf():
+def test_bias_swiglu_impl_perf():
     _run(
         False,
         bias_swiglu_input_fn,
         base_op(),
         flag_train.megatron.bias_swiglu_impl,
-        "bias_swiglu",
+        "bias_swiglu_impl",
     )
 
 
 @pytest.mark.bias_swiglu_impl
-def test_bias_swiglu_backward_perf():
+def test_bias_swiglu_impl_backward_perf():
     _run(
         True,
         bias_swiglu_input_fn,
         base_op(),
         flag_train.megatron.bias_swiglu_impl,
-        "bias_swiglu_backward",
+        "bias_swiglu_impl_backward",
     )
 
 
 @pytest.mark.bias_swiglu_impl
-def test_weighted_bias_swiglu_perf():
+def test_weighted_bias_swiglu_impl_perf():
     _run(
         False,
         weighted_bias_swiglu_input_fn,
         base_op(weighted=True),
         flag_train.megatron.weighted_bias_swiglu_impl,
-        "weighted_bias_swiglu",
+        "weighted_bias_swiglu_impl",
     )
 
 
 @pytest.mark.bias_swiglu_impl
-def test_weighted_bias_swiglu_backward_perf():
+def test_weighted_bias_swiglu_impl_backward_perf():
     _run(
         True,
         weighted_bias_swiglu_input_fn,
         base_op(weighted=True),
         flag_train.megatron.weighted_bias_swiglu_impl,
-        "weighted_bias_swiglu_backward",
+        "weighted_bias_swiglu_impl_backward",
     )
 
 
 @pytest.mark.bias_swiglu_impl
 @pytest.mark.parametrize("is_backward", [False, True], ids=["forward", "backward"])
-def test_bias_swiglu_clamped_perf(is_backward):
+def test_bias_swiglu_impl_clamped_perf(is_backward):
     _run(
         is_backward,
         bias_swiglu_input_fn,
         base_op(**_CLAMPED_KWARGS),
         flag_train.megatron.bias_swiglu_impl,
-        "bias_swiglu_clamped_backward" if is_backward else "bias_swiglu_clamped",
+        (
+            "bias_swiglu_impl_clamped_backward"
+            if is_backward
+            else "bias_swiglu_impl_clamped"
+        ),
         op_kwargs=_CLAMPED_KWARGS,
     )
 
 
 @pytest.mark.bias_swiglu_impl
 @pytest.mark.parametrize("is_backward", [False, True], ids=["forward", "backward"])
-def test_bias_swiglu_situ_perf(is_backward):
+def test_bias_swiglu_impl_situ_perf(is_backward):
     _run(
         is_backward,
         bias_swiglu_input_fn,
         base_op(**_SITU_KWARGS),
         flag_train.megatron.bias_swiglu_impl,
-        "bias_swiglu_situ_backward" if is_backward else "bias_swiglu_situ",
+        "bias_swiglu_impl_situ_backward" if is_backward else "bias_swiglu_impl_situ",
         op_kwargs=_SITU_KWARGS,
     )
