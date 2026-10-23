@@ -72,6 +72,14 @@ _SHAPES = [
     (4, 7, 32),
 ]
 
+# bias 与 shape / variant 正交，只在代表形状和变体上做带 bias 的抽查。
+_BIAS_SHAPES = [
+    (1, 2),
+    (17, 32),
+    (64, 128),
+    (4, 7, 32),
+]
+
 _VARIANTS = {
     "plain": {},
     "clamped": {"clamp_value": 1.5},
@@ -226,29 +234,39 @@ def _check_weighted(x, weights, **kwargs):
 @pytest.mark.bias_swiglu_impl
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-@pytest.mark.parametrize("with_bias", [False, True])
-def test_bias_swiglu_impl(shape, dtype, with_bias):
+def test_bias_swiglu_impl(shape, dtype):
     utils.init_seed(0)
     x = torch.randn(shape, dtype=dtype, device=flag_train.device)
-    bias = (
-        torch.randn(shape[-1], dtype=dtype, device=flag_train.device)
-        if with_bias
-        else None
-    )
+    _check_bias_swiglu(x, None)
+
+
+@pytest.mark.bias_swiglu_impl
+@pytest.mark.parametrize("shape", _BIAS_SHAPES)
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_bias_swiglu_impl_bias(shape, dtype):
+    utils.init_seed(0)
+    x = torch.randn(shape, dtype=dtype, device=flag_train.device)
+    bias = torch.randn(shape[-1], dtype=dtype, device=flag_train.device)
     _check_bias_swiglu(x, bias)
 
 
 @pytest.mark.bias_swiglu_impl
 @pytest.mark.parametrize("variant", list(_VARIANTS))
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-@pytest.mark.parametrize("with_bias", [False, True])
-def test_bias_swiglu_impl_variants(variant, dtype, with_bias):
+def test_bias_swiglu_impl_variants(variant, dtype):
     utils.init_seed(1)
     scale = _scale_for(variant)
     x = torch.randn((16, 64), dtype=dtype, device=flag_train.device) * scale
-    bias = None
-    if with_bias:
-        bias = torch.randn((64,), dtype=dtype, device=flag_train.device)
+    _check_bias_swiglu(x, None, **_variant_kwargs(variant))
+
+
+@pytest.mark.bias_swiglu_impl
+@pytest.mark.parametrize("variant", list(_VARIANTS))
+def test_bias_swiglu_impl_variants_bias(variant):
+    utils.init_seed(1)
+    scale = _scale_for(variant)
+    x = torch.randn((16, 64), dtype=torch.float16, device=flag_train.device) * scale
+    bias = torch.randn((64,), dtype=torch.float16, device=flag_train.device)
     _check_bias_swiglu(x, bias, **_variant_kwargs(variant))
 
 
