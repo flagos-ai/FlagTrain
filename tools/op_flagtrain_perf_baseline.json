@@ -1,0 +1,1370 @@
+{
+  "_environment": {
+    "schema_version": 1,
+    "collected_at_utc": "2026-10-23T00:45:47.495858+00:00",
+    "hardware": {
+      "gpu": {
+        "name": "NVIDIA H20-3e",
+        "uuid": "1ab48497-787b-cb0e-c979-c7718ddb6cdc",
+        "total_memory_bytes": 150121021440,
+        "total_memory_gib": 139.81,
+        "compute_capability": "9.0",
+        "multiprocessor_count": 78,
+        "cuda_device_index": 0,
+        "driver_version": "570.158.01"
+      },
+      "cpu_model": "INTEL(R) XEON(R) PLATINUM 8558",
+      "cpu_architecture": "x86_64",
+      "cpu_socket_count": 2,
+      "physical_cpu_core_count": 96,
+      "logical_cpu_count": 192,
+      "cpu_threads_per_core": 2,
+      "numa_node_count": 2,
+      "process_cpu_affinity_count": 192,
+      "hypervisor_vendor": null
+    },
+    "software": {
+      "os": "Linux",
+      "os_release": "5.4.0-48-generic",
+      "machine": "x86_64",
+      "python": "3.12.3",
+      "packages": {
+        "torch": "2.11.0a0+eb65b36914.nv26.2",
+        "triton": "3.6.0",
+        "vllm": null,
+        "sglang": null
+      },
+      "torch_cuda_version": "13.1",
+      "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Tue_Dec_16_07:23:41_PM_PST_2025\nCuda compilation tools, release 13.1, V13.1.115\nBuild cuda_13.1.r13.1/compiler.37061995_0",
+      "ncu_version": "NVIDIA (R) Nsight Compute Command Line Profiler\nCopyright (c) 2018-2025 NVIDIA Corporation\nVersion 2025.4.1.0 (build 37053803) (public-release)"
+    },
+    "source": {
+      "git_commit": "7d43707757d04910585b0b97f9bdcb56faa1e56e",
+      "git_branch": "main",
+      "git_dirty": true
+    },
+    "run": {
+      "repo": "megatron",
+      "device": "5",
+      "ncu_enabled": true,
+      "report_dir": "ncu_reports",
+      "output_path": "op_megatron_perf_baseline.json",
+      "op_timeout_seconds": 1800,
+      "reference_chip": "H800",
+      "only": null,
+      "whitelist": null,
+      "blacklist": null,
+      "selected_ops": [
+        "fused_indices_to_multihot",
+        "fused_proj_rms_compute_h_fwd",
+        "quick_gelu"
+      ],
+      "latency_warmup_ms": 25,
+      "latency_rep_ms": 100,
+      "ncu_warmup_calls": 3
+    },
+    "environment_variables": {
+      "CUDA_VISIBLE_DEVICES": "5",
+      "CUDA_DEVICE_ORDER": null
+    }
+  },
+  "_scaling_factors": {
+    "_note": "factor = vendor_peak / H800_peak；null 表示分子或分母缺失；nominal/measured 各一套。供 flaggems-vllm 跨芯片归一化对比使用。",
+    "reference_chip": "H800",
+    "source_specs": "hardware_specs.json",
+    "chips": [
+      {
+        "vendor": "nvidia",
+        "vendor_zh": "英伟达",
+        "chip": "H800",
+        "nominal": {
+          "bandwidth_gbps": 1.0,
+          "tensor": {
+            "bf16": 1.0,
+            "fp16": 1.0,
+            "fp32": 1.0,
+            "tf32": 1.0,
+            "int8": 1.0,
+            "fp64": 1.0,
+            "fp8": 1.0
+          },
+          "vector": {
+            "bf16": 1.0,
+            "fp16": 1.0,
+            "fp32": 1.0,
+            "int8": null,
+            "fp64": 1.0,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 1.0,
+          "tensor": {
+            "bf16": 1.0,
+            "fp16": 1.0,
+            "fp32": 1.0,
+            "tf32": 1.0,
+            "int8": 1.0,
+            "fp64": 1.0,
+            "fp8": 1.0
+          },
+          "vector": {
+            "bf16": 1.0,
+            "fp16": 1.0,
+            "fp32": 1.0,
+            "int8": 1.0,
+            "fp64": 1.0,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "nvidia",
+        "vendor_zh": "英伟达",
+        "chip": "H100",
+        "nominal": {
+          "bandwidth_gbps": 1.0,
+          "tensor": {
+            "bf16": 1.000404,
+            "fp16": 1.000404,
+            "fp32": 1.0,
+            "tf32": 1.000404,
+            "int8": 0.999949,
+            "fp64": 66.9,
+            "fp8": 0.999949
+          },
+          "vector": {
+            "bf16": 0.998507,
+            "fp16": 0.998507,
+            "fp32": 0.998507,
+            "int8": null,
+            "fp64": 33.5,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 1.0,
+          "tensor": {
+            "bf16": 0.992845,
+            "fp16": 1.043176,
+            "fp32": 0.999938,
+            "tf32": 0.964256,
+            "int8": 0.988143,
+            "fp64": 58.895238,
+            "fp8": 1.048244
+          },
+          "vector": {
+            "bf16": 0.999955,
+            "fp16": 0.99997,
+            "fp32": 0.992604,
+            "int8": 1.0003,
+            "fp64": 29.44689,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "t-head",
+        "vendor_zh": "平头哥",
+        "chip": "PPU-ZW810E",
+        "nominal": {
+          "bandwidth_gbps": null,
+          "tensor": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "tf32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.662759,
+          "tensor": {
+            "bf16": 0.058651,
+            "fp16": 0.062691,
+            "fp32": 0.538868,
+            "tf32": 0.075912,
+            "int8": 0.027883,
+            "fp64": 6.597143,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": 0.828975,
+            "fp16": 0.828837,
+            "fp32": 0.416839,
+            "int8": 0.206073,
+            "fp64": 6.120574,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "t-head",
+        "vendor_zh": "平头哥",
+        "chip": "m890",
+        "nominal": {
+          "bandwidth_gbps": null,
+          "tensor": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "tf32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.781483,
+          "tensor": {
+            "bf16": 0.281445,
+            "fp16": 0.300869,
+            "fp32": 0.257819,
+            "tf32": 0.161166,
+            "int8": null,
+            "fp64": null,
+            "fp8": 0.042014
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": 0.194236,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "enflame",
+        "vendor_zh": "燧原",
+        "chip": "S60",
+        "nominal": {
+          "bandwidth_gbps": 0.200597,
+          "tensor": {
+            "bf16": 0.132457,
+            "fp16": 0.132457,
+            "fp32": 0.478326,
+            "tf32": null,
+            "int8": 0.13239,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.150325,
+          "tensor": {
+            "bf16": 0.135388,
+            "fp16": 0.144762,
+            "fp32": 0.672654,
+            "tf32": null,
+            "int8": 0.134391,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": 0.026166,
+            "fp16": 0.026197,
+            "fp32": 0.029496,
+            "int8": 0.013308,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "ascend",
+        "vendor_zh": "华为",
+        "chip": "Atlas 800T A3",
+        "nominal": {
+          "bandwidth_gbps": null,
+          "tensor": {
+            "bf16": null,
+            "fp16": 0.760364,
+            "fp32": null,
+            "tf32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.951084,
+          "tensor": {
+            "bf16": 0.761695,
+            "fp16": 0.839078,
+            "fp32": 4.098971,
+            "tf32": null,
+            "int8": 0.756027,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "metax",
+        "vendor_zh": "沐曦",
+        "chip": "C550",
+        "nominal": {
+          "bandwidth_gbps": 0.537313,
+          "tensor": {
+            "bf16": 0.323559,
+            "fp16": 0.323559,
+            "fp32": 0.597907,
+            "tf32": 0.323559,
+            "int8": 0.323396,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.472532,
+          "tensor": {
+            "bf16": 0.285784,
+            "fp16": 0.298125,
+            "fp32": 0.816461,
+            "tf32": 0.265815,
+            "int8": 0.291016,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": 0.136079,
+            "fp32": 0.541991,
+            "int8": 0.068039,
+            "fp64": 2.166507,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "kunlunxin",
+        "vendor_zh": "昆仑芯",
+        "chip": "P900",
+        "nominal": {
+          "bandwidth_gbps": 0.776119,
+          "tensor": {
+            "bf16": 0.353893,
+            "fp16": 0.353893,
+            "fp32": null,
+            "tf32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.791,
+          "tensor": {
+            "bf16": 0.357504,
+            "fp16": 0.389264,
+            "fp32": 2.853909,
+            "tf32": 0.278234,
+            "int8": 0.33308,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "kunlunxin",
+        "vendor_zh": "昆仑芯",
+        "chip": "P800",
+        "nominal": {
+          "bandwidth_gbps": null,
+          "tensor": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "tf32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": null,
+          "tensor": {
+            "bf16": 0.032261,
+            "fp16": 0.03449,
+            "fp32": null,
+            "tf32": 0.062035,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "mthreads",
+        "vendor_zh": "摩尔",
+        "chip": "MTT-S5000",
+        "nominal": {
+          "bandwidth_gbps": 0.477612,
+          "tensor": {
+            "bf16": 0.434783,
+            "fp16": 0.434783,
+            "fp32": 0.433483,
+            "tf32": 0.434783,
+            "int8": 0.434563,
+            "fp64": 14.5,
+            "fp8": 0.434563
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.423867,
+          "tensor": {
+            "bf16": 0.46863,
+            "fp16": 0.499849,
+            "fp32": 0.585391,
+            "tf32": 0.449552,
+            "int8": 0.463452,
+            "fp64": 13.533333,
+            "fp8": 0.504517
+          },
+          "vector": {
+            "bf16": 0.285102,
+            "fp16": 0.284926,
+            "fp32": 0.255336,
+            "int8": 0.095037,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "hygon",
+        "vendor_zh": "海光",
+        "chip": "BW1000",
+        "nominal": {
+          "bandwidth_gbps": 0.537313,
+          "tensor": {
+            "bf16": 0.485339,
+            "fp16": 0.485339,
+            "fp32": 0.896861,
+            "tf32": 0.485339,
+            "int8": 0.485093,
+            "fp64": 30.0,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.47352,
+          "tensor": {
+            "bf16": 0.494279,
+            "fp16": 0.526445,
+            "fp32": 1.253704,
+            "tf32": 0.475373,
+            "int8": 0.490587,
+            "fp64": 29.009524,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": 0.109955,
+            "fp16": 0.45465,
+            "fp32": 0.228884,
+            "int8": 0.114093,
+            "fp64": 14.488038,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "iluvatar",
+        "vendor_zh": "天数",
+        "chip": "BI-V150",
+        "nominal": {
+          "bandwidth_gbps": 0.477612,
+          "tensor": {
+            "bf16": 0.258847,
+            "fp16": 0.258847,
+            "fp32": 0.956652,
+            "tf32": null,
+            "int8": 0.388075,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.356378,
+          "tensor": {
+            "bf16": 0.220302,
+            "fp16": 0.234676,
+            "fp32": 0.940123,
+            "tf32": null,
+            "int8": 0.391076,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": 0.461253,
+            "fp16": 0.469367,
+            "fp32": 0.230722,
+            "int8": 0.11987,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "tsingmicro",
+        "vendor_zh": "清微智能",
+        "chip": "TX8110",
+        "nominal": {
+          "bandwidth_gbps": null,
+          "tensor": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "tf32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": null,
+          "tensor": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "tf32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "tsingmicro",
+        "vendor_zh": "清微智能",
+        "chip": "REX1032",
+        "nominal": {
+          "bandwidth_gbps": 0.238806,
+          "tensor": {
+            "bf16": 0.517695,
+            "fp16": 0.517695,
+            "fp32": 0.179372,
+            "tf32": 1.035389,
+            "int8": 0.517433,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.197353,
+          "tensor": {
+            "bf16": 0.525497,
+            "fp16": 0.561805,
+            "fp32": 0.251029,
+            "tf32": 0.892402,
+            "int8": 0.521583,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      },
+      {
+        "vendor": "cambricon",
+        "vendor_zh": "寒武纪",
+        "chip": "MLU590-M9DE",
+        "nominal": {
+          "bandwidth_gbps": 0.671642,
+          "tensor": {
+            "bf16": 0.33367,
+            "fp16": 0.33367,
+            "fp32": 1.233184,
+            "tf32": 0.33367,
+            "int8": 0.333502,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        },
+        "measured": {
+          "bandwidth_gbps": 0.625387,
+          "tensor": {
+            "bf16": 0.316304,
+            "fp16": 0.338258,
+            "fp32": 1.604938,
+            "tf32": 0.307205,
+            "int8": 0.312064,
+            "fp64": null,
+            "fp8": null
+          },
+          "vector": {
+            "bf16": null,
+            "fp16": null,
+            "fp32": null,
+            "int8": null,
+            "fp64": null,
+            "fp8": null
+          }
+        }
+      }
+    ]
+  },
+  "fused_indices_to_multihot": {
+    "native_api": "ops.fused_indices_to_multihot",
+    "shapes": {
+      "[4096, 2, 8]": {
+        "torch.float32": {
+          "config": {
+            "inputs": {
+              "indices": {
+                "shape": [
+                  4096,
+                  2
+                ],
+                "dtype": "torch.int32",
+                "note": "取值 [0, num_local_experts) 或 -1"
+              },
+              "probs_indices": {
+                "shape": [
+                  4096,
+                  2
+                ],
+                "dtype": "torch.float32"
+              },
+              "num_of_local_experts": {
+                "scalar": 8
+              }
+            },
+            "outputs": {
+              "multihot_indices": {
+                "shape": [
+                  4096,
+                  8
+                ],
+                "dtype": "torch.bool"
+              },
+              "probs_in_multihot": {
+                "shape": [
+                  4096,
+                  8
+                ],
+                "dtype": "torch.float32"
+              }
+            },
+            "dims": {
+              "num_tokens": 4096,
+              "topk": 2,
+              "num_local_experts": 8,
+              "topk_next_power_of_2": 2,
+              "num_local_experts_next_power_of_2": 8
+            }
+          },
+          "T_us": 7.257411746061681,
+          "latency_ms": 0.007257411746061681,
+          "F_cuda": 0.0,
+          "F_tensor": 0.0,
+          "B_mem": 68864.0,
+          "U_cuda": 3.648644,
+          "U_tensor": 0.0,
+          "U_mem": 0.315165,
+          "U_bottle_neck": 3.648644,
+          "bottle_neck_unit": "cuda",
+          "num_kernels": 1,
+          "per_kernel": [
+            {
+              "name": "_indices_to_multihot_kernel",
+              "F_cuda": 0.0,
+              "F_tensor": 0.0,
+              "B_mem": 68864.0,
+              "U_cuda": 3.648644,
+              "U_tensor": 0.0,
+              "U_mem": 0.315165,
+              "T_us": 7.257411746061681
+            }
+          ],
+          "flops_cuda_core": 0.0,
+          "flops_tensor_core": 0.0,
+          "memory_bytes": 68864.0,
+          "util_cuda_core": 0.03648644,
+          "util_tensor_core": 0.0,
+          "util_memory_bw": 0.0031516499999999998,
+          "bottleneck": "cuda_core",
+          "bottleneck_util": 0.03648644,
+          "cuda_flops": 0.0,
+          "sm_utilization": 0.10959875999999999,
+          "report_path": "ncu_reports/fused_indices_to_multihot_4096x2x8_float32.ncu-rep"
+        }
+      },
+      "[4096, 6, 8]": {
+        "torch.float32": {
+          "config": {
+            "inputs": {
+              "indices": {
+                "shape": [
+                  4096,
+                  6
+                ],
+                "dtype": "torch.int32",
+                "note": "取值 [0, num_local_experts) 或 -1"
+              },
+              "probs_indices": {
+                "shape": [
+                  4096,
+                  6
+                ],
+                "dtype": "torch.float32"
+              },
+              "num_of_local_experts": {
+                "scalar": 8
+              }
+            },
+            "outputs": {
+              "multihot_indices": {
+                "shape": [
+                  4096,
+                  8
+                ],
+                "dtype": "torch.bool"
+              },
+              "probs_in_multihot": {
+                "shape": [
+                  4096,
+                  8
+                ],
+                "dtype": "torch.float32"
+              }
+            },
+            "dims": {
+              "num_tokens": 4096,
+              "topk": 6,
+              "num_local_experts": 8,
+              "topk_next_power_of_2": 8,
+              "num_local_experts_next_power_of_2": 8
+            }
+          },
+          "T_us": 7.164940020640047,
+          "latency_ms": 0.007164940020640047,
+          "F_cuda": 0.0,
+          "F_tensor": 0.0,
+          "B_mem": 199936.0,
+          "U_cuda": 3.9960909999999994,
+          "U_tensor": 0.0,
+          "U_mem": 0.9175609999999998,
+          "U_bottle_neck": 3.9960909999999994,
+          "bottle_neck_unit": "cuda",
+          "num_kernels": 1,
+          "per_kernel": [
+            {
+              "name": "_indices_to_multihot_kernel",
+              "F_cuda": 0.0,
+              "F_tensor": 0.0,
+              "B_mem": 199936.0,
+              "U_cuda": 3.996091,
+              "U_tensor": 0.0,
+              "U_mem": 0.917561,
+              "T_us": 7.164940020640047
+            }
+          ],
+          "flops_cuda_core": 0.0,
+          "flops_tensor_core": 0.0,
+          "memory_bytes": 199936.0,
+          "util_cuda_core": 0.039960909999999995,
+          "util_tensor_core": 0.0,
+          "util_memory_bw": 0.009175609999999999,
+          "bottleneck": "cuda_core",
+          "bottleneck_util": 0.039960909999999995,
+          "cuda_flops": 0.0,
+          "sm_utilization": 0.11040763,
+          "report_path": "ncu_reports/fused_indices_to_multihot_4096x6x8_float32.ncu-rep"
+        }
+      },
+      "[4096, 4, 15]": {
+        "torch.float32": {
+          "config": {
+            "inputs": {
+              "indices": {
+                "shape": [
+                  4096,
+                  4
+                ],
+                "dtype": "torch.int32",
+                "note": "取值 [0, num_local_experts) 或 -1"
+              },
+              "probs_indices": {
+                "shape": [
+                  4096,
+                  4
+                ],
+                "dtype": "torch.float32"
+              },
+              "num_of_local_experts": {
+                "scalar": 15
+              }
+            },
+            "outputs": {
+              "multihot_indices": {
+                "shape": [
+                  4096,
+                  15
+                ],
+                "dtype": "torch.bool"
+              },
+              "probs_in_multihot": {
+                "shape": [
+                  4096,
+                  15
+                ],
+                "dtype": "torch.float32"
+              }
+            },
+            "dims": {
+              "num_tokens": 4096,
+              "topk": 4,
+              "num_local_experts": 15,
+              "topk_next_power_of_2": 4,
+              "num_local_experts_next_power_of_2": 16
+            }
+          },
+          "T_us": 7.204152047942,
+          "latency_ms": 0.007204152047942,
+          "F_cuda": 0.0,
+          "F_tensor": 0.0,
+          "B_mem": 134400.0,
+          "U_cuda": 3.7964240000000005,
+          "U_tensor": 0.0,
+          "U_mem": 0.613074,
+          "U_bottle_neck": 3.7964240000000005,
+          "bottle_neck_unit": "cuda",
+          "num_kernels": 1,
+          "per_kernel": [
+            {
+              "name": "_indices_to_multihot_kernel",
+              "F_cuda": 0.0,
+              "F_tensor": 0.0,
+              "B_mem": 134400.0,
+              "U_cuda": 3.796424,
+              "U_tensor": 0.0,
+              "U_mem": 0.613074,
+              "T_us": 7.204152047942
+            }
+          ],
+          "flops_cuda_core": 0.0,
+          "flops_tensor_core": 0.0,
+          "memory_bytes": 134400.0,
+          "util_cuda_core": 0.03796424,
+          "util_tensor_core": 0.0,
+          "util_memory_bw": 0.00613074,
+          "bottleneck": "cuda_core",
+          "bottleneck_util": 0.03796424,
+          "cuda_flops": 0.0,
+          "sm_utilization": 0.10990104,
+          "report_path": "ncu_reports/fused_indices_to_multihot_4096x4x15_float32.ncu-rep"
+        }
+      }
+    }
+  },
+  "quick_gelu": {
+    "native_api": "ops.quick_gelu",
+    "shapes": {
+      "[1]": {
+        "torch.float16": {
+          "config": {
+            "inputs": {
+              "x": {
+                "shape": [
+                  1
+                ],
+                "dtype": "torch.float16"
+              }
+            },
+            "outputs": {
+              "out": {
+                "shape": [
+                  1
+                ],
+                "dtype": "torch.float16"
+              }
+            },
+            "dims": {
+              "rank": 1,
+              "numel": 1,
+              "alpha": 1.702
+            }
+          },
+          "T_us": 4.952000011689961,
+          "latency_ms": 0.004952000011689961,
+          "F_cuda": 226.0,
+          "F_tensor": 0.0,
+          "B_mem": 3072.0,
+          "U_cuda": 0.000716,
+          "U_tensor": 0.000159,
+          "U_mem": 0.028948,
+          "U_bottle_neck": 0.028948,
+          "bottle_neck_unit": "mem",
+          "num_kernels": 1,
+          "per_kernel": [
+            {
+              "name": "triton_poi_fused_mul_sigmoid_0",
+              "F_cuda": 226.0,
+              "F_tensor": 0.0,
+              "B_mem": 3072.0,
+              "U_cuda": 0.000716,
+              "U_tensor": 0.000159,
+              "U_mem": 0.028948,
+              "T_us": 4.952000011689961
+            }
+          ],
+          "flops_cuda_core": 226.0,
+          "flops_tensor_core": 0.0,
+          "memory_bytes": 3072.0,
+          "util_cuda_core": 7.159999999999999e-06,
+          "util_tensor_core": 1.5899999999999998e-06,
+          "util_memory_bw": 0.00028948,
+          "bottleneck": "memory_bw",
+          "bottleneck_util": 0.00028948,
+          "cuda_flops": 226.0,
+          "sm_utilization": 3.18e-05,
+          "report_path": "ncu_reports/quick_gelu_1_float16.ncu-rep"
+        },
+        "torch.float32": {
+          "config": {
+            "inputs": {
+              "x": {
+                "shape": [
+                  1
+                ],
+                "dtype": "torch.float32"
+              }
+            },
+            "outputs": {
+              "out": {
+                "shape": [
+                  1
+                ],
+                "dtype": "torch.float32"
+              }
+            },
+            "dims": {
+              "rank": 1,
+              "numel": 1,
+              "alpha": 1.702
+            }
+          },
+          "T_us": 4.701100989318002,
+          "latency_ms": 0.004701100989318002,
+          "F_cuda": 132.0,
+          "F_tensor": 0.0,
+          "B_mem": 3328.0,
+          "U_cuda": 0.000669,
+          "U_tensor": 0.000167,
+          "U_mem": 0.033007,
+          "U_bottle_neck": 0.033007,
+          "bottle_neck_unit": "mem",
+          "num_kernels": 1,
+          "per_kernel": [
+            {
+              "name": "triton_poi_fused_mul_sigmoid_0",
+              "F_cuda": 132.0,
+              "F_tensor": 0.0,
+              "B_mem": 3328.0,
+              "U_cuda": 0.000669,
+              "U_tensor": 0.000167,
+              "U_mem": 0.033007,
+              "T_us": 4.701100989318002
+            }
+          ],
+          "flops_cuda_core": 132.0,
+          "flops_tensor_core": 0.0,
+          "memory_bytes": 3328.0,
+          "util_cuda_core": 6.69e-06,
+          "util_tensor_core": 1.6699999999999999e-06,
+          "util_memory_bw": 0.00033007,
+          "bottleneck": "memory_bw",
+          "bottleneck_util": 0.00033007,
+          "cuda_flops": 132.0,
+          "sm_utilization": 3.347e-05,
+          "report_path": "ncu_reports/quick_gelu_1_float32.ncu-rep"
+        },
+        "torch.bfloat16": {
+          "config": {
+            "inputs": {
+              "x": {
+                "shape": [
+                  1
+                ],
+                "dtype": "torch.bfloat16"
+              }
+            },
+            "outputs": {
+              "out": {
+                "shape": [
+                  1
+                ],
+                "dtype": "torch.bfloat16"
+              }
+            },
+            "dims": {
+              "rank": 1,
+              "numel": 1,
+              "alpha": 1.702
+            }
+          },
+          "T_us": 4.749246159642166,
+          "latency_ms": 0.004749246159642165,
+          "F_cuda": 194.0,
+          "F_tensor": 0.0,
+          "B_mem": 3072.0,
+          "U_cuda": 0.000733,
+          "U_tensor": 0.000183,
+          "U_mem": 0.033259,
+          "U_bottle_neck": 0.033259,
+          "bottle_neck_unit": "mem",
+          "num_kernels": 1,
+          "per_kernel": [
+            {
+              "name": "triton_poi_fused_mul_sigmoid_0",
+              "F_cuda": 194.0,
+              "F_tensor": 0.0,
+              "B_mem": 3072.0,
+              "U_cuda": 0.000733,
+              "U_tensor": 0.000183,
+              "U_mem": 0.033259,
+              "T_us": 4.749246159642166
+            }
+          ],
+          "flops_cuda_core": 194.0,
+          "flops_tensor_core": 0.0,
+          "memory_bytes": 3072.0,
+          "util_cuda_core": 7.33e-06,
+          "util_tensor_core": 1.83e-06,
+          "util_memory_bw": 0.00033258999999999996,
+          "bottleneck": "memory_bw",
+          "bottleneck_util": 0.00033258999999999996,
+          "cuda_flops": 194.0,
+          "sm_utilization": 3.664e-05,
+          "report_path": "ncu_reports/quick_gelu_1_bfloat16.ncu-rep"
+        }
+      },
+      "[1024]": {
+        "torch.float16": {
+          "config": {
+            "inputs": {
+              "x": {
+                "shape": [
+                  1024
+                ],
+                "dtype": "torch.float16"
+              }
+            },
+            "outputs": {
+              "out": {
+                "shape": [
+                  1024
+                ],
+                "dtype": "torch.float16"
+              }
+            },
+            "dims": {
+              "rank": 1,
+              "numel": 1024,
+              "alpha": 1.702
+            }
+          },
+          "T_us": 4.9071986146546696,
+          "latency_ms": 0.00490719861465467,
+          "F_cuda": 9216.0,
+          "F_tensor": 0.0,
+          "B_mem": 5120.0,
+          "U_cuda": 0.033554,
+          "U_tensor": 0.005162,
+          "U_mem": 0.049024,
+          "U_bottle_neck": 0.049024,
+          "bottle_neck_unit": "mem",
+          "num_kernels": 1,
+          "per_kernel": [
+            {
+              "name": "triton_poi_fused_mul_sigmoid_0",
+              "F_cuda": 9216.0,
+              "F_tensor": 0.0,
+              "B_mem": 5120.0,
+              "U_cuda": 0.033554,
+              "U_tensor": 0.005162,
+              "U_mem": 0.049024,
+              "T_us": 4.9071986146546696
+            }
+          ],
+          "flops_cuda_core": 9216.0,
+          "flops_tensor_core": 0.0,
+          "memory_bytes": 5120.0,
+          "util_cuda_core": 0.00033554,
+          "util_tensor_core": 5.162e-05,
+          "util_memory_bw": 0.00049024,
+          "bottleneck": "memory_bw",
+          "bottleneck_util": 0.00049024,
+          "cuda_flops": 9216.0,
+          "sm_utilization": 0.00123891,
+          "report_path": "ncu_reports/quick_gelu_1024_float16.ncu-rep"
+        },
+        "torch.float32": {
+          "config": {
+            "inputs": {
+              "x": {
+                "shape": [
+                  1024
+                ],
+                "dtype": "torch.float32"
+              }
+            },
+            "outputs": {
+              "out": {
+                "shape": [
+                  1024
+                ],
+                "dtype": "torch.float32"
+              }
+            },
+            "dims": {
+              "rank": 1,
+              "numel": 1024,
+              "alpha": 1.702
+            }
+          },
+          "T_us": 4.947726426701201,
+          "latency_ms": 0.004947726426701201,
+          "F_cuda": 8192.0,
+          "F_tensor": 0.0,
+          "B_mem": 7168.0,
+          "U_cuda": 0.031916,
+          "U_tensor": 0.005319,
+          "U_mem": 0.070782,
+          "U_bottle_neck": 0.070782,
+          "bottle_neck_unit": "mem",
+          "num_kernels": 1,
+          "per_kernel": [
+            {
+              "name": "triton_poi_fused_mul_sigmoid_0",
+              "F_cuda": 8192.0,
+              "F_tensor": 0.0,
+              "B_mem": 7168.0,
+              "U_cuda": 0.031916,
+              "U_tensor": 0.005319,
+              "U_mem": 0.070782,
+              "T_us": 4.947726426701201
+            }
+          ],
+          "flops_cuda_core": 8192.0,
+          "flops_tensor_core": 0.0,
+          "memory_bytes": 7168.0,
+          "util_cuda_core": 0.00031916,
+          "util_tensor_core": 5.319e-05,
+          "util_memory_bw": 0.00070782,
+          "bottleneck": "memory_bw",
+          "bottleneck_util": 0.00070782,
+          "cuda_flops": 8192.0,
+          "sm_utilization": 0.00127666,
+          "report_path": "ncu_reports/quick_gelu_1024_float32.ncu-rep"
+        },
+        "torch.bfloat16": {
+          "config": {
+            "inputs": {
+              "x": {
+                "shape": [
+                  1024
+                ],
+                "dtype": "torch.bfloat16"
+              }
+            },
+            "outputs": {
+              "out": {
+                "shape": [
+                  1024
+                ],
+                "dtype": "torch.bfloat16"
+              }
+            },
+            "dims": {
+              "rank": 1,
+              "numel": 1024,
+              "alpha": 1.702
+            }
+          },
+          "T_us": 5.188539945332274,
+          "latency_ms": 0.005188539945332274,
+          "F_cuda": 7168.0,
+          "F_tensor": 0.0,
+          "B_mem": 5376.0,
+          "U_cuda": 0.026412,
+          "U_tensor": 0.005282,
+          "U_mem": 0.052607,
+          "U_bottle_neck": 0.052607,
+          "bottle_neck_unit": "mem",
+          "num_kernels": 1,
+          "per_kernel": [
+            {
+              "name": "triton_poi_fused_mul_sigmoid_0",
+              "F_cuda": 7168.0,
+              "F_tensor": 0.0,
+              "B_mem": 5376.0,
+              "U_cuda": 0.026412,
+              "U_tensor": 0.005282,
+              "U_mem": 0.052607,
+              "T_us": 5.188539945332274
+            }
+          ],
+          "flops_cuda_core": 7168.0,
+          "flops_tensor_core": 0.0,
+          "memory_bytes": 5376.0,
+          "util_cuda_core": 0.00026412,
+          "util_tensor_core": 5.282e-05,
+          "util_memory_bw": 0.00052607,
+          "bottleneck": "memory_bw",
+          "bottleneck_util": 0.00052607,
+          "cuda_flops": 7168.0,
+          "sm_utilization": 0.00072634,
+          "report_path": "ncu_reports/quick_gelu_1024_bfloat16.ncu-rep"
+        }
+      }
+    }
+  }
+}
