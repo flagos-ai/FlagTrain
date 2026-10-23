@@ -10,6 +10,7 @@ from .lion import multi_tensor_lion
 from .mixed_moe_gemm import mixed_moe_gemm
 from .packbits import packbits
 from .unpackbits import unpackbits
+from .moe_gemm import moe_gemm
 from .wf6af16_linear import wf6af16_linear
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "multi_tensor_lion",
     "packbits",
     "unpackbits",
+    "moe_gemm",
     "wf6af16_linear",
 ]
 
