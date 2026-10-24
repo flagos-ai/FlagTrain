@@ -147,11 +147,13 @@ def base_op(weighted=False, **op_kwargs):
 
 
 def _stabilize_megatron_compile():
-    """Keep the torch.compile baseline from silently falling back to eager.
+    """Keep the compiled Megatron baseline working on every backend.
 
     ``megatron.core.jit`` sets ``jit_fuser = torch.compile`` on torch >= 2.2,
     so the native baseline recompiles per shape, dtype and requires-grad
-    pattern. The default Dynamo limit is below this suite's case count.
+    pattern; the default Dynamo limit is below this suite's case count. And
+    Inductor's async compile has to pickle the compiled Triton kernel back
+    from its worker, which some vendor Triton builds cannot do.
     """
     try:
         from megatron.core import jit
@@ -159,6 +161,23 @@ def _stabilize_megatron_compile():
         return
     if jit.jit_fuser is not torch.compile:
         return
+
+    # Inductor's async compile sends each Triton kernel to a worker process and
+    # pickles the compiled kernel back. Vendor Triton builds whose JITFunction
+    # cannot be pickled (it carries an RLock) fail there with
+    # "TypeError: cannot pickle '_thread.RLock' object" while compiling the
+    # Megatron baseline. One compile thread keeps compilation in-process; it
+    # changes compile time only, not the measured kernel time.
+    try:
+        from torch._inductor import config as inductor_config
+    except ImportError:
+        inductor_config = None
+    if (
+        inductor_config is not None
+        and getattr(inductor_config, "compile_threads", 1) != 1
+    ):
+        inductor_config.compile_threads = 1
+
     try:
         import torch._dynamo as dynamo
     except ImportError:
