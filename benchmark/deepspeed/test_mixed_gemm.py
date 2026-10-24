@@ -13,46 +13,19 @@
 # limitations under the License.
 """Performance benchmark for the mixed_gemm operator.
 
-Run ``tests/deepspeed/test_mixed_gemm.py`` green first.
+Run ``tests/deepspeed/test_mixed_gemm.py`` green first, then::
 
-Run with::
+    pytest benchmark/deepspeed/test_mixed_gemm.py -v -s
 
-    pytest benchmark/deepspeed/test_mixed_gemm.py -v -s      # -s to see the prints
+The baseline is ``_BoundReference`` -- dequantize the weight on device, then cuBLAS --
+working from the *logical* quantized matrix, so it does no layout arithmetic and the
+dequantization stays inside the timed region. The operator is the only side that has to
+get the packed layout right, so the ratio between them is a statement about this kernel.
+Comparing against an unquantized ``torch.mm`` would put a different amount of work on each
+side and needs its own benchmark.
 
-The baseline
-------------
-
-The baseline is ``_BoundReference``: dequantize the weight on device, then cuBLAS. It
-works from the *logical* quantized matrix -- the one the packed buffer was built from --
-so it does no layout arithmetic, and the operator is the only side that has to get the
-layout right. Both produce one ``[m, n]`` output over the same logical product, so the
-only thing that differs is *where the dequantization happens*: on the device before the
-GEMM, or folded into the kernel's operand fetch. That is what makes the ratio a statement
-about this kernel.
-
-The cost of quantization itself is a different question and is not answered here.
-Comparing against an unquantized ``torch.mm`` would put a different amount of work
-on each side of the ratio, so it would need its own benchmark under its own name,
-with the difference in work stated alongside it.
-
-A framework behaviour worth knowing
------------------------------------
-
-``base.py`` lines 590 and 593 hand the **same** args/kwargs to ``torch_op`` and to
-``train_op``, so the two must have identical signatures. ``lamb`` guarantees that
-by funnelling everything through ``_call``, and so does this file.
-
-A measurement to reproduce on the target hardware
--------------------------------------------------
-
-On a local RTX 4060 Laptop at 2048 cubed with int4 weights, the operator was
-*slower* than the naive baseline. 2048-squared fp16 weights are only 8 MiB and fit
-in L2, so the 4x smaller weight is never re-read from HBM: the saved bandwidth
-buys nothing and the per-element dequantization is pure cost. Quantization only
-turns saved bandwidth into saved time once the working set exceeds L2, which is
-why the shape list below includes a case that large.
-
-That number does not transfer to another part -- re-measure it here.
+``base.py`` hands the same args/kwargs to ``torch_op`` and to ``train_op``, so the two must
+have identical signatures; ``_call`` is what guarantees that here.
 """
 
 import os
@@ -67,20 +40,12 @@ from flag_train.runtime import torch_device_fn
 
 from .. import base
 
-# ``(m, k, n, num_bits)``. The framework fixes its dtype list before the shapes are
-# walked, so the bit width travels with the shape rather than in a module constant --
-# both precisions have to appear in one run.
-#
-# The set is chosen around two axes that pull in opposite directions: **how thin the
-# GEMM is** (tokens against weight) and **whether the weight exceeds L2**. Thin is where
-# quantization should win, because the weight is nearly all of the traffic; past L2 is
-# where the saved bandwidth can first turn into saved time. Both bit widths appear on
-# every axis, since int4 and int8 differ by 2x in weight size and take different
-# nibble-vs-byte paths through the kernel.
+# ``(m, k, n, num_bits)``. The bit width travels with the shape because the
+# framework fixes its dtype list before the shapes are walked. Thin and past-L2
+# are the two axes: thin is where quantization should win, past L2 is where the
+# saved bandwidth can first turn into saved time.
 _SHAPES = [
-    # Thin: few tokens against a wide weight, which is the decoding shape and the one
-    # weight-only quantization exists for. Here the weight dominates both the traffic and
-    # the footprint, so the 4x/2x smaller buffer is most of the story.
+    # Thin: few tokens, wide weight -- the decoding shape, where the weight dominates traffic.
     (1, 4096, 4096, 4),
     (64, 4096, 4096, 4),
     (1, 4096, 4096, 8),
@@ -93,9 +58,7 @@ _SHAPES = [
     (1024, 1024, 1024, 8),
     (2048, 2048, 2048, 8),
     (4096, 4096, 4096, 8),
-    # Wide and deep: many tokens, a long reduction, and an output far wider than the
-    # token count. 16384 columns is where the per-output-channel scale load and the
-    # n-dimension grid start to matter.
+    # Wide and deep: many tokens, a long reduction, 16384 output columns.
     (8192, 4096, 4096, 4),
     (2048, 4096, 16384, 4),
     (8192, 4096, 4096, 8),
@@ -104,9 +67,7 @@ _SHAPES = [
 
 _ACT = 6  # IDENTITY: keep activation time out of the GEMM measurement
 
-# Both, because ``mixed_gemm.cu``'s ``ACT_DTYPE_SWITCH`` instantiates exactly these two
-# and they take different epilogue paths; a kernel tuned against one says nothing about
-# the other. The correctness tests cover both for the same reason.
+# Both: ``mixed_gemm.cu``'s ``ACT_DTYPE_SWITCH`` instantiates exactly these two.
 _DTYPES = [torch.float16, torch.bfloat16]
 _DTYPE = _DTYPES[0]  # the dtype the probe call and the byte table use
 
@@ -115,18 +76,9 @@ _DTYPE = _DTYPES[0]  # the dtype the probe call and the byte table use
 # Quantization
 #
 # ``weight`` reaches the operator already quantized *and* already run through
-# ``preprocess_weights_for_mixed_gemm``. Only the quantization half is reproduced here,
-# because a timing does not need the layout.
-#
-# What the operator is handed is a uint8 buffer of the right length and nothing more.
-# The kernel reads it through its own index arithmetic, so arbitrary bytes make it do
-# exactly the same work; building the real layout would cost minutes at 4096 cubed and
-# change nothing that is being measured. Whether the operator reads that layout
-# correctly is the tests' question, and they answer it at 64x64 where the transform is
-# cheap.
-#
-# ``quantize`` itself is kept honest -- it feeds the baseline's dequantization, and the
-# tests pin it against DeepSpeed's ``symmetric_quantize`` bit for bit.
+# ``preprocess_weights_for_mixed_gemm``; only the quantization half is reproduced
+# here, because a timing does not need the layout. Arbitrary uint8 makes the kernel
+# do the same work, and whether it reads the real layout is the tests' question.
 # ---------------------------------------------------------------------------
 
 
@@ -136,11 +88,11 @@ def _round_half_away(x):
 
 
 def quantize(w, num_bits):
-    """``[k, n]`` fp16 -> ``([k, n] signed int64, scales fp16)``, per output channel.
+    """``[k, n]`` fp16 -> ``([k, n] signed int64, scales fp16)`` per output channel.
 
     ``symmetric_quantize``'s rules: per-column ``max|w| / 2**(bits-1)``, rounded half
     away from zero, clamped to the signed range. Verified bit-for-bit against
-    DeepSpeed: scales and values both, int4 and int8, 4096 elements each.
+    DeepSpeed.
     """
     wf = w.float()
     per_col_max = wf.abs().amax(dim=0)
@@ -156,8 +108,8 @@ def quantize(w, num_bits):
 def dequantize_logical(q, scales):
     """Logical quantized matrix -> the fp16 weight, for the reference baseline.
 
-    Takes the matrix the input builder already has, so the baseline never touches the
-    packed buffer and its timing is dequantize-plus-GEMM and nothing else.
+    The baseline never touches the packed buffer, so its timing is
+    dequantize-plus-GEMM.
     """
     return q.to(scales.dtype) * scales[None, :]
 
@@ -165,39 +117,19 @@ def dequantize_logical(q, scales):
 # ---------------------------------------------------------------------------
 # The baseline, by platform
 #
-# One rule, in one order, on one predicate -- the same rule
-# ``tests/deepspeed/test_mixed_gemm.py`` picks the oracle it holds the operator to,
-# so a reader comparing the two files sees one statement rather than two that happen to
-# resemble each other. The difference is what the choice *does*: the tests run every
-# oracle they can and skip the ones they cannot, while here the tier decides what is
-# **timed**, so the branch is exclusive.
+# One rule, on one predicate, matching the rule ``tests/deepspeed/test_mixed_gemm.py``
+# uses to pick its oracle; here the tier decides what is **timed**, so the branch is
+# exclusive.
 #
-# 1. On a backend that runs DeepSpeed's own mixed_gemm, that operator **is** the
-#    baseline. It is the operator being ported, so it is the only thing that answers
-#    "what did the port cost" -- and it is *required*: if it cannot be loaded this
-#    module raises rather than timing the torch reference and reporting it under that
-#    name, which would answer a different question.
-# 2. On any other backend, the torch reference. It is not a competitor, and the ratio
-#    there says how far the kernel is from *a* correct implementation rather than from
-#    the best one.
+# 1. A backend that runs DeepSpeed's own mixed_gemm uses that operator. It is the
+#    operator being ported, and it is required: if it cannot load, this module raises
+#    rather than reporting a torch reference under that name.
+# 2. Any other backend uses the torch reference -- a correct implementation, not the
+#    best one.
 #
-# There is no middle tier the way the blocked-flash benchmark has one: that file falls
-# back to ``flash_attn``, a real third-party competitor. Nothing comparable exists for
-# a weight-only quantized GEMM at this contract.
-#
-# Why tier 1 may not load is its own subject -- a prebuilt kernels library that lacks
-# this GPU's compute capability imports cleanly and fails only when called.
-# ``_load_deepspeed_mixed_gemm`` does the lookup and the trial call, and this module
-# turns its answer into a raise on the backends where the DeepSpeed baseline is not
-# optional.
-#
-# ``FLAG_TRAIN_ALLOW_TORCH_BASELINE=1`` turns that raise into a fallback. It exists for a
-# development machine that cannot host the DeepSpeed baseline at all: without it there is
-# no way to obtain *any* number there, and the alternative people reach for -- editing the
-# vendor set -- quietly makes the two files disagree about which baseline applies where.
-# It is not a silent fallback: the reason is printed, the baseline is named everywhere it
-# appears, and every result row carries it, so a number that travels out of this terminal
-# cannot be mistaken for one measured against DeepSpeed.
+# ``FLAG_TRAIN_ALLOW_TORCH_BASELINE=1`` turns the raise into a fallback for a
+# development machine that cannot host the DeepSpeed baseline; the reason and the
+# chosen baseline are printed and carried on every row.
 # ---------------------------------------------------------------------------
 
 # Backends whose baseline is DeepSpeed. ``mixed_gemm`` ships as a CUDA op, so only a
@@ -221,10 +153,9 @@ _DEEPSPEED_UNAVAILABLE_MSG = (
 def _load_deepspeed_mixed_gemm():
     """``(op, reason)`` -- ``op`` is ``None`` when there is not a usable one.
 
-    Import success is not enough: the kernel is prebuilt, so a library without this GPU's
-    compute capability imports cleanly and fails only when called. It is therefore called
-    once here, on random bytes -- the *values* mean nothing, but a signal or an exception
-    is exactly the finding, and ``reason`` carries it.
+    The kernel is prebuilt, so a library without this GPU's compute capability
+    imports cleanly and fails only when called; it is therefore called once here, on
+    random bytes.
     """
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
         return None, None
@@ -258,11 +189,8 @@ _DEEPSPEED_ORACLE, _DEEPSPEED_REASON = _load_deepspeed_mixed_gemm()
 _REQUIRED = flag_train.vendor_name in _DEEPSPEED_BASELINE_VENDORS
 
 # Whether this platform owes a DeepSpeed baseline that is not there. Recorded rather
-# than raised: raising here happens at *import*, which is collection time for pytest,
-# and the repository's CI maps a changed benchmark file onto
-# ``benchmark/deepspeed/<file>`` and runs it (`tools/ci_checks/select_changed_tests.py`).
-# An import-time raise turns the whole perf stage into a collection error, which says
-# nothing about this operator.
+# than raised: raising at import is a pytest collection error, which says nothing
+# about this operator.
 _BASELINE_REQUIRED_BUT_UNAVAILABLE = _REQUIRED and _DEEPSPEED_ORACLE is None
 
 _WHY = (
@@ -270,17 +198,10 @@ _WHY = (
     f"which {_DEEPSPEED_REASON}. {_DEEPSPEED_UNAVAILABLE_MSG}"
 )
 
-# The framework's own way of saying "no native baseline on this platform": the autouse
-# ``configure_native_baseline`` fixture reads this marker per test and sets
-# ``Config.skip_native``, which makes ``base.py`` skip the ``torch_op`` timing and
-# ``consts.py`` print ``Native baseline: N/A (<reason>)`` in the report header. The
-# operator under test is still timed, so the module reports what it can rather than
-# failing the whole stage over a baseline the platform cannot load.
-#
-# Appending to ``pytestmark`` at import time is enough because the fixture runs later:
-# import happens during collection, the fixture before each test. Gated on
-# ``_DEEPSPEED_ORACLE is None`` rather than on the vendor, so a platform where the
-# upstream kernel *does* load keeps it as the baseline.
+# The framework's own way of saying "no native baseline here": the autouse
+# ``configure_native_baseline`` fixture reads this marker and sets ``Config.skip_native``,
+# so the ``torch_op`` timing is skipped and the report prints ``Native baseline: N/A``.
+# ``pytestmark`` is enough because the fixture runs after import, i.e. after collection.
 if _BASELINE_REQUIRED_BUT_UNAVAILABLE and not _ALLOW_TORCH_BASELINE:
     _NATIVE_SKIP_REASON = (
         f"DeepSpeed's mixed_gemm {_DEEPSPEED_REASON}; {_DEEPSPEED_UNAVAILABLE_MSG}"
@@ -327,40 +248,25 @@ else:
 def mixed_gemm_input_fn(shape, dtype, device):
     """The inputs every implementation shares.
 
-    A dict **inside a tuple**: ``base`` does
-    ``for item in input_tuple: ... elif isinstance(item, dict): kwargs.update(item)``,
-    and iterating a bare dict yields its keys, which then arrive as positional
-    arguments and every op fails on a signature mismatch.
-
-    The shape is quantized exactly once per yield so both implementations read the
-    same weight, and ``output`` is the same buffer every time -- the operator
-    writes it in place, and re-allocating inside the timed region would measure
-    the allocator.
+    A dict **inside a tuple**: ``base`` iterates the tuple to split args from kwargs,
+    and iterating a bare dict would yield its keys instead. The shape is quantized
+    once per yield and ``output`` is reused, since the operator writes it in place.
     """
     m, k, n, num_bits = shape
     hidden = torch.randn(m, k, dtype=dtype, device=device)
     w = torch.randn(k, n, dtype=dtype, device=device)
     q, scales = quantize(w.cpu(), num_bits)
-    # The buffer's *contents* are irrelevant to a timing: the kernel reads it through its
-    # own index arithmetic, so any uint8 of the right length makes it do the same work.
-    # Running the real preprocessing here would cost minutes at 4096 cubed and change
-    # nothing that is being measured. Whether the operator reads the layout correctly is
-    # the tests' question, and they answer it at a size where the transform is cheap.
+    # Only the buffer's length matters to a timing: the kernel reads it through its own
+    # index arithmetic, and whether it reads the real layout is the tests' question.
     packed = torch.randint(
         0, 256, (k, n // (2 if num_bits == 4 else 1)), dtype=torch.uint8, device=device
     )
     scales = scales.to(device).to(dtype)
     output = torch.empty(m, n, dtype=dtype, device=device)
 
-    # ``q`` is the logical matrix the baseline dequantizes. It is what the buffer above
-    # would hold if it had been built properly, so the two sides do the same amount of
-    # arithmetic even though the operator's output is meaningless on this input.
-    #
-    # Stored at the width it actually needs, not at the int64 ``quantize`` returns. The
-    # baseline converts this to fp16 on every call, and an int64 intermediate would make
-    # that conversion -- not the dequantization -- the dominant cost: 8 bytes per element
-    # to read against 2 written, for a step the operator does not have at all. A real
-    # quantized weight is stored the way it was quantized to, which is what int8 is here.
+    # ``q`` is the logical matrix the baseline dequantizes -- what the buffer above would
+    # hold if it had been built properly. Stored at the width it needs rather than at the
+    # int64 ``quantize`` returns, so the baseline's fp16 conversion does not dominate it.
     yield (
         {
             "hidden": hidden,
@@ -378,8 +284,7 @@ def _call(op, **kwargs):
     """Hand the inputs to an implementation in the operator's own order.
 
     Every implementation goes through here, which is what keeps their signatures
-    identical -- ``base`` passes one argument tuple to both ``torch_op`` and
-    ``train_op``.
+    identical.
     """
     return op(
         kwargs["output"],
@@ -398,18 +303,12 @@ def _call(op, **kwargs):
 
 
 class _BoundReference:
-    """The baseline, holding the logical weight so its signature can stay the operator's.
+    """The baseline, holding the logical weight so its signature can stay the
+    operator's.
 
-    ``base`` hands one argument tuple to both ``torch_op`` and ``train_op``, so the two
-    must accept exactly the same call -- the operator takes seven arguments and none of
-    them is the logical matrix. Binding that matrix to the object keeps the shared call
-    identical while the baseline still works from the logical values rather than from the
-    packed buffer.
-
-    It reads the *same* logical product the operator computes, so the ratio isolates the
-    kernel. The dequantization stays **inside** the timed region: moving it out would
-    measure a bare cuBLAS GEMM against the operator's dequantize-plus-GEMM, which is a
-    different question, and one this ratio would then answer wrongly.
+    ``base`` hands one argument tuple to both ops, so binding the matrix to the object
+    keeps the shared call identical. The dequantization stays inside the timed region:
+    moving it out would compare a bare GEMM against dequantize-plus-GEMM.
     """
 
     def __init__(self, q):
@@ -427,14 +326,9 @@ class _BoundReference:
 def torch_op(**kwargs):
     """Baseline, chosen by platform. See the module docstring.
 
-    The DeepSpeed branch reads the same preprocessed buffer the operator under test
-    reads, so both sides do one ``[m, k] @ [k, n]`` product over identical inputs and
-    the ratio isolates the kernel.
-
-    The torch branch works from the logical matrix instead. ``q`` comes off the kwargs
-    rather than through ``_call``: ``base`` hands one argument tuple to both ops, so the
-    baseline cannot take an extra parameter, and binding it to the object keeps the
-    shared call identical.
+    The DeepSpeed branch reads the same preprocessed buffer as the operator; the torch
+    branch works from the logical matrix, which arrives bound to the object because
+    ``base`` passes one argument tuple to both ops.
     """
     if _DEEPSPEED_ORACLE is not None:
         return _call(_DEEPSPEED_ORACLE, **kwargs)
@@ -466,9 +360,8 @@ class MixedGemmBenchmark(base.GenericBenchmark):
 def _peak_memory_mb():
     """Peak device memory since the last reset, in MiB.
 
-    The framework does not report this and it has to be here: saving memory is one
-    of the two things weight-only quantization is for, so a benchmark that reports
-    only latency reports half the result.
+    The framework does not report this, and saving memory is half of what weight-only
+    quantization is for.
     """
     try:
         return torch.cuda.max_memory_allocated() / (1 << 20)
@@ -486,12 +379,9 @@ def _weight_bytes(shape, num_bits):
 @pytest.mark.mixed_gemm
 def test_mixed_gemm_perf():
     """Time the operator against the baseline. See the module docstring."""
-    # No baseline check here: when this platform cannot load the upstream kernel the
-    # module-level ``skip_native`` marker already tells the framework to leave the
-    # native baseline out and report it as N/A. Failing instead would make the perf
-    # stage red on a platform whose only problem is a prebuilt kernel's arch list.
-    # The tier first, so a run whose numbers moved says whether the baseline it moved
-    # against is the one this platform was supposed to pick.
+    # No baseline check: on a platform that cannot load the upstream kernel the
+    # module-level ``skip_native`` marker already tells the framework to report it as
+    # N/A. The tier goes first, so a moved number says whether its baseline moved too.
     print(f"\nOracle: {_ORACLE}\nBaseline: {_BASELINE}")
     print(f"  dtypes={[str(d) for d in _DTYPES]}  act=IDENTITY (id 6)")
     print("  weight size per shape (int4/int8, and the fp16 it replaces):")
@@ -525,9 +415,8 @@ def test_mixed_gemm_perf():
 def test_mixed_gemm_vs_deepspeed():
     """Report DeepSpeed's own operator on the same shapes.
 
-    Separate from the ratio above on purpose. Both sides now read the same preprocessed
-    B layout -- that is the whole point of the port -- so this compares kernels over
-    identical inputs rather than mixing in a layout difference.
+    Separate from the ratio above: both sides read the same preprocessed B layout, so
+    this compares kernels over identical inputs.
     """
     print(f"\nDeepSpeed oracle: {_ORACLE}")
     if torch.cuda.is_available():

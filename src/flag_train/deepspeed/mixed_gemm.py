@@ -14,67 +14,34 @@
 """Mixed-precision GEMM with weight-only integer quantization.
 
 Port of DeepSpeed's ``mixed_gemm`` (``csrc/quantization/mixed_gemm.cpp`` and
-``fastertransformer``'s ``CutlassFpAIntBGemmRunner``). The activations stay in
-their input dtype while the weights are int4/int8 with a per-output-channel
-scale; the dequantization is folded into the GEMM's operand fetch.
+``fastertransformer``'s ``CutlassFpAIntBGemmRunner``): fp16/bf16 activations against an
+int4/int8 weight with a per-output-channel scale, dequantized in the kernel's operand
+fetch. ``weight`` arrives already quantized and packed in DeepSpeed's
+``preprocess_weights_for_mixed_gemm`` layout (pinned by ``mixed_gemm_B_layout.h``); this
+operator performs no quantization.
 
-The operator contract is taken verbatim from DeepSpeed's launcher: ``weight`` has
-shape ``[k, n]`` (checked by ``TORCH_CHECK(weight.size(0) == k)``), ``scales`` has
-shape ``[n]``, and ``weight`` arrives already quantized and packed -- this operator
-performs no quantization. Producing that packed weight is DeepSpeed's offline
-``symmetric_quantize`` + ``preprocess_weights_for_mixed_gemm`` preprocessing, which
-is a separate concern and is not part of this port.
+Deviations: the gated activations (``GEGLU``/``ReGLU``/``SiGLU``) are declared but rejected,
+as DeepSpeed's runner rejects them; the activation is selected by a ``tl.constexpr`` rather
+than at C++ template instantiation, which keeps one kernel instead of four.
 
-Weight layout
--------------
-
-``weight`` is what ``preprocess_weights_for_mixed_gemm`` produces, so this
-operator can be dropped in wherever DeepSpeed's ``mixed_gemm`` is used. That
-layout is pinned by ``mixed_gemm_B_layout.h``: ``ColumnMajorTileInterleave`` with
-``ThreadblockK = 64`` and ``ColumnsInterleaved = (128*8/bits)/64`` (4 for int4,
-2 for int8), followed by four transforms in order -- row permutation, 64x64
-sub-byte transpose, column interleave, then ``+8``/``+128`` with an
-intra-register reorder.
-
-The kernel recomputes the resulting address arithmetically rather than walking
-those four transforms. Each logical ``(k, n)`` maps to an element *slot*, whose
-parity picks the nibble for int4. Because the layout is a permutation of the
-weight's bytes, a 2-D shape no longer describes it, so ``weight`` is addressed
-flat and must be contiguous.
-
-Deviations from DeepSpeed
--------------------------
-
-1. **Gated activations.** ``ActivationType`` also declares ``GEGLU``/``ReGLU``/
-   ``SiGLU``, but DeepSpeed's ``fpA_intB`` runner rejects them at runtime
-   ("Fused gated activations not supported"), so this port rejects them too.
-
-2. **Activation dispatch.** DeepSpeed selects the epilogue at C++ template
-   instantiation time. This port makes the same choice at kernel-compile time via
-   a ``tl.constexpr``, which keeps one kernel instead of four.
-
-This is the generic implementation. A backend with a specialised kernel replaces
-this *name* through ``runtime.backend.SpecOpRegistrar`` when
-``flag_train.deepspeed`` is imported, so that is where to import the operator
-from -- importing it from this module gets the generic kernel on every backend.
+This is the generic implementation. A backend with a specialised kernel replaces this *name*
+through ``runtime.backend.SpecOpRegistrar`` when ``flag_train.deepspeed`` is imported, so
+import the operator from there, not from this module.
 """
 
 import logging
 
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
-from flag_train.utils import libentry
+from flag_train.utils import libentry, tl_extra_shim
 from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-# ``ActivationType`` values, verbatim from DeepSpeed's ``utils/activation_type.h``.
-# ``IDENTITY`` is 6, not 0. ``tl.constexpr`` so the kernel can read them; host code
-# wraps them back with ``int(...)``.
+# ``ActivationType`` values, from DeepSpeed's ``utils/activation_type.h``. ``IDENTITY`` is 6, not 0.
 GELU = tl.constexpr(0)
 RELU = tl.constexpr(1)
 SILU = tl.constexpr(2)
@@ -84,8 +51,7 @@ SiGLU = tl.constexpr(5)
 IDENTITY = tl.constexpr(6)
 INVALID_TYPE = tl.constexpr(-1)
 
-# The runner supports exactly these four; ``fpA_intB_gemm_template.h`` switches
-# over them and rejects everything else.
+# The runner supports exactly these four; everything else is rejected.
 _SUPPORTED_ACTIVATIONS = frozenset((int(GELU), int(RELU), int(SILU), int(IDENTITY)))
 _GATED_ACTIVATIONS = frozenset((int(GEGLU), int(ReGLU), int(SiGLU)))
 
@@ -114,30 +80,10 @@ def mixed_gemm_kernel(
 ):
     """Weight-only dequantization fused into a tiled GEMM.
 
-    Mirrors ``CutlassFpAIntBGemmRunner::gemm_bias_act``: the weight tile is
-    dequantized as it is fetched (``w = (q - 2**(bits-1)) * scale[n]``), the
-    product accumulates in fp32 through the tensor cores, and the epilogue adds
-    the bias and applies the activation before storing in the output dtype.
-
-    Args:
-        output_ptr: output ``[m, n]``, same dtype as ``hidden_states``.
-        hidden_states_ptr: activations ``[m, k]`` (fp16 or bf16). Never quantized.
-        weight_ptr: quantized weight in DeepSpeed's preprocessed layout, as a flat
-            uint8 buffer of ``k * ceil(n/2)`` bytes for int4 or ``k * n`` for int8.
-        scales_ptr: per-output-channel scales ``[n]``, in the activation dtype.
-        bias_ptr: optional ``[n]`` bias, in the activation dtype. Only
-            dereferenced when ``HAS_BIAS``.
-        m, n, k: problem dimensions.
-        stride_hm, stride_hk: row/column strides of ``hidden_states``.
-        stride_om, stride_on: row/column strides of ``output``.
-        HAS_BIAS: whether ``bias_ptr`` is meaningful.
-        ACT_TYPE: an ``ActivationType`` value; see the module constants.
-        NUM_BITS: 4 or 8.
-        BLOCK_M, BLOCK_N, BLOCK_K: tile sizes.
-
-    ``scale[n]`` carries no ``k``, so it is hoisted out of the reduction:
-    ``sum_k a[m,k]*q[k,n]*s[n] == s[n] * sum_k a[m,k]*q[k,n]``. That is why one
-    scale load outside the K loop suffices.
+    Mirrors ``CutlassFpAIntBGemmRunner::gemm_bias_act``: ``w = (q - 2**(bits-1)) * scale[n]``
+    is computed as the tile is fetched, the product accumulates in fp32, and the epilogue
+    adds the bias and applies the activation. ``scale[n]`` carries no ``k``, so it is hoisted
+    out of the reduction.
     """
     pid_m = tle.program_id(0)
     pid_n = tle.program_id(1)
@@ -152,16 +98,13 @@ def mixed_gemm_kernel(
 
     sc = tl.load(scales_ptr + cols, mask=cols_mask, other=0.0)
 
-    # Layout constants, straight from `mixed_gemm_B_layout.h`:
-    #   ThreadblockK = 64, ElementsPerCacheLine = 128*8/bits,
-    #   ColumnsInterleaved = ElementsPerCacheLine / ThreadblockK.
+    # Layout constants, straight from ``mixed_gemm_B_layout.h``.
     EIR = 32 // NUM_BITS  # elements per 32-bit register
     INTER = 16 // NUM_BITS  # columns_interleaved: 4 (int4), 2 (int8)
     VPT = 2 * NUM_BITS  # rows_per_column_tile // EIR
     BROWS = 8 * (16 // NUM_BITS)  # B_ROWS_PER_MMA
 
-    # Column side of stages 2-3. `k` is the reduction length, which is the R of
-    # the [R, C] = [k, n] weight.
+    # Column side of stages 2-3; ``k`` is the R of the ``[R, C] = [k, n]`` weight.
     nvr = k // EIR  # num_vec_rows
     col_part = (cols // INTER) * (nvr * INTER) + VPT * (cols % INTER)
 
@@ -175,10 +118,8 @@ def mixed_gemm_kernel(
             other=0.0,
         )
 
-        # Row side of stages 1-3. Stage 1 (permute_B_rows) is *inverted*: the C++
-        # copies input[read_row] into output[write_row], so a row's content moves
-        # to f^-1(row). Using f directly still works for int4, where f happens to
-        # be an involution, and is wrong for int8.
+        # Row side of stages 1-3. Stage 1 (permute_B_rows) is *inverted*: using f
+        # directly works for int4, where f is an involution, and is wrong for int8.
         t = koff % BROWS
         k1 = (koff // BROWS) * BROWS + ((t % 8) // 2) * EIR + 2 * (t // 8) + (t % 2)
         kr = k1 // EIR
@@ -192,9 +133,8 @@ def mixed_gemm_kernel(
         if NUM_BITS == 8:
             wq = tl.load(weight_ptr + slot, mask=wmask, other=128)
         else:
-            # Two elements share a byte. Which half is decided by the *slot's*
-            # parity, not by the column. The 0x88 pad dequantizes to
-            # (8 - 8) * scale == 0; a pad of 0 would give -8 * scale instead.
+            # Two elements share a byte, and the *slot's* parity picks the half. The
+            # 0x88 pad dequantizes to zero; a pad of 0 would give -8 * scale.
             packed = tl.load(weight_ptr + slot // 2, mask=wmask, other=0x88)
             lo = packed & 0x0F
             hi = (packed >> 4) & 0x0F
@@ -215,7 +155,8 @@ def mixed_gemm_kernel(
         acc = acc * tl.sigmoid(acc)
     elif ACT_TYPE == GELU:
         c = 0.7978845608028654  # sqrt(2 / pi), tanh approximation of GELU
-        acc = 0.5 * acc * (1.0 + libdevice.tanh(c * (acc + 0.044715 * acc * acc * acc)))
+        z = c * (acc + 0.044715 * acc * acc * acc)
+        acc = 0.5 * acc * (1.0 + tl_extra_shim.tanh(z))
 
     tl.store(
         output_ptr + rows[:, None] * stride_om + cols[None, :] * stride_on,
@@ -224,26 +165,11 @@ def mixed_gemm_kernel(
     )
 
 
-# Tile sizes, warp count and pipeline depth. These decide the kernel's shared-memory
-# footprint and its arithmetic intensity, and they are the operator's only tuning knobs.
-#
-# Measured on the target part with the benchmark framework's own settings rather than
-# taken from a default. `BLOCK_N` dominates: the weight fetch is a gather whose volume
-# scales with N -- every column of the tile reads its own set of cache lines -- so halving
-# N halves the gather, and `BLOCK_M` is then raised to put the arithmetic intensity back.
-# Ratio to the torch reference baseline, int4, on an H20 (sm_90, 78 SMs):
-#
-#     BM/BN/BK     1024 cubed  2048 cubed  4096 cubed  8192x4096x4096  2048x4096x16384
-#     128/64/32        0.715       0.575       0.796            0.516            0.543
-#     256/64/32        0.576       0.716       0.886            0.806            0.601
-#     256/32/32        0.794       0.760       0.920            0.861            0.911
-#
-# 256/32/32 wins 12 of the 14 benchmarked shapes and averages +0.139 over 128/64/32. The
-# two it does not win are the thinnest (m = 1 and m = 64), where the weight fetch is the
-# whole cost and a larger BLOCK_M only means more masked-off rows.
-#
-# ``num_stages`` and ``num_warps`` make no measurable difference at this configuration:
-# 2, 3 and 4 stages and 4 or 8 warps all land within 0.5% of one another.
+# Tile sizes, measured on the target part with the benchmark's own settings.
+# ``BLOCK_N`` dominates: the weight fetch is a gather whose volume scales with N, so
+# halving N halves the gather and ``BLOCK_M`` goes up to put the arithmetic intensity
+# back. 256/32/32 wins 12 of the 14 benchmarked shapes (+0.139 mean over 128/64/32)
+# and loses the two thinnest (m = 1, m = 64).
 _DEFAULT_TILE = {
     "BLOCK_M": 256,
     "BLOCK_N": 32,
@@ -252,20 +178,9 @@ _DEFAULT_TILE = {
     "num_stages": 3,
 }
 
-# Hygon's warp is 64 lanes where NVIDIA's is 32, and on gfx936 the sweep above inverts:
-# 128/64/32 beats the shipped tile on all nine shapes measured, by 1.3x to 2.4x
-# (4096 cubed int4: 2.307 ms / 59.6 TFLOP/s against 4.829 ms / 28.5 TFLOP/s), with
-# bit-identical output. ``BLOCK_N`` 32 -> 64 is the lever there -- the two tiles that
-# change it differ by up to 12%, while ``num_stages`` 1 and 3 agree within 0.06% and 4
-# and 8 warps at one tile are indistinguishable. Why the warp width flips the ranking is
-# not established (a 64-lane warp distributes MMA operands differently), so this is a
-# calibrated value, not a derived one. Only ``BLOCK_M``/``BLOCK_N`` are overridden, so
-# the caller's keyword arguments and the rest of the shipped tile still apply.
-#
-# The thin shapes (m = 1, m = 64) are where the sweep's absolute readings are least
-# trustworthy: outside the benchmark framework the L2 flush is too small there to mask
-# host dispatch, which on Hygon costs about as much as the kernel. The margin between
-# the two tiles survives that, since both are measured with the same host path.
+# Hygon's warp is 64 lanes, and on gfx936 the sweep above inverts: 128/64/32 wins all
+# nine shapes measured, with bit-identical output. The backend now ships its own
+# override, so this applies only to a build running the generic kernel on Hygon.
 if runtime_device.vendor_name == "hygon":
     _DEFAULT_TILE["BLOCK_M"] = 128
     _DEFAULT_TILE["BLOCK_N"] = 64
@@ -276,14 +191,9 @@ def _check_launch_arguments(
 ):
     """Validate one ``mixed_gemm`` call and return ``(m, n, k)``.
 
-    Kept out of the operator because a backend may replace the kernel without
-    replacing the contract: a vendor override imports this function rather than
-    restating the checks, so no backend can accept a call another one rejects.
-
-    These reproduce the launcher's ``TORCH_CHECK``s, so a caller gets the same
-    diagnosis the reference gives rather than a failure inside the Triton compiler
-    or the driver. The device check is the one addition: upstream is CUDA-only and
-    so has no other device to name.
+    Shared with the backends that override the kernel, so no backend accepts a call another
+    one rejects. These reproduce the launcher's ``TORCH_CHECK``s; the device check is the one
+    addition.
     """
     if num_bits not in (4, 8):
         raise ValueError(f"Data width must be 4 or 8, got {num_bits}")
@@ -305,16 +215,14 @@ def _check_launch_arguments(
     if bias is not None and bias.numel() != n:
         raise ValueError(f"Expected {n} bias entries, got {bias.numel()}")
 
-    # gemm_bias_act rejects anything outside the four epilogues it instantiates;
-    # the gated ones get their own message (fpA_intB_gemm_template.h:527-532).
+    # gemm_bias_act rejects anything outside the four epilogues it instantiates.
     if activation_raw not in _SUPPORTED_ACTIVATIONS:
         if activation_raw in _GATED_ACTIVATIONS:
             raise ValueError("Fused gated activations not supported")
         raise ValueError(f"Invalid activation type: {activation_raw}")
 
-    # Against the runtime's name rather than a hard-coded "cuda": the same source
-    # runs on npu and hcu. A CPU tensor is still rejected, since the kernels would
-    # address memory the accelerator cannot see.
+    # Against the runtime's name rather than a hard-coded "cuda": the same source runs
+    # on npu and hcu. A CPU tensor is still rejected.
     for name, tensor in (
         ("output", output),
         ("hidden_states", hidden_states),
@@ -356,31 +264,21 @@ def mixed_gemm(
 ):
     """Mixed-precision GEMM with weight-only integer quantization.
 
-    Faithful port of DeepSpeed's ``mixed_gemm`` launcher. Computes
-    ``output = act(hidden_states @ dequantize(weight) + bias)`` writing into
-    ``output`` in place; ``hidden_states`` is never quantized, which is what makes
-    this a weight-only scheme.
+    ``output = act(hidden_states @ dequantize(weight) + bias)``, written into ``output`` in
+    place; ``hidden_states`` is never quantized.
 
     Args:
-        output (Tensor): ``[m, n]``, same dtype as ``hidden_states``; written in
-            place.
+        output (Tensor): ``[m, n]``, same dtype as ``hidden_states``; written in place.
         hidden_states (Tensor): activations ``[m, k]`` (fp16 or bf16).
-        weight (Tensor): packed quantized weight ``[k, ceil(n/2)]`` uint8 for
-            int4 or ``[k, n]`` uint8 for int8. Already quantized and packed.
-        scales (Tensor): ``[n]`` per-output-channel scales, in the activation
-            dtype.
-        bias (Tensor or None): ``[n]`` bias, in the activation dtype. May be
-            ``None``.
+        weight (Tensor): packed quantized weight, ``[k, ceil(n/2)]`` uint8 for int4 or
+            ``[k, n]`` uint8 for int8.
+        scales (Tensor): ``[n]`` per-output-channel scales, in the activation dtype.
+        bias (Tensor or None): ``[n]`` bias, in the activation dtype.
         num_bits (int): 4 or 8.
-        activation_raw (int): an ``ActivationType`` value. See the module
-            constants.
+        activation_raw (int): an ``ActivationType`` value.
 
     Returns:
         Tensor: ``output``, updated in place.
-
-    The checks are ``_check_launch_arguments`` above, shared with the backends
-    that override this operator, so the contract cannot differ from one device to
-    the next.
     """
     logger.debug("TRAIN MIXED_GEMM")
 
@@ -388,9 +286,7 @@ def mixed_gemm(
         output, hidden_states, weight, scales, bias, num_bits, activation_raw
     )
 
-    # Keyword-only and defaulted, so the seven-argument call every caller uses still
-    # gets one fixed configuration. Overriding them is for measuring on a new part, not
-    # something a caller should need.
+    # Keyword-only and defaulted; overriding them is for measuring on a new part.
     BLOCK_M = _DEFAULT_TILE["BLOCK_M"] if BLOCK_M is None else BLOCK_M
     BLOCK_N = _DEFAULT_TILE["BLOCK_N"] if BLOCK_N is None else BLOCK_N
     BLOCK_K = _DEFAULT_TILE["BLOCK_K"] if BLOCK_K is None else BLOCK_K
@@ -398,8 +294,7 @@ def mixed_gemm(
     num_stages = _DEFAULT_TILE["num_stages"] if num_stages is None else num_stages
 
     has_bias = bias is not None
-    # Only read when HAS_BIAS, so the output doubles as the stand-in pointer and
-    # no dummy tensor is allocated.
+    # Only read when HAS_BIAS, so the output doubles as the stand-in pointer.
     bias_in = bias if has_bias else output
 
     grid = (triton.cdiv(m, BLOCK_M), triton.cdiv(n, BLOCK_N))

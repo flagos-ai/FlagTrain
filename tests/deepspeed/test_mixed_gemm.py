@@ -15,27 +15,17 @@
 
 Three checks, and they fail differently:
 
-1. ``mixed_gemm_ref`` -- a plain-torch composition of the same contract, fed the
-   **same preprocessed weight and scales the operator receives**. This is the primary
-   check and it runs on any device. Both sides read one byte stream, so a
-   disagreement is the operator's own bug and nothing to do with quantization,
-   which is why the tolerance here can be tight.
+1. ``mixed_gemm_ref`` -- a plain-torch composition of the same contract, fed the same
+   preprocessed weight the operator receives, so a disagreement is the operator's own bug.
+   The primary check; runs on any device.
+2. The quantization error -- how far the int4/int8 result sits from the unquantized product.
+   That is the scheme's cost, so it is checked against the bound quantization promises
+   (``scale[n] * sum_k |A[m, k]|``) rather than a tuned tolerance.
+3. DeepSpeed's own mixed_gemm -- the only check that can contradict our *reading* of the
+   contract; resolved at import by ``_load_deepspeed_mixed_gemm`` and reported in the skip
+   reason.
 
-2. **The quantization error itself** -- how far the int4/int8 result sits from the
-   *unquantized* fp32 product. That gap is the scheme's cost rather than a bug, so
-   it is checked against the bound quantization promises
-   (``scale[n] * sum_k |A[m, k]|``) rather than against a tuned tolerance.
-
-3. **DeepSpeed's own mixed_gemm** -- the operator this ports. It is the only check
-   that can contradict *our reading* of the contract: the two above are both
-   written from that reading, so a shared misreading survives them. Nothing about
-   the inputs blocks it, since this port reads the same preprocessed B buffer
-   DeepSpeed does; whether it runs is an environment question, resolved at import
-   time by ``_load_deepspeed_mixed_gemm`` and reported in the skip reason.
-
-Run with::
-
-    pytest tests/deepspeed/test_mixed_gemm.py -v
+Run with ``pytest tests/deepspeed/test_mixed_gemm.py -v``.
 """
 
 import logging
@@ -57,28 +47,15 @@ logger = logging.getLogger(__name__)
 # Quantization and the preprocessed weight layout
 #
 # ``weight`` reaches the operator already quantized *and* already run through
-# ``preprocess_weights_for_mixed_gemm``. Nothing in the operator produces that buffer,
-# but this file has to build one, so the transforms are transcribed here.
+# ``preprocess_weights_for_mixed_gemm``. Nothing in the operator produces that
+# buffer, but this file has to build one, so the transforms are transcribed here.
 #
-# Why the layout is *recovered* rather than computed: the reference side must not use
-# the kernel's index arithmetic. If it did, the two would agree even when both were
-# wrong, and the comparison would prove nothing -- an earlier version of this test did
-# exactly that. Instead every element is tagged with a recoverable value, the real
-# preprocessing runs, the positions are read back, and the result is required to be a
-# bijection. A nibble swap cannot satisfy that.
-#
-# Three constraints shaped the tagging, all found by running it:
-#
-# * int4 has 4096 elements and a nibble holds 16 values, so one buffer cannot carry an
-#   element index. The index is split into base-8 digits, one per pass (8**5 > 4096).
-# * The base is 8, not 15: stage 4 adds ``+8`` *before* storing, so a digit of 10 would
-#   land as 18, which does not fit a nibble and reads back as 2.
-# * ``subbyte_transpose`` recombines nibbles **across byte boundaries**, so a tag
-#   cannot describe a byte. Tracing one showed output byte 0 holding values that came
-#   from input bytes 0 and 2.
-#
-# Quantized values stay **signed** throughout. The preprocessing adds the
-# ``+8``/``+128`` bias itself, so adding it here would add it twice.
+# The layout is *recovered* rather than computed: the reference side must not use the
+# kernel's index arithmetic, or the two would agree even when both were wrong. Every
+# element is tagged with a recoverable value, the real preprocessing runs, the
+# positions are read back, and the result must be a bijection. The tag is base-8
+# (``8**5 > 4096``) rather than base-15 because stage 4 adds ``+8`` before storing;
+# values stay signed throughout, since the preprocessing adds the bias itself.
 # ---------------------------------------------------------------------------
 
 
@@ -101,9 +78,8 @@ _LAYOUT_B_COLUMN_MAJOR = True
 def _permute_b_rows(buf, num_rows, num_cols, quant_type, arch_version=80):
     """Permutes the rows of B, in units of 32-bit words.
 
-    C++ (182-201) walks word columns (``num_vec_cols`` of them) and, for each row
-    of a ``B_ROWS_PER_MMA`` group, copies whole 32-bit words. The row written at
-    ``write_row`` is read from ``tile_read_row``, computed at 189-190.
+    C++ 182-201 walks word columns and copies whole 32-bit words per row of a
+    ``B_ROWS_PER_MMA`` group, reading ``tile_read_row`` for each ``write_row``.
     """
     bits = _QUANT_BITS[quant_type]
     K = 16 // bits  # 156
@@ -150,11 +126,8 @@ _M_TILE_L1 = 64
 def _subbyte_transpose(buf, num_rows, num_cols, quant_type):
     """Transposes in 64x64 *element* tiles, at sub-byte granularity for int4.
 
-    The C++ stages a tile in ``cache_buf[64][64/elts_per_byte]``:
-      * load phase (258-272) copies whole VECTOR_WIDTH runs of bytes;
-      * swap phase (274-303) transposes the tile *in elements*, which for int4
-        means nibble-level swaps (293-300);
-      * store phase (314-327) writes to the transposed geometry.
+    C++ 258-327: load whole VECTOR_WIDTH byte runs, transpose the tile in elements
+    (nibble swaps at 293-300 for int4), then store to the transposed geometry.
     """
     bits = _QUANT_BITS[quant_type]
     elts_per_byte = 8 // bits
@@ -174,9 +147,8 @@ def _subbyte_transpose(buf, num_rows, num_cols, quant_type):
 
     src = buf.view(torch.uint8).reshape(num_rows, col_bytes)
 
-    # The store phase indexes rows by *logical element* index, 0..num_cols-1, with
-    # col_bytes_trans bytes each. For int4 that is 64 rows of 32 bytes -- the same
-    # geometry as the element cache below, one byte holding two elements.
+    # The store phase indexes rows by *logical element* index, col_bytes_trans bytes
+    # each: for int4, 64 rows of 32 bytes, one byte holding two elements.
     dst = torch.zeros(num_cols, col_bytes_trans, dtype=torch.uint8)
 
     for row_tile_start in range(0, num_rows, _M_TILE_L1):
@@ -244,9 +216,8 @@ def _subbyte_transpose(buf, num_rows, num_cols, quant_type):
 def _interleave_column_major(buf, num_rows, num_cols, quant_type, details):
     """Reorders the column-major buffer so each tile's columns are contiguous.
 
-    C++ (479-497) walks the uint32 view: ``read_col`` over columns,
-    ``vec_read_row`` over 32-bit rows within a tile, and writes to ``write_col`` /
-    ``vec_write_row`` from 482 and 487-489.
+    C++ 479-497 walks the uint32 view: ``read_col`` over columns, ``vec_read_row``
+    over 32-bit rows within a tile, written to ``write_col`` / ``vec_write_row``.
     """
     bits = _QUANT_BITS[quant_type]
     elts_in_int32 = 32 // bits
@@ -261,13 +232,9 @@ def _interleave_column_major(buf, num_rows, num_cols, quant_type, details):
     num_vec_rows = num_rows // elts_in_int32
     vec_rows_per_tile = rows_per_tile // elts_in_int32
 
-    # The C++ views the buffer as uint32 (467-468), so read_offset and write_offset
-    # below are *word* offsets even though the variable is called *_offset.
-    #
-    # Read side: read_col * num_vec_rows + vec_read_row  ->  a [num_cols, num_vec_rows]
-    # word matrix. Write side: write_col * num_vec_rows * interleave + vec_write_row,
-    # with write_col < num_cols / interleave and vec_write_row < interleave *
-    # num_vec_rows -- so the output has the same size and is re-indexed in place.
+    # The C++ views the buffer as uint32 (467-468), so both offsets below are *word*
+    # offsets. The read side forms a [num_cols, num_vec_rows] word matrix and the write
+    # side re-indexes it in place with ``write_col < num_cols / interleave``.
     words = buf.view(torch.int32).reshape(num_cols, num_vec_rows)
     out = torch.empty(
         (num_cols // interleave, num_vec_rows * interleave),
@@ -297,12 +264,9 @@ def _interleave_column_major(buf, num_rows, num_cols, quant_type, details):
 def _add_bias_and_interleave(buf, num_elts, quant_type):
     """Adds the bias and reorders within each 32-bit register, in place.
 
-    int8 (351-371): +128 to every byte, then swap bytes 1 and 2 of each group of
-    four -- so a register [e3 e2 e1 e0] becomes [e3 e1 e2 e0].
-
-    int4 (373-423): +8 to every nibble (sign-extending the low one first, 382),
-    then per register [e7 e6 e5 e4 e3 e2 e1 e0] -> [e7 e5 e3 e1 e6 e4 e2 e0] via
-    the source index at 414.
+    int8 (351-371): +128 per byte, then swap bytes 1 and 2 of each group of four.
+    int4 (373-423): +8 per nibble, sign-extending the low one first, and
+    [e7 e6 e5 e4 e3 e2 e1 e0] -> [e7 e5 e3 e1 e6 e4 e2 e0] per register.
     """
     if quant_type == INT8:
         if num_elts % 4:
@@ -320,19 +284,12 @@ def _add_bias_and_interleave(buf, num_elts, quant_type):
         raise ValueError("int4 tensor must be a multiple of 8 elements")
 
     b = buf.view(torch.uint8).clone()
-    # 379-394: sign-extend the low nibble, add 8 to both, repack.
-    #
-    # The C++ is ``int8_t(packed << 4) >> 4``. That works because the shift moves
-    # the low nibble's *sign bit* (its bit 3) into bit 7 and the arithmetic shift
-    # brings it back sign-extended. Doing it on the extracted nibble instead, the
-    # sign test is ``low & 0x8``.
+    # 379-394: sign-extend the low nibble, add 8 to both, repack. The C++ uses
+    # ``int8_t(packed << 4) >> 4``; on an extracted nibble the sign test is ``low & 0x8``.
     for ii in range(num_bytes):
         byte = int(b[ii])
-        # Both nibbles are sign-extended before +8. The C++ does this with the
-        # int8_t shifts `(int8_t(x << 4) >> 4)` and `(x >> 4)` (382-383); here the
-        # sign test is bit 3. Missing the *high* nibble's sign extension
-        # makes this raise on any real weight whose high nibble reaches 8..15,
-        # which is half of them.
+        # Both nibbles are sign-extended before +8. Missing the *high* nibble's sign
+        # extension makes this raise on any real weight whose high nibble reaches 8..15.
         low = byte & 0xF
         if low & 0x8:  # bit 3 set -> negative int4, i.e. -8..-1
             low -= 16
@@ -375,12 +332,9 @@ def preprocess_weights_for_mixed_gemm(unprocessed, num_rows, num_cols, num_bits)
 
     ``unprocessed`` is the *signed* quantized matrix packed row-major: one byte per
     element for int8, two nibbles per byte for int4 with the low nibble holding the
-    even column. The bias is added by the last transform, so the input must not
-    carry it.
-
-    Both dimensions must be multiples of 64 -- the C++ asserts the row multiple and
-    the 64x64 transpose needs the column multiple. The layout is undefined outside
-    that, which is also why the operator's tile sizes are what they are.
+    even column. The bias is added by the last transform, so the input must not carry
+    it. Both dimensions must be multiples of 64 -- the layout is undefined outside
+    that.
     """
     if num_rows % 64 or num_cols % 64:
         raise ValueError(
@@ -406,11 +360,11 @@ def _round_half_away(x):
 
 
 def quantize(w, num_bits):
-    """``[k, n]`` fp16 -> ``([k, n] signed int64, scales fp16)``, per output channel.
+    """``[k, n]`` fp16 -> ``([k, n] signed int64, scales fp16)`` per output channel.
 
     ``symmetric_quantize``'s rules: per-column ``max|w| / 2**(bits-1)``, rounded half
     away from zero, clamped to the signed range. Verified bit-for-bit against
-    DeepSpeed: scales and values both, int4 and int8, 4096 elements each.
+    DeepSpeed.
     """
     wf = w.float()
     per_col_max = wf.abs().amax(dim=0)
@@ -426,8 +380,8 @@ def quantize(w, num_bits):
 def pack_signed(q, num_bits, k, n):
     """Signed quantized matrix -> the unprocessed packed buffer.
 
-    One byte per element for int8. Two nibbles per byte for int4, low nibble holding
-    the even column; an odd ``n`` leaves a padding byte, as the C++ guard produces.
+    One byte per element for int8; two nibbles per byte for int4, low nibble holding
+    the even column, with a padding byte for an odd ``n``.
     """
     if num_bits == 8:
         return (q & 0xFF).to(torch.uint8).reshape(-1)
@@ -440,9 +394,9 @@ def pack_signed(q, num_bits, k, n):
 def _reference_copy(tensor):
     """A reference-side copy.
 
-    ``utils.to_reference`` moves it to the CPU under ``--ref cpu``, which is what
-    makes the reference an independent oracle rather than a second reading of the
-    same device arithmetic.
+    ``utils.to_reference`` moves it to the CPU under ``--ref cpu``, which is what makes
+    the reference an independent oracle rather than a second reading of the device
+    arithmetic.
     """
     return utils.to_reference(tensor.clone() if tensor is not None else None)
 
@@ -453,19 +407,16 @@ def mixed_gemm_ref(
     """Plain-torch composition of the mixed_gemm contract.
 
     ``weight`` is the logical quantized matrix, not the operator's packed buffer: the
-    tests built that buffer from this matrix, so passing it directly costs nothing and
-    leaves the reference free of layout arithmetic. ``num_bits`` is unused now.
+    tests built that buffer from this matrix, so the reference needs no layout
+    arithmetic.
 
-    Accumulates in fp64: the operator accumulates in fp32, and an fp32 reference would
-    contribute its own error on top of the one being measured, which is what keeps the
-    main assertion's tolerance meaningful.
+    Accumulates in fp64 -- the operator accumulates in fp32, and an fp32 reference
+    would add its own error on top of the one being measured.
     """
     if utils.TO_CPU:
-        # ``--ref cpu`` promises the reference *computation* is on the CPU, not only
-        # its result. Asserting that precondition here rather than at the call sites
-        # is what makes a test that forgets ``_reference_copy`` fail loudly instead
-        # of quietly becoming a second reading of the device arithmetic -- which
-        # would pass while testing nothing. Same guard as ``test_lamb.py``.
+        # ``--ref cpu`` promises the reference *computation* is on the CPU, not only its
+        # result; asserting it here makes a test that forgets ``_reference_copy`` fail
+        # loudly instead of quietly becoming a second reading of the device arithmetic.
         for name, operand in (
             ("hidden_states", hidden_states),
             ("weight", weight),
@@ -499,24 +450,20 @@ def mixed_gemm_ref(
 # ---------------------------------------------------------------------------
 # DeepSpeed's own operator, if this machine can run it
 #
-# The one check that can contradict the reading of the contract: everything else here is
-# written from that reading, so a shared misreading survives it.
+# The one check that can contradict the reading of the contract.
 #
-# Loading it is not the same as running it. ``mixed_gemm`` ships as a prebuilt kernels
-# library, so a build that lacks this GPU's compute capability imports cleanly and fails
-# only when called -- and it fails with a signal in the runner's configuration search, not
-# an exception. ``_load_deepspeed_mixed_gemm`` therefore calls the operator once on a
-# small input rather than trusting a successful import, and returns ``None`` (with the
-# reason in ``_DEEPSPEED_UNAVAILABLE_MSG``) so the suite still runs.
+# Loading it is not running it: ``mixed_gemm`` ships as a prebuilt kernels library, so
+# a build without this GPU's compute capability imports cleanly and fails only when
+# called, with a signal rather than an exception. ``_load_deepspeed_mixed_gemm``
+# therefore calls it once and returns ``None``.
 # ---------------------------------------------------------------------------
 
 # Backends whose reference is DeepSpeed. ``mixed_gemm`` ships as a CUDA op, so only a
 # backend that can compile and execute one can host it.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
 
-# Set to 1 to make "no reference" an error instead of a skip. A dedicated environment
-# should set it, so an absent reference cannot quietly thin the suite there; a generic
-# runner should not, so the rest of the file still runs.
+# Set to 1 to make "no reference" an error instead of a skip; a dedicated
+# environment sets it, a generic runner does not.
 _REQUIRE_DEEPSPEED = os.environ.get("FLAG_TRAIN_REQUIRE_DEEPSPEED", "") == "1"
 
 _DEEPSPEED_UNAVAILABLE_MSG = (
@@ -531,10 +478,9 @@ _DEEPSPEED_UNAVAILABLE_MSG = (
 def _load_deepspeed_mixed_gemm():
     """DeepSpeed's ``mixed_gemm``, or ``None`` when there is not a usable one.
 
-    ``None`` covers both "this backend does not use DeepSpeed" and "it is installed but
-    cannot run here". Which of those is fatal is the caller's decision, through
-    ``_REQUIRE_DEEPSPEED``: a dedicated environment sets it so an absent reference cannot
-    quiet the suite, and a generic runner does not, so the rest of the file still runs.
+    ``None`` covers both "this backend does not use DeepSpeed" and "it is installed
+    but cannot run here"; which of those is fatal is ``_REQUIRE_DEEPSPEED``'s
+    decision.
     """
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
         return None
@@ -547,9 +493,8 @@ def _load_deepspeed_mixed_gemm():
         logger.warning("DeepSpeed's mixed_gemm could not be loaded: %s", exc)
         return None
 
-    # Import success says nothing about whether the kernel can dispatch here. Random bytes
-    # are not a valid quantized weight, so the *values* mean nothing; a signal or an
-    # exception is the finding, and both are what a missing compute capability produces.
+    # Import success says nothing about dispatch here; a signal or an exception is the
+    # finding.
     m = k = n = 128
     try:
         hidden = torch.randn(m, k, dtype=torch.float16, device=runtime_device.name)
@@ -590,20 +535,17 @@ requires_deepspeed_reference = pytest.mark.skipif(
 def _build(m, k, n, num_bits, dtype, seed):
     """One reproducible case.
 
-    Returns ``(output, hidden, weight, q, scales, bias)``. ``weight`` is the operand
-    the operator's contract takes -- already preprocessed. ``q`` is the signed
-    quantized matrix that buffer was built from, kept so the reference can use it
-    directly: recovering it from the buffer would mean re-deriving the layout, which is
-    slower and would put the same addressing on both sides of the comparison.
+    Returns ``(output, hidden, weight, q, scales, bias)``, with ``weight`` already
+    preprocessed for the operator and ``q`` the signed matrix it was built from, so the
+    reference can avoid re-deriving the layout.
     """
     torch.manual_seed(seed)
     device = flag_train.device
     hidden = torch.randn(m, k, dtype=dtype, device=device)
     w = torch.randn(k, n, dtype=dtype, device=device)
     q, scales = quantize(w.cpu(), num_bits)
-    # Keep the 2-D shape: the operator reads ``weight.size(0)`` to check it against
-    # ``k`` and derives ``n`` from ``weight.size(1)``, so a flat buffer would be
-    # rejected before reaching the kernel.
+    # Keep the 2-D shape: the operator checks ``size(0)`` against ``k`` and takes ``n``
+    # from ``size(1)``.
     packed = (
         preprocess_weights_for_mixed_gemm(
             pack_signed(q, num_bits, k, n), k, n, num_bits
@@ -612,10 +554,8 @@ def _build(m, k, n, num_bits, dtype, seed):
         .to(device)
     )
     scales = scales.to(device).to(dtype)
-    # ``q`` goes to the device too: the reference multiplies it against ``hidden``, and
-    # mixing a CPU operand with a device one is an error rather than a slow path. Above
-    # int8's size this is the same order of memory as the output, which is acceptable
-    # for a test; the benchmark keeps it on the host and moves only what it must.
+    # ``q`` goes to the device too -- the reference multiplies it against ``hidden``, and
+    # mixing device and host operands is an error rather than a slow path.
     q = q.to(device)
     bias = torch.randn(n, dtype=dtype, device=device) * 0.1
     output = torch.empty(m, n, dtype=dtype, device=device)
@@ -626,11 +566,9 @@ def _build(m, k, n, num_bits, dtype, seed):
 # Cases
 # ---------------------------------------------------------------------------
 
-# Each shape makes one mask non-trivial: ``rows_mask`` / ``kmask`` / ``cols_mask``.
-# Both the weight's row count (k) and its column count (n) are multiples of 64 here,
-# because the preprocessed layout is only defined for those -- the C++ asserts the row
-# multiple and the 64x64 transpose needs the column multiple. ``m`` is free, and 65
-# and 1 are the interesting values.
+# Each shape makes one mask non-trivial: ``rows_mask`` / ``kmask`` / ``cols_mask``. Both
+# k and n are multiples of 64, since the preprocessed layout is only defined for those;
+# ``m`` is free, and 65 and 1 are the interesting values.
 _SHAPES = [
     (128, 64, 128),
     (65, 64, 128),  # m is not a multiple of BLOCK_M
@@ -643,9 +581,8 @@ _ACTS = [0, 1, 2, 6]
 _ACT_IDS = ["gelu", "relu", "silu", "identity"]
 _BITS = [4, 8]
 
-# ``mixed_gemm.cu``'s ACT_DTYPE_SWITCH instantiates exactly two activation
-# dtypes, fp16 and bf16 (``__half`` and ``__nv_bfloat16``) -- there is no fp32
-# path, so those two are the whole contract.
+# ``mixed_gemm.cu``'s ACT_DTYPE_SWITCH instantiates fp16 and bf16 only -- there is no
+# fp32 path.
 _DTYPES = [torch.float16, torch.bfloat16]
 _DTYPE_IDS = ["fp16", "bf16"]
 
@@ -657,10 +594,8 @@ _DTYPE_IDS = ["fp16", "bf16"]
 def test_mixed_gemm(shape, activation_raw, num_bits, dtype):
     """The operator must match the torch reference on the same packed weight.
 
-    Both sides read the same integers, so the quantization step does not appear
-    here at all and the tolerance is sized against fp32 accumulation over ``k``
-    plus the fp16 store instead. Sizing it against the quantization step is the
-    usual way this test ends up either vacuous or red for no reason.
+    Both sides read the same integers, so the quantization step does not appear here:
+    the tolerance is sized against fp32 accumulation over ``k`` plus the fp16 store.
     """
     m, k, n = shape
     output, hidden, packed, q, scales, bias = _build(m, k, n, num_bits, dtype, seed=0)
@@ -668,10 +603,9 @@ def test_mixed_gemm(shape, activation_raw, num_bits, dtype):
     mixed_gemm(output, hidden, packed, scales, None, num_bits, activation_raw)
 
     ref_out = torch.empty_like(output)
-    # ``ref_out`` itself must NOT go through ``_reference_copy``: that clones, and
-    # the reference would write into the clone while ``ref_out`` stays whatever
-    # ``torch.empty`` left there. What goes through it is the *inputs*, so that
-    # ``--ref cpu`` makes the reference genuinely independent.
+    # ``ref_out`` must NOT go through ``_reference_copy``: that clones, and the reference
+    # would write into the clone while ``ref_out`` stays whatever ``torch.empty`` left
+    # there. It is the *inputs* that go through it, to keep ``--ref cpu`` honest.
     mixed_gemm_ref(
         ref_out,
         _reference_copy(hidden),
@@ -681,14 +615,10 @@ def test_mixed_gemm(shape, activation_raw, num_bits, dtype):
         num_bits,
         activation_raw,
     )
-    # ``train_assert_close``'s rtol is not a choice -- flag_train.testing looks it
-    # up per dtype (1e-3 for fp16). What is a choice is atol * reduce_dim: 1e-3 *
-    # k puts the effective absolute tolerance roughly 6x above the observed gap
-    # (~2e-2 at k=128), on the fp16 store's resolution rather than the
-    # quantization step.
-    # Both sides go through ``to_reference``: under ``--ref cpu`` that is what puts
-    # them on the same device, and ``flag_train.testing.assert_close`` compares with
-    # ``torch.testing.assert_close``, which requires that.
+    # ``train_assert_close``'s rtol is looked up per dtype (1e-3 for fp16); atol *
+    # reduce_dim is the choice, and 1e-3 * k puts the effective tolerance roughly 6x above
+    # the observed gap, on the fp16 store's resolution rather than the quantization step.
+    # Both sides go through ``to_reference``, which is what puts them on one device.
     utils.train_assert_close(
         utils.to_reference(ref_out),
         utils.to_reference(output),
@@ -705,12 +635,9 @@ def test_mixed_gemm(shape, activation_raw, num_bits, dtype):
 def test_mixed_gemm_with_bias(shape, num_bits, dtype):
     """The bias must be added before the activation, not after.
 
-    RELU is the discriminating activation. With ``z`` the pre-activation, the
-    correct order gives ``relu(z + bias)`` and the wrong one gives
-    ``relu(z) + bias``: at an element where ``z`` is far below ``-|bias|`` the
-    first returns 0 and the second returns **the bias itself**. IDENTITY cannot
-    tell the two apart, which is exactly why the ordering survived unnoticed in
-    the exercise that first wrote it.
+    RELU is the discriminating activation: with ``z`` the pre-activation, the correct
+    order gives ``relu(z + bias)`` and the wrong one ``relu(z) + bias``, which at ``z``
+    far below ``-|bias|`` returns the bias itself. IDENTITY cannot tell them apart.
     """
     m, k, n = shape
     output, hidden, packed, q, scales, bias = _build(m, k, n, num_bits, dtype, seed=1)
@@ -727,9 +654,6 @@ def test_mixed_gemm_with_bias(shape, num_bits, dtype):
         num_bits,
         1,
     )
-    # Both sides go through ``to_reference``: under ``--ref cpu`` that is what puts
-    # them on the same device, and ``flag_train.testing.assert_close`` compares with
-    # ``torch.testing.assert_close``, which requires that.
     utils.train_assert_close(
         utils.to_reference(ref_out),
         utils.to_reference(output),
@@ -755,17 +679,14 @@ def test_mixed_gemm_with_bias(shape, num_bits, dtype):
 def test_mixed_gemm_matches_theoretical_bound(num_bits, dtype):
     """The gap from the *unquantized* product must stay inside the bound.
 
-    Quantization error is the scheme's cost rather than an implementation bug, so
-    it is checked against what the packing promises. Each weight moves by at most
-    one step -- the column maximum rounds to ``2**(bits-1)`` and is clipped back
-    to ``2**(bits-1) - 1``, which is a full step, not half -- so
+    Each weight moves by at most one step -- the column maximum rounds to ``2**(bits-1)``
+    and is clipped back to ``2**(bits-1) - 1`` -- so
 
         |C_hat - C_true| <= scale[n] * sum_k |A[m, k]|
 
-    holds without a factor of two. The bound is loose by design: the ``k`` error
-    terms are independent and partly cancel, so a healthy kernel uses only about
-    an eighth of it. Asserting per element rather than on the maxima is what
-    catches "the worst element happens to be fine".
+    holds without a factor of two. The bound is loose by design: the ``k`` error terms
+    partly cancel, and a healthy kernel uses about an eighth of it. Asserting per
+    element rather than on the maxima is what catches "the worst element is fine".
     """
     m, k, n = 128, 128, 128
     output, hidden, packed, q, scales, bias = _build(m, k, n, num_bits, dtype, seed=2)
@@ -792,14 +713,8 @@ def test_mixed_gemm_matches_theoretical_bound(num_bits, dtype):
 def test_mixed_gemm_int4_n_is_twice_the_packed_width():
     """For int4 the operator takes ``n`` from the weight's width, and that is exact.
 
-    ``n = weight.size(1) * 2``, so an int4 weight whose byte count per row is ``w``
-    always means ``2 * w`` output columns. There is no argument through which a
-    caller could ask for an odd ``n`` -- which is the point: a packed frame cannot
-    represent one unambiguously, and deriving ``n`` rather than trusting a parameter
-    is what makes that explicit.
-
-    The odd-``n`` behaviour that *is* observable lives in the packing, and is covered
-    by ``test_pack_int4_odd_n_pads_the_tail`` below.
+    ``n = weight.size(1) * 2``, and there is no argument through which a caller could
+    ask for an odd ``n``: a packed frame cannot represent one unambiguously.
     """
     m, k, n = 32, 64, 128
     dtype = torch.float16
@@ -823,13 +738,9 @@ def test_mixed_gemm_int4_n_is_twice_the_packed_width():
 def test_pack_int4_odd_n_pads_the_tail():
     """Packing an odd column count pads the tail, and the padding must not leak.
 
-    The odd-``n`` behaviour is only observable at the packing boundary:
-    ``symmetric_quantize`` writes ``ceil(n/2)`` bytes with the last byte's high
-    nibble unused (the C++ guards it with ``input_idx < num_cols``), which is
-    equivalent to appending a zero column before pairing.
-
-    The operator itself never sees this case -- its layout requires a column count
-    that is a multiple of 64 -- so this checks the packing convention on its own.
+    ``symmetric_quantize`` writes ``ceil(n/2)`` bytes with the last byte's high nibble
+    unused, equivalent to appending a zero column before pairing. The operator never
+    sees this case -- its layout needs a multiple of 64 columns.
     """
     k, n = 64, 63
     torch.manual_seed(0)
@@ -864,11 +775,10 @@ def test_pack_int4_odd_n_pads_the_tail():
 def test_mixed_gemm_accepts_missing_bias():
     """``bias=None`` must be a working path, not a zero bias.
 
-    The wrapper hands the *output* to the kernel as a stand-in pointer when no
-    bias is given and relies on the ``HAS_BIAS`` constexpr to keep the kernel off
-    it. That pointer is valid memory, so a missing guard would not crash -- it
-    would read the accumulator's own contents and produce a wrong answer. The
-    numerical assertion is therefore the check, not the absence of an exception.
+    The wrapper hands the *output* to the kernel as a stand-in pointer when no bias is
+    given and relies on ``HAS_BIAS`` to keep the kernel off it. That pointer is valid
+    memory, so a missing guard would not crash -- it would read the accumulator. The
+    numerical assertion is therefore the check.
     """
     m, k, n = 64, 64, 64
     dtype = torch.float16
@@ -886,9 +796,6 @@ def test_mixed_gemm_accepts_missing_bias():
         4,
         6,
     )
-    # Both sides go through ``to_reference``: under ``--ref cpu`` that is what puts
-    # them on the same device, and ``flag_train.testing.assert_close`` compares with
-    # ``torch.testing.assert_close``, which requires that.
     utils.train_assert_close(
         utils.to_reference(ref_out),
         utils.to_reference(output),
@@ -907,9 +814,8 @@ def test_mixed_gemm_accepts_missing_bias():
 def test_mixed_gemm_rejects_gated_activations(num_bits, activation_raw):
     """The runner instantiates no gated epilogue, so it must say so.
 
-    The message is DeepSpeed's own ("Fused gated activations not supported"),
-    because a caller should get the same diagnosis from the port as from the
-    operator it replaces.
+    The message is DeepSpeed's own ("Fused gated activations not supported"), so a
+    caller gets the same diagnosis from the port as from the operator it replaces.
     """
     output, hidden, packed, q, scales, bias = _build(
         64, 64, 64, num_bits, torch.float16, 5
@@ -940,8 +846,8 @@ def test_mixed_gemm_rejects_invalid_activation():
 def test_mixed_gemm_rejects_weight_k_mismatch():
     """``TORCH_CHECK(weight.size(0) == k)``.
 
-    The rows disagree with ``k`` while the packed width stays plausible, so the
-    check under test is the one this case names.
+    The rows disagree with ``k`` while the packed width stays plausible, so the check
+    under test is the one this case names.
     """
     output, hidden, packed, q, scales, bias = _build(64, 64, 64, 4, torch.float16, 8)
     bad = torch.zeros(63, packed.size(1), dtype=torch.uint8, device=runtime_device.name)
@@ -965,17 +871,11 @@ def test_mixed_gemm_rejects_dtype_mismatch():
 def test_matches_deepspeed(shape, num_bits):
     """Compare against DeepSpeed's own operator.
 
-    This is the one check that can contradict our *reading* of the contract: the
-    reference above is written from the same reading, so a shared misreading survives
-    it.
-
-    Nothing about the *inputs* stands in the way. This port reads the same preprocessed
-    B buffer DeepSpeed's operator reads, and both write in place, so one argument tuple
-    drives both.
-
-    Whether it runs is an environment question, and ``_load_deepspeed_mixed_gemm`` has
-    answered it by the time this is collected: the reference is called once at import, so
-    a library that imports but does not dispatch is caught there rather than here.
+    The one check that can contradict our *reading* of the contract: the reference above
+    is written from the same reading, so a shared misreading survives it. Nothing about
+    the inputs stands in the way -- this port reads the same preprocessed B buffer and
+    both write in place. Whether it runs was decided at import by
+    ``_load_deepspeed_mixed_gemm``.
     """
     m, k, n = shape
     dtype = torch.float16
@@ -985,9 +885,6 @@ def test_matches_deepspeed(shape, num_bits):
 
     ref_out = torch.empty_like(output)
     _DEEPSPEED_ORACLE(ref_out, hidden, packed, scales, bias, num_bits, 6)
-    # Both sides go through ``to_reference``: under ``--ref cpu`` that is what puts
-    # them on the same device, and ``flag_train.testing.assert_close`` compares with
-    # ``torch.testing.assert_close``, which requires that.
     utils.train_assert_close(
         utils.to_reference(ref_out),
         utils.to_reference(output),
