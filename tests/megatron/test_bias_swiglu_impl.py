@@ -150,13 +150,19 @@ def _assert_close(actual, expected, dtype):
 
 
 # Megatron-LM's own tests use dtype-specific tolerances, because the reference
-# and the fused path round independently. They cover the forward output and the
-# element-wise input gradient only; the reduced gradients (bias, weights) are
-# compared in fp32, where Megatron does not round per-token values first.
+# and the fused path round independently. The baseline is ``@jit_fuser``, which
+# is ``torch.compile`` on torch >= 2.2: where the compiler fuses, the backward
+# keeps fp32 intermediates and agrees with this kernel to a few 1e-7; where it
+# falls back to eager, the whole backward runs in the input dtype and rounds at
+# every step. That eager path lands up to ~1.5 ulp away in practice, so fp16 and
+# bf16 allow four ulp of their own dtype. Only the forward output and the
+# element-wise input gradient use these entries; the reduced gradients (bias,
+# weights) are compared in fp32, where Megatron does not round per-token values
+# first.
 _MEGATRON_TOLERANCES = {
     torch.float32: {"rtol": 1.0e-6, "atol": 1.0e-6},
-    torch.float16: {"rtol": 1.0e-3, "atol": 1.0e-3},
-    torch.bfloat16: {"rtol": 2.0e-2, "atol": 1.0e-2},
+    torch.float16: {"rtol": 4 * torch.finfo(torch.float16).eps, "atol": 1.0e-3},
+    torch.bfloat16: {"rtol": 4 * torch.finfo(torch.bfloat16).eps, "atol": 1.0e-2},
 }
 
 
