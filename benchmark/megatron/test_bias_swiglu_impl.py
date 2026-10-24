@@ -149,17 +149,16 @@ def base_op(weighted=False, **op_kwargs):
 def _stabilize_megatron_compile():
     """Keep the compiled Megatron baseline working on every backend.
 
-    ``megatron.core.jit`` sets ``jit_fuser = torch.compile`` on torch >= 2.2,
-    so the native baseline recompiles per shape, dtype and requires-grad
-    pattern; the default Dynamo limit is below this suite's case count. And
-    Inductor's async compile has to pickle the compiled Triton kernel back
+    ``megatron.core.jit`` compiles the baseline per shape, dtype and
+    requires-grad pattern, so the default Dynamo limit is below this suite's
+    case count. Vendor Megatron builds may wrap ``torch.compile`` in their own
+    helper, so do not gate on an identity check against ``torch.compile``.
+    Inductor's async compile also has to pickle the compiled Triton kernel back
     from its worker, which some vendor Triton builds cannot do.
     """
     try:
         from megatron.core import jit
     except ImportError:
-        return
-    if jit.jit_fuser is not torch.compile:
         return
 
     # Inductor's async compile sends each Triton kernel to a worker process and
@@ -177,6 +176,9 @@ def _stabilize_megatron_compile():
         and getattr(inductor_config, "compile_threads", 1) != 1
     ):
         inductor_config.compile_threads = 1
+
+    if jit.jit_fuser is getattr(jit, "noop_decorator", None):
+        return
 
     try:
         import torch._dynamo as dynamo

@@ -64,6 +64,23 @@ def base_op():
     return megatron.core.fusions.fused_bias_swiglu
 
 
+def _keep_compile_in_process():
+    """Compile the Megatron baseline without Inductor's worker processes.
+
+    Inductor's async compile ships the compiled Triton kernel back from a
+    worker process, so it has to pickle it; vendor Triton builds whose
+    JITFunction carries an RLock cannot be pickled. One compile thread runs the
+    task inline. This changes compile time only, not the reference values.
+    """
+    try:
+        from torch._inductor import config as inductor_config
+    except ImportError:
+        return
+    if getattr(inductor_config, "compile_threads", 1) != 1:
+        inductor_config.compile_threads = 1
+
+
+_keep_compile_in_process()
 reference_megatron = base_op()
 
 # Empty, unaligned (half = 3 and 17), and MLP-like ranks. The last dim is even.
