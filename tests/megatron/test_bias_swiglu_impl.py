@@ -91,13 +91,12 @@ _VARIANTS = {
 def bias_swiglu_ref(
     x,
     bias=None,
-    fp8_input_store=False,
     cpu_offload_input=False,
     clamp_value=None,
     gate_clamp_scale=None,
     linear_clamp_scale=None,
 ):
-    del fp8_input_store, cpu_offload_input
+    del cpu_offload_input
     y = x if bias is None else x + bias
     gate, linear = torch.chunk(y, 2, dim=-1)
     if gate_clamp_scale is not None:
@@ -117,7 +116,6 @@ def weighted_bias_swiglu_ref(
     x,
     bias,
     weights,
-    fp8_input_store=False,
     clamp_value=None,
     gate_clamp_scale=None,
     linear_clamp_scale=None,
@@ -131,7 +129,6 @@ def weighted_bias_swiglu_ref(
         gate_clamp_scale=gate_clamp_scale,
         linear_clamp_scale=linear_clamp_scale,
     )
-    del fp8_input_store
     return activated * weights
 
 
@@ -361,33 +358,6 @@ def test_bias_swiglu_impl_noncontiguous(dtype):
 
 
 @pytest.mark.bias_swiglu_impl
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_bias_swiglu_impl_fp8_input_store(dtype):
-    if not hasattr(torch, "float8_e4m3fn"):
-        pytest.skip("float8_e4m3fn is not available")
-    utils.init_seed(6)
-    x = torch.randn((8, 32), dtype=dtype, device=flag_train.device)
-    bias = torch.randn((32,), dtype=dtype, device=flag_train.device)
-    y = flag_train.megatron.bias_swiglu_impl(x, bias, fp8_input_store=True)
-    y_full = flag_train.megatron.bias_swiglu_impl(x, bias, fp8_input_store=False)
-    _assert_close(y, _reference(y_full), dtype)
-
-    x_q = x.detach().to(torch.float8_e4m3fn).to(dtype)
-    bias_train = bias.detach().requires_grad_(True)
-    x_train = x.detach().requires_grad_(True)
-    grad_out = torch.randn_like(y)
-    flag_train.megatron.bias_swiglu_impl(
-        x_train, bias_train, fp8_input_store=True
-    ).backward(grad_out)
-
-    x_ref = _reference(x_q).requires_grad_(True)
-    bias_ref = _reference(bias).requires_grad_(True)
-    bias_swiglu_ref(x_ref, bias_ref).backward(_reference(grad_out))
-    _assert_close(x_train.grad, x_ref.grad, dtype)
-    _assert_close(bias_train.grad, bias_ref.grad, bias.dtype)
-
-
-@pytest.mark.bias_swiglu_impl
 def test_bias_swiglu_impl_cpu_offload_marks_saved_tensors():
     dtype = torch.float32
     x = torch.randn((4, 8), dtype=dtype, device=flag_train.device, requires_grad=True)
@@ -485,38 +455,6 @@ def test_weighted_bias_swiglu_impl_zero_stride_weights(dtype):
     )
     assert weights.stride() == (0, 0)
     _check_weighted(x, weights)
-
-
-@pytest.mark.bias_swiglu_impl
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_weighted_bias_swiglu_impl_fp8_input_store(dtype):
-    if not hasattr(torch, "float8_e4m3fn"):
-        pytest.skip("float8_e4m3fn is not available")
-    utils.init_seed(10)
-    x = torch.randn((8, 32), dtype=dtype, device=flag_train.device)
-    weights = torch.randn((8, 1), dtype=torch.float32, device=flag_train.device)
-
-    y = flag_train.megatron.weighted_bias_swiglu_impl(
-        x, None, weights, fp8_input_store=True
-    )
-    y_full = flag_train.megatron.weighted_bias_swiglu_impl(
-        x, None, weights, fp8_input_store=False
-    )
-    _assert_close(y, _reference(y_full), dtype)
-
-    x_q = x.detach().to(torch.float8_e4m3fn).to(dtype)
-    x_train = x.detach().requires_grad_(True)
-    w_train = weights.detach().requires_grad_(True)
-    grad_out = torch.randn_like(y)
-    flag_train.megatron.weighted_bias_swiglu_impl(
-        x_train, None, w_train, fp8_input_store=True
-    ).backward(grad_out)
-
-    x_ref = _reference(x_q).requires_grad_(True)
-    w_ref = _reference(weights).requires_grad_(True)
-    weighted_bias_swiglu_ref(x_ref, None, w_ref).backward(_reference(grad_out))
-    _assert_close(x_train.grad, x_ref.grad, dtype)
-    _assert_close(w_train.grad, w_ref.grad, weights.dtype)
 
 
 @pytest.mark.bias_swiglu_impl

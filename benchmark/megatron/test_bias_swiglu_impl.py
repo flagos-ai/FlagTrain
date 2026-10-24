@@ -47,7 +47,7 @@ import torch
 
 import flag_train
 
-from .. import base
+from .. import base, consts
 
 # Token counts and hidden widths used by a fused MLP activation. Last dim is even.
 _CORE_SHAPES = [
@@ -192,7 +192,12 @@ _SITU_KWARGS = {"gate_clamp_scale": 4.0, "linear_clamp_scale": 2.5}
 
 
 def _dtypes():
-    dtypes = [torch.float16, torch.float32]
+    """``consts.FLOAT_DTYPES`` with bf16 dropped where the backend has none.
+
+    Same rule as ``utils.FLOAT_DTYPES`` in the correctness suite, so both see
+    the same dtypes on every backend.
+    """
+    dtypes = [dtype for dtype in consts.FLOAT_DTYPES if dtype != torch.bfloat16]
     if flag_train.runtime.device.support_bf16:
         dtypes.append(torch.bfloat16)
     return dtypes
