@@ -523,7 +523,7 @@ def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch
             ``[num_experts, num_tokens]`` buffer. For ``num_tokens == 0`` the
             argument itself is returned, unchanged.
     """
-    logger.debug("TRAIN FUSED_PAD_ROUTING_MAP")
+    logger.debug("TRAIN_ASCEND FUSED_PAD_ROUTING_MAP")
     assert routing_map.dim() == 2, (
         "fused_pad_routing_map expects a [num_tokens, num_experts] tensor, "
         f"got shape {tuple(routing_map.shape)}"
