@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for fused bias + SwiGLU.
+"""Correctness tests for fused bias + SwiGLU (forward only).
 
 The reference is the eager formula Megatron-LM checks its own fusion against:
 SiLU (or SiTU) of the two halves, with the bias added by ordinary
@@ -22,18 +22,10 @@ Under ``--ref cpu`` those operands are moved to the CPU and upcast, so the
 comparison is against a higher-precision CPU result.
 Tolerances are ``train_assert_close``'s defaults.
 
-Megatron-LM's ``BiasSwiGLUFunction.backward`` returns the unreduced
-pre-activation gradient for the bias as well, and autograd reduces it for
-broadcast-compatible ``bias`` shapes. These tests expect the broadcast
-gradient, reduced to ``bias.shape``, which is also what the eager reference
-produces. ``bias`` must have the same dtype as ``input``.
-
-The differential tests compare the forward output and the element-wise input
-gradient, which both sides compute at the same precision. The reduced
-gradients are compared in fp32 only: Megatron rounds each per-token value to
-the input dtype before it reduces, while this kernel keeps the reduction in
-fp32, so fp16/bf16 have no useful common tolerance. Those values are pinned by
-the eager-reference checks above instead.
+Only the forward output is checked: the backward is a separate operator. The
+``fp8_input_store`` and ``cpu_offload_input`` flags stay for Megatron-LM
+signature compatibility but have nothing left to save, so passing either one is
+expected to raise. ``bias`` must have the same dtype as ``input``.
 """
 
 import warnings
@@ -167,16 +159,12 @@ def _assert_close(actual, expected, dtype):
     utils.train_assert_close(utils.to_reference(actual), expected, dtype)
 
 
-# Megatron-LM's own tests use dtype-specific tolerances, because the reference
-# and the fused path round independently. The baseline is ``@jit_fuser``, which
-# is ``torch.compile`` on torch >= 2.2: where the compiler fuses, the backward
-# keeps fp32 intermediates and agrees with this kernel to a few 1e-7; where it
-# falls back to eager, the whole backward runs in the input dtype and rounds at
-# every step. That eager path lands up to ~1.5 ulp away in practice, so fp16 and
-# bf16 allow four ulp of their own dtype. Only the forward output and the
-# element-wise input gradient use these entries; the reduced gradients (bias,
-# weights) are compared in fp32, where Megatron does not round per-token values
-# first.
+# Megatron-LM's baseline is ``@jit_fuser``, which is ``torch.compile`` on
+# torch >= 2.2: where the compiler fuses, the forward keeps fp32 intermediates
+# and agrees with this kernel to a few 1e-7; where it falls back to eager, it
+# rounds at every step and lands up to ~1.5 ulp away in practice. fp16 and bf16
+# therefore allow four ulp of their own dtype. Only the forward output uses this
+# table; this operator has no backward.
 _MEGATRON_TOLERANCES = {
     torch.float32: {"rtol": 1.0e-6, "atol": 1.0e-6},
     torch.float16: {"rtol": 4 * torch.finfo(torch.float16).eps, "atol": 1.0e-3},
@@ -212,51 +200,21 @@ def _check_bias_swiglu(x, bias, **kwargs):
     assert y.shape[:-1] == x.shape[:-1]
     assert y.dtype == dtype
 
-    x_ref = _reference(x)
-    bias_ref = _reference(bias)
-    _assert_close(y, bias_swiglu_ref(x_ref, bias_ref, **kwargs), dtype)
-
-    grad_out = torch.randn_like(y)
-    x_train = x.detach().requires_grad_(True)
-    bias_train = None if bias is None else bias.detach().requires_grad_(True)
-    flag_train.megatron.bias_swiglu_impl(x_train, bias_train, **kwargs).backward(
-        grad_out
-    )
-
-    x_ref = _reference(x).requires_grad_(True)
-    bias_ref = None if bias is None else _reference(bias).requires_grad_(True)
-    bias_swiglu_ref(x_ref, bias_ref, **kwargs).backward(_reference(grad_out))
-    _assert_close(x_train.grad, x_ref.grad, dtype)
-    if bias is not None:
-        assert bias_train.grad.shape == bias.shape
-        _assert_close(bias_train.grad, bias_ref.grad, bias.dtype)
+    expected = bias_swiglu_ref(_reference(x), _reference(bias), **kwargs)
+    _assert_close(y, expected, dtype)
 
 
 def _check_weighted(x, weights, **kwargs):
     dtype = x.dtype
     y = flag_train.megatron.weighted_bias_swiglu_impl(x, None, weights, **kwargs)
     assert y.shape[-1] * 2 == x.shape[-1]
+    assert y.shape[:-1] == x.shape[:-1]
     assert y.dtype == dtype
 
-    x_ref = _reference(x)
-    w_ref = _reference(weights)
-    _assert_close(y, weighted_bias_swiglu_ref(x_ref, None, w_ref, **kwargs), dtype)
-
-    grad_out = torch.randn_like(y)
-    x_train = x.detach().requires_grad_(True)
-    w_train = weights.detach().requires_grad_(True)
-    flag_train.megatron.weighted_bias_swiglu_impl(
-        x_train, None, w_train, **kwargs
-    ).backward(grad_out)
-
-    x_ref = _reference(x).requires_grad_(True)
-    w_ref = _reference(weights).requires_grad_(True)
-    weighted_bias_swiglu_ref(x_ref, None, w_ref, **kwargs).backward(
-        _reference(grad_out)
+    expected = weighted_bias_swiglu_ref(
+        _reference(x), None, _reference(weights), **kwargs
     )
-    _assert_close(x_train.grad, x_ref.grad, dtype)
-    assert w_train.grad.shape == weights.shape
-    _assert_close(w_train.grad, w_ref.grad, weights.dtype)
+    _assert_close(y, expected, dtype)
 
 
 @pytest.mark.bias_swiglu_impl
@@ -389,19 +347,6 @@ def test_bias_swiglu_impl_noncontiguous(dtype):
 
 
 @pytest.mark.bias_swiglu_impl
-def test_bias_swiglu_impl_cpu_offload_marks_saved_tensors():
-    dtype = torch.float32
-    x = torch.randn((4, 8), dtype=dtype, device=flag_train.device, requires_grad=True)
-    bias = torch.randn((8,), dtype=dtype, device=flag_train.device, requires_grad=True)
-    y = flag_train.megatron.bias_swiglu_impl(x, bias, cpu_offload_input=True)
-    assert getattr(x, "activation_offloading", False) is True
-    assert getattr(bias, "activation_offloading", False) is True
-    y.backward(torch.ones_like(y))
-    assert x.grad is not None
-    assert bias.grad is not None
-
-
-@pytest.mark.bias_swiglu_impl
 def test_bias_swiglu_impl_rejects_bad_arguments():
     device = flag_train.device
     x = torch.randn((4, 8), device=device)
@@ -431,6 +376,15 @@ def test_bias_swiglu_impl_rejects_bad_arguments():
         )
     with pytest.raises(ValueError, match="broadcast"):
         flag_train.megatron.bias_swiglu_impl(x, torch.randn((3,), device=device))
+    # Forward only: the flags that used to control the saved activations raise.
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        flag_train.megatron.bias_swiglu_impl(x, None, fp8_input_store=True)
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        flag_train.megatron.bias_swiglu_impl(x, None, cpu_offload_input=True)
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        flag_train.megatron.weighted_bias_swiglu_impl(
+            x, None, x.new_ones((4, 1), dtype=torch.float32), fp8_input_store=True
+        )
 
 
 @pytest.mark.bias_swiglu_impl
@@ -489,22 +443,6 @@ def test_weighted_bias_swiglu_impl_zero_stride_weights(dtype):
 
 
 @pytest.mark.bias_swiglu_impl
-def test_bias_swiglu_impl_skips_unneeded_parameter_grads():
-    device = flag_train.device
-    x = torch.randn((4, 8), device=device, requires_grad=True)
-    bias = torch.randn((8,), device=device)
-    flag_train.megatron.bias_swiglu_impl(x, bias).sum().backward()
-    assert x.grad is not None
-    assert bias.grad is None
-
-    x = torch.randn((4, 8), device=device, requires_grad=True)
-    weights = torch.randn((4, 1), device=device)
-    flag_train.megatron.weighted_bias_swiglu_impl(x, None, weights).sum().backward()
-    assert x.grad is not None
-    assert weights.grad is None
-
-
-@pytest.mark.bias_swiglu_impl
 @pytest.mark.skipif(reference_megatron is None, reason="Megatron-LM is not installed")
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("with_bias", [False, True])
@@ -515,30 +453,11 @@ def test_bias_swiglu_impl_matches_megatron(dtype, with_bias):
     bias = (
         torch.randn((64,), dtype=dtype, device=flag_train.device) if with_bias else None
     )
-    grad_out = torch.randn((16, 32), dtype=dtype, device=flag_train.device)
 
-    x_actual = x.detach().requires_grad_(True)
-    bias_actual = None if bias is None else bias.detach().requires_grad_(True)
-    y_actual = flag_train.megatron.bias_swiglu_impl(x_actual, bias_actual)
-    y_actual.backward(grad_out)
-
-    x_ref = x.detach().requires_grad_(True)
-    bias_ref = None if bias is None else bias.detach().requires_grad_(True)
-    y_ref = reference_megatron.bias_swiglu_impl(x_ref, bias_ref)
-    y_ref.backward(grad_out)
+    y_actual = flag_train.megatron.bias_swiglu_impl(x, bias)
+    y_ref = reference_megatron.bias_swiglu_impl(x, bias)
 
     _assert_megatron_close(y_actual, _reference(y_ref), dtype)
-    _assert_megatron_close(x_actual.grad, _reference(x_ref.grad), dtype)
-    if bias is not None:
-        # Megatron returns the unreduced per-token gradient for the bias slot and
-        # lets autograd sum it in the input dtype; this kernel sums the fp32
-        # values. The two are only comparable in fp32, so fp16/bf16 keep the
-        # structural check and rely on the eager-reference test for the numbers.
-        if dtype == torch.float32:
-            _assert_megatron_close(bias_actual.grad, _reference(bias_ref.grad), dtype)
-        else:
-            assert bias_actual.grad.shape == bias.shape
-            assert bias_actual.grad.dtype == bias.dtype
 
 
 @pytest.mark.bias_swiglu_impl
@@ -553,26 +472,8 @@ def test_weighted_bias_swiglu_impl_matches_megatron(dtype):
     utils.init_seed(12)
     x = torch.randn((16, 64), dtype=dtype, device=flag_train.device)
     weights = torch.randn((16, 1), dtype=torch.float32, device=flag_train.device)
-    grad_out = torch.randn((16, 32), dtype=dtype, device=flag_train.device)
 
-    x_actual = x.detach().requires_grad_(True)
-    weights_actual = weights.detach().requires_grad_(True)
-    y_actual = flag_train.megatron.weighted_bias_swiglu_impl(
-        x_actual, None, weights_actual
-    )
-    y_actual.backward(grad_out)
-
-    x_ref = x.detach().requires_grad_(True)
-    weights_ref = weights.detach().requires_grad_(True)
-    y_ref = reference_megatron.weighted_bias_swiglu_impl(x_ref, None, weights_ref)
-    y_ref.backward(grad_out)
+    y_actual = flag_train.megatron.weighted_bias_swiglu_impl(x, None, weights)
+    y_ref = reference_megatron.weighted_bias_swiglu_impl(x, None, weights)
 
     _assert_megatron_close(y_actual, _reference(y_ref), dtype)
-    _assert_megatron_close(x_actual.grad, _reference(x_ref.grad), dtype)
-    # Megatron computes the weight gradient from activations rounded to the
-    # input dtype, so the reduced value is only comparable in fp32.
-    if dtype == torch.float32:
-        _assert_megatron_close(weights_actual.grad, _reference(weights_ref.grad), dtype)
-    else:
-        assert weights_actual.grad.shape == weights.shape
-        assert weights_actual.grad.dtype == weights.dtype
