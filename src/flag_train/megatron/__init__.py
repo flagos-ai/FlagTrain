@@ -13,6 +13,8 @@ from .fused_pad_routing_map import fused_pad_routing_map
 from .fused_proj_rms_backward import fused_proj_rms_backward
 from .fused_proj_rms_forward import fused_proj_rms_forward
 from .quick_gelu import quick_gelu
+from .scaled_masked_softmax_cuda_backward import scaled_masked_softmax_cuda_backward
+from .scaled_masked_softmax_cuda_forward import scaled_masked_softmax_cuda_forward
 from .weighted_squared_relu_impl import weighted_squared_relu_impl
 
 __all__ = [
@@ -26,6 +28,8 @@ __all__ = [
     "fused_proj_rms_backward",
     "fused_proj_rms_forward",
     "quick_gelu",
+    "scaled_masked_softmax_cuda_backward",
+    "scaled_masked_softmax_cuda_forward",
     "weighted_squared_relu_impl",
 ]
 
