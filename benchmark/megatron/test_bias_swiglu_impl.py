@@ -17,8 +17,11 @@ The baseline is Megatron-LM's own ``bias_swiglu_impl`` /
 ``weighted_bias_swiglu_impl`` when it is installed. Those functions are
 PyTorch compositions decorated with ``@jit_fuser``, which is ``torch.compile``
 on torch >= 2.2, so the baseline is the compiled native implementation rather
-than eager PyTorch. The eager composition is only a fallback (with a warning)
-when Megatron-LM is missing or does not support a variant.
+than eager PyTorch. When the installed Megatron-LM predates the clamp / SiTU
+variants, the main-branch implementation vendored in
+``_vendored_megatron_bias_swiglu`` is used instead, so those cases are still
+compared against a compiled baseline. The eager composition is the last resort
+(with a warning) only when neither is usable.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the shapes
@@ -105,42 +108,68 @@ def _megatron_weighted(impl, x, bias, weights, **kwargs):
     return impl(x, bias, weights, **kwargs)
 
 
+def _missing_baseline(weighted, op_kwargs, reason):
+    """Baseline for variants the installed Megatron-LM cannot serve.
+
+    Uses the main-branch implementation vendored in
+    ``_vendored_megatron_bias_swiglu`` so the clamp / SiTU cases are still
+    compared against a compiled Megatron instead of the eager composition.
+
+    Once the minimum supported megatron-core ships those variants this function
+    and the vendored module can be deleted, and its call sites restored to
+    ``functools.partial(eager, **op_kwargs)``; ``base_op`` needs no other change.
+    """
+    try:
+        from ._vendored_megatron_bias_swiglu import (
+            bias_swiglu_impl,
+            weighted_bias_swiglu_impl,
+        )
+
+        impl = weighted_bias_swiglu_impl if weighted else bias_swiglu_impl
+    except Exception as exc:
+        warnings.warn(
+            f"{reason}; the vendored main-branch baseline is unusable "
+            f"({exc!r}), so the eager PyTorch composition is measured instead",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        eager = weighted_bias_swiglu_ref if weighted else bias_swiglu_ref
+        return functools.partial(eager, **op_kwargs)
+
+    warnings.warn(
+        f"{reason}; using the vendored main-branch implementation as the "
+        "benchmark baseline",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    if weighted:
+        return functools.partial(_megatron_weighted, impl, **op_kwargs)
+    return functools.partial(impl, **op_kwargs)
+
+
 def base_op(weighted=False, **op_kwargs):
-    """Megatron-LM's native op when available, eager composition otherwise.
+    """Megatron-LM's native op when it supports the variant, else the vendored one.
 
     Mirrors ``base_op`` in ``test_quick_gelu.py``: the import happens here and
     a missing Megatron-LM is a warning plus a fallback, not a hard dependency.
+    An installed Megatron-LM that predates the clamp / SiTU variants is served
+    by ``_missing_baseline``; the eager composition is its own last resort.
     """
-    eager = weighted_bias_swiglu_ref if weighted else bias_swiglu_ref
     name = "weighted_bias_swiglu_impl" if weighted else "bias_swiglu_impl"
     try:
         import megatron.core.fusions.fused_bias_swiglu
     except ImportError:
-        warnings.warn(
-            "Megatron-LM is unavailable; using the eager PyTorch composition "
-            "as the benchmark baseline",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return functools.partial(eager, **op_kwargs)
+        return _missing_baseline(weighted, op_kwargs, "Megatron-LM is unavailable")
     impl = getattr(megatron.core.fusions.fused_bias_swiglu, name, None)
     if impl is None:
-        warnings.warn(
-            f"Megatron-LM has no {name}; using the eager PyTorch composition "
-            "as the benchmark baseline",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return functools.partial(eager, **op_kwargs)
+        return _missing_baseline(weighted, op_kwargs, f"Megatron-LM has no {name}")
     missing = _missing_kwargs(impl, op_kwargs)
     if missing:
-        warnings.warn(
-            f"installed Megatron-LM {name} does not accept {missing}; using "
-            "the eager PyTorch composition as the benchmark baseline",
-            RuntimeWarning,
-            stacklevel=2,
+        return _missing_baseline(
+            weighted,
+            op_kwargs,
+            f"installed Megatron-LM {name} does not accept {missing}",
         )
-        return functools.partial(eager, **op_kwargs)
     if weighted:
         return functools.partial(_megatron_weighted, impl, **op_kwargs)
     return functools.partial(impl, **op_kwargs)
