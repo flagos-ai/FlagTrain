@@ -14,6 +14,9 @@ from .fused_proj_rms_forward import fused_proj_rms_forward
 from .quick_gelu import quick_gelu
 from .scaled_masked_softmax_cuda_backward import scaled_masked_softmax_cuda_backward
 from .scaled_masked_softmax_cuda_forward import scaled_masked_softmax_cuda_forward
+from .scaled_upper_triang_masked_softmax_forward import (
+    scaled_upper_triang_masked_softmax_forward,
+)
 from .weighted_squared_relu_impl import weighted_squared_relu_impl
 
 __all__ = [
@@ -31,6 +34,7 @@ __all__ = [
     "quick_gelu",
     "scaled_masked_softmax_cuda_backward",
     "scaled_masked_softmax_cuda_forward",
+    "scaled_upper_triang_masked_softmax_forward",
     "weighted_squared_relu_impl",
 ]
 
