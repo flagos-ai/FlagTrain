@@ -197,35 +197,32 @@ def _stabilize_megatron_compile():
     # Megatron baseline. One compile thread keeps compilation in-process; it
     # changes compile time only, not the measured kernel time.
     try:
-        from torch._inductor import config as inductor_config
+        import torch._inductor.config
+
+        if getattr(torch._inductor.config, "compile_threads", 1) != 1:
+            torch._inductor.config.compile_threads = 1
     except ImportError:
-        inductor_config = None
-    if (
-        inductor_config is not None
-        and getattr(inductor_config, "compile_threads", 1) != 1
-    ):
-        inductor_config.compile_threads = 1
+        pass
 
     if jit.jit_fuser is getattr(jit, "noop_decorator", None):
         return
 
     try:
-        import torch._dynamo as dynamo
+        import torch._dynamo
     except ImportError:
         return
-    config = dynamo.config
-    if hasattr(config, "recompile_limit"):
-        current = config.recompile_limit
-    elif hasattr(config, "cache_size_limit"):
-        current = config.cache_size_limit
+    if hasattr(torch._dynamo.config, "recompile_limit"):
+        current = torch._dynamo.config.recompile_limit
+    elif hasattr(torch._dynamo.config, "cache_size_limit"):
+        current = torch._dynamo.config.cache_size_limit
     else:
         return
     if current >= _DYNAMO_RECOMPILE_LIMIT:
         return
-    if hasattr(config, "recompile_limit"):
-        config.recompile_limit = _DYNAMO_RECOMPILE_LIMIT
+    if hasattr(torch._dynamo.config, "recompile_limit"):
+        torch._dynamo.config.recompile_limit = _DYNAMO_RECOMPILE_LIMIT
     else:
-        config.cache_size_limit = _DYNAMO_RECOMPILE_LIMIT
+        torch._dynamo.config.cache_size_limit = _DYNAMO_RECOMPILE_LIMIT
     warnings.warn(
         "raised the torch._dynamo recompile limit to "
         f"{_DYNAMO_RECOMPILE_LIMIT} so the torch.compile baseline does not "
