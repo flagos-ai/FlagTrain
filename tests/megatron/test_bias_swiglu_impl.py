@@ -96,7 +96,8 @@ _SHAPES = [
     (4, 7, 32),
 ]
 
-# bias 与 shape / variant 正交，只在代表形状和变体上做带 bias 的抽查。
+# Bias is orthogonal to the shapes and variants below, so it is sampled on a
+# few representative cases only.
 _BIAS_SHAPES = [
     (1, 2),
     (17, 32),
