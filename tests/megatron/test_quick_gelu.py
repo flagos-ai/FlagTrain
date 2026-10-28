@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for Megatron Quick GELU.
+"""Correctness tests for Megatron Quick GELU (forward only).
 
 The preferred reference is Megatron-LM's official
 ``megatron.core.activations.quick_gelu`` interface. If Megatron-LM is not
@@ -21,6 +21,8 @@ and upcast, so the comparison is against a higher-precision CPU result rather
 than a second run of the device kernel. Tolerances are
 ``train_assert_close``'s defaults (``atol=1e-4``, dtype rtol from
 ``flag_train.testing.RESOLUTION``).
+
+Only the forward output is checked: the backward is a separate operator.
 """
 
 import warnings
@@ -76,22 +78,13 @@ def _assert_close(actual, expected, dtype):
     utils.train_assert_close(utils.to_reference(actual), expected, dtype)
 
 
-def _check_forward_and_backward(x):
+def _check_forward(x):
     dtype = x.dtype
     y = flag_train.megatron.quick_gelu(x)
     assert y.shape == x.shape
     assert y.dtype == dtype
 
-    x_ref = _reference(x)
-    _assert_close(y, reference_quick_gelu(x_ref), dtype)
-
-    grad_out = torch.randn_like(y)
-    x_train = x.detach().requires_grad_(True)
-    flag_train.megatron.quick_gelu(x_train).backward(grad_out)
-
-    x_ref = _reference(x).requires_grad_(True)
-    reference_quick_gelu(x_ref).backward(_reference(grad_out))
-    _assert_close(x_train.grad, x_ref.grad, dtype)
+    _assert_close(y, reference_quick_gelu(_reference(x)), dtype)
 
 
 @pytest.mark.quick_gelu
@@ -100,7 +93,7 @@ def _check_forward_and_backward(x):
 def test_quick_gelu(shape, dtype):
     utils.init_seed(0)
     x = torch.randn(shape, dtype=dtype, device=flag_train.device)
-    _check_forward_and_backward(x)
+    _check_forward(x)
 
 
 @pytest.mark.quick_gelu
@@ -124,7 +117,7 @@ def test_quick_gelu_values(dtype):
         50.0,
     ]
     x = torch.tensor(values, dtype=torch.float32, device=flag_train.device).to(dtype)
-    _check_forward_and_backward(x)
+    _check_forward(x)
 
 
 @pytest.mark.quick_gelu
@@ -134,9 +127,20 @@ def test_quick_gelu_noncontiguous(dtype):
     base = torch.randn((32, 64), dtype=dtype, device=flag_train.device)
     x = base.t()
     assert not x.is_contiguous()
-    _check_forward_and_backward(x)
+    _check_forward(x)
 
     cube = torch.randn((4, 8, 16), dtype=dtype, device=flag_train.device)
     transposed = cube.transpose(0, 2)
     assert not transposed.is_contiguous()
-    _check_forward_and_backward(transposed)
+    _check_forward(transposed)
+
+
+@pytest.mark.quick_gelu
+def test_quick_gelu_is_forward_only():
+    """The output carries no autograd history, so ``backward`` is unavailable."""
+    x = torch.randn((4, 8), dtype=torch.float32, device=flag_train.device)
+    x.requires_grad_(True)
+    y = flag_train.megatron.quick_gelu(x)
+    assert not y.requires_grad
+    with pytest.raises(RuntimeError):
+        y.sum().backward()
