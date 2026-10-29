@@ -387,7 +387,7 @@ def bias_swiglu_impl(
     Returns:
         Tensor: same rank and dtype as ``input``, with the last dimension halved.
     """
-    logger.debug("FORWARD BIAS_SWIGLU")
+    logger.debug("TRAIN BIAS_SWIGLU_IMPL")
     if bias is not None and not isinstance(bias, torch.Tensor):
         raise TypeError(
             f"bias_swiglu bias needs a tensor or None, got {type(bias).__name__}"
