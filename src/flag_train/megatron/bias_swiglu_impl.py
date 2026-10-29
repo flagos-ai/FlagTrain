@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused bias + SwiGLU, including the clamped, SiTU-GLU and weighted variants.
+"""Fused bias + SwiGLU, including the clamped and SiTU-GLU variants.
 
 Forward only. One token is one row; the last dimension is the concatenated
 ``[gate | linear]`` and the output keeps the gated half. Bias is added inside
@@ -60,11 +60,6 @@ _MODE_SITU = 2
 _BIAS_NONE = 0
 _BIAS_VECTOR = 1
 _BIAS_FULL = 2
-
-_WEIGHT_NONE = 0
-_WEIGHT_SCALAR = 1
-_WEIGHT_ROW = 2
-_WEIGHT_ELEMENT = 3
 
 
 def _check_input(tensor, name):
@@ -158,53 +153,6 @@ def _prepare_bias(bias, n_rows, hidden):
     return expanded.contiguous(), _BIAS_FULL
 
 
-def _prepare_weight(weights, out_shape):
-    """Return a compact weight tensor and how the kernel should index it.
-
-    The mode is chosen from the **shape**, not from strides, because only the
-    forward read traffic depends on it: scalar and per-row weights are loaded
-    once per token, while a full-shape weight (including a zero-stride
-    ``expand`` of a scalar) is read per element. An elementwise weight is
-    copied to ``[token, half]`` so the kernel can load it with the output.
-    """
-    if weights is None:
-        return None, _WEIGHT_NONE
-    _check_input(weights, "bias_swiglu weights")
-    n_rows = 1
-    for size in out_shape[:-1]:
-        n_rows *= size
-    n_cols = out_shape[-1]
-    flat_shape = (n_rows, n_cols)
-    if _can_broadcast_to(weights, flat_shape):
-        expanded = torch.broadcast_to(weights, flat_shape)
-    elif _can_broadcast_to(weights, out_shape):
-        expanded = torch.broadcast_to(weights, out_shape).reshape(flat_shape)
-    else:
-        raise ValueError(
-            "bias_swiglu weights must broadcast with the output "
-            f"{tuple(out_shape)} (or the flattened {flat_shape}), "
-            f"got {tuple(weights.shape)}"
-        )
-    if n_rows == 0 or n_cols == 0:
-        return weights, _WEIGHT_ROW
-    if weights.numel() == 1:
-        # One value shared by every output element. ``reshape(1)`` rejects the
-        # broadcast view because it still reports ``n_rows * n_cols``
-        # elements, so keep the single value explicitly.
-        return expanded.reshape(-1)[:1].contiguous(), _WEIGHT_SCALAR
-    if tuple(weights.shape) in (flat_shape, tuple(out_shape)):
-        # One weight per output element, including zero-stride views such as
-        # ``scalar.expand(*out_shape)``; read it elementwise.
-        return expanded.contiguous(), _WEIGHT_ELEMENT
-    if weights.shape[-1] == 1:
-        # One weight per token: ``[token, 1]`` or the unflattened
-        # ``[*batch, 1]`` used by MoE.
-        return expanded[:, 0].contiguous(), _WEIGHT_ROW
-    # A partial broadcast such as ``[half]`` or ``[1, half]``. Keep one value
-    # per output element so the kernel can load it with the output.
-    return expanded.contiguous(), _WEIGHT_ELEMENT
-
-
 @triton.jit
 def _activate(
     gate,
@@ -236,14 +184,12 @@ def _activate(
 def _bias_swiglu_forward_kernel(
     x_ptr,
     bias_ptr,
-    weight_ptr,
     y_ptr,
     n_cols,
     clamp_value,
     gate_scale,
     linear_scale,
     BIAS_MODE: tl.constexpr,
-    WEIGHT_MODE: tl.constexpr,
     MODE: tl.constexpr,
     HAS_LINEAR_CLAMP: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -253,11 +199,6 @@ def _bias_swiglu_forward_kernel(
     x_row = x_ptr + row * hidden
     y_row = y_ptr + row * n_cols
     bias_row = bias_ptr + row * hidden
-    weight = 0.0
-    if WEIGHT_MODE == 1:
-        weight = tl.load(weight_ptr).to(tl.float32)
-    elif WEIGHT_MODE == 2:
-        weight = tl.load(weight_ptr + row).to(tl.float32)
 
     for start in tl.range(0, n_cols, BLOCK):
         cols = start + tl.arange(0, BLOCK)
@@ -283,12 +224,6 @@ def _bias_swiglu_forward_kernel(
             MODE,
             HAS_LINEAR_CLAMP,
         )
-        if WEIGHT_MODE == 3:
-            out *= tl.load(weight_ptr + row * n_cols + cols, mask=mask, other=0.0).to(
-                tl.float32
-            )
-        elif WEIGHT_MODE != 0:
-            out *= weight
         tl.store(y_row + cols, out.to(y_ptr.dtype.element_ty), mask=mask)
 
 
@@ -310,8 +245,6 @@ def _launch_forward(
     x,
     bias,
     bias_mode,
-    weight,
-    weight_mode,
     y,
     variant,
     clamp_value,
@@ -329,14 +262,12 @@ def _launch_forward(
             # The constexpr mode stops the kernel from reading this pointer,
             # but Triton still type-checks the argument, so reuse ``x``.
             x if bias is None else bias,
-            x if weight is None else weight,
             y,
             n_cols,
             0.0 if clamp_value is None else clamp_value,
             1.0 if gate_scale is None else gate_scale,
             1.0 if linear_scale is None else linear_scale,
             BIAS_MODE=bias_mode,
-            WEIGHT_MODE=weight_mode,
             MODE=mode,
             HAS_LINEAR_CLAMP=has_linear_clamp,
             BLOCK=block,
@@ -366,7 +297,7 @@ def _empty_output(x, out_shape):
 
 
 def _forward_from_flat(
-    flat, bias, weights, out_shape, clamp_value, gate_scale, linear_scale, variant
+    flat, bias, out_shape, clamp_value, gate_scale, linear_scale, variant
 ):
     n_rows, hidden = flat.shape
     n_cols = hidden // 2
@@ -380,10 +311,6 @@ def _forward_from_flat(
                 "bias_swiglu bias must have the input dtype, got "
                 f"{bias.dtype} for {flat.dtype}"
             )
-    weight_tensor, weight_mode = _prepare_weight(weights, out_shape)
-    if weights is not None:
-        _check_same_device(weights, "bias_swiglu weights", flat.device)
-
     if n_rows == 0 or n_cols == 0:
         return _empty_output(flat, (n_rows, n_cols)).view(out_shape)
 
@@ -392,8 +319,6 @@ def _forward_from_flat(
         flat,
         bias_tensor,
         bias_mode,
-        weight_tensor,
-        weight_mode,
         y,
         variant,
         clamp_value,
@@ -412,7 +337,7 @@ def _check_forward_only_flags(fp8_input_store, cpu_offload_input):
         )
 
 
-def _apply(x, bias, weights, clamp_value, gate_clamp_scale, linear_clamp_scale):
+def _apply(x, bias, clamp_value, gate_clamp_scale, linear_clamp_scale):
     flat, out_shape = _flatten_input(x)
     mode, resolved, resolved_linear, has_linear_clamp = _resolve_variant(
         clamp_value, gate_clamp_scale, linear_clamp_scale
@@ -420,7 +345,6 @@ def _apply(x, bias, weights, clamp_value, gate_clamp_scale, linear_clamp_scale):
     return _forward_from_flat(
         flat,
         bias,
-        weights,
         out_shape,
         resolved if mode == _MODE_CLAMPED else None,
         resolved if mode == _MODE_SITU else None,
@@ -472,42 +396,6 @@ def bias_swiglu_impl(
     return _apply(
         input,
         bias,
-        None,
-        clamp_value,
-        gate_clamp_scale,
-        linear_clamp_scale,
-    )
-
-
-def weighted_bias_swiglu_impl(
-    input,
-    bias,
-    weights,
-    fp8_input_store=False,
-    clamp_value=None,
-    gate_clamp_scale=None,
-    linear_clamp_scale=None,
-):
-    """Per-token weighted SwiGLU or SiTU-GLU. Forward only.
-
-    ``bias`` is accepted so the signature matches Megatron-LM. A non-``None``
-    bias raises ``NotImplementedError``, as it does there. ``weights``
-    broadcasts with the output; the usual MoE shape is ``[token, 1]`` or the
-    unflattened ``[*batch, 1]``. ``fp8_input_store`` is accepted for signature
-    compatibility only and raises when ``True``.
-    """
-    logger.debug("FORWARD WEIGHTED_BIAS_SWIGLU")
-    if bias is not None:
-        raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
-    if not isinstance(weights, torch.Tensor):
-        raise TypeError(
-            f"bias_swiglu weights needs a tensor, got {type(weights).__name__}"
-        )
-    _check_forward_only_flags(fp8_input_store, False)
-    return _apply(
-        input,
-        None,
-        weights,
         clamp_value,
         gate_clamp_scale,
         linear_clamp_scale,

@@ -129,26 +129,6 @@ def bias_swiglu_ref(
     return torch.nn.functional.silu(gate) * linear
 
 
-def weighted_bias_swiglu_ref(
-    x,
-    bias,
-    weights,
-    clamp_value=None,
-    gate_clamp_scale=None,
-    linear_clamp_scale=None,
-):
-    if bias is not None:
-        raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
-    activated = bias_swiglu_ref(
-        x,
-        None,
-        clamp_value=clamp_value,
-        gate_clamp_scale=gate_clamp_scale,
-        linear_clamp_scale=linear_clamp_scale,
-    )
-    return activated * weights
-
-
 def _reference(tensor):
     if tensor is None:
         return None
@@ -204,19 +184,6 @@ def _check_bias_swiglu(x, bias, **kwargs):
     _assert_close(y, expected, dtype)
 
 
-def _check_weighted(x, weights, **kwargs):
-    dtype = x.dtype
-    y = flag_train.megatron.weighted_bias_swiglu_impl(x, None, weights, **kwargs)
-    assert y.shape[-1] * 2 == x.shape[-1]
-    assert y.shape[:-1] == x.shape[:-1]
-    assert y.dtype == dtype
-
-    expected = weighted_bias_swiglu_ref(
-        _reference(x), None, _reference(weights), **kwargs
-    )
-    _assert_close(y, expected, dtype)
-
-
 @pytest.mark.bias_swiglu_impl
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
@@ -254,33 +221,6 @@ def test_bias_swiglu_impl_variants_bias(variant):
     x = torch.randn((16, 64), dtype=torch.float16, device=flag_train.device) * scale
     bias = torch.randn((64,), dtype=torch.float16, device=flag_train.device)
     _check_bias_swiglu(x, bias, **_variant_kwargs(variant))
-
-
-@pytest.mark.bias_swiglu_impl
-@pytest.mark.parametrize("variant", list(_VARIANTS))
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_weighted_bias_swiglu_impl(variant, dtype):
-    utils.init_seed(2)
-    scale = _scale_for(variant)
-    x = torch.randn((16, 64), dtype=dtype, device=flag_train.device) * scale
-    weights = torch.randn((16, 1), dtype=torch.float32, device=flag_train.device)
-    _check_weighted(x, weights, **_variant_kwargs(variant))
-
-
-@pytest.mark.bias_swiglu_impl
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_weighted_bias_swiglu_impl_broadcast(dtype):
-    """Weights shaped like the unflattened output, a scalar, and a full output."""
-    utils.init_seed(3)
-    x = torch.randn((2, 4, 32), dtype=dtype, device=flag_train.device)
-    per_token = torch.randn((2, 4, 1), dtype=torch.float32, device=flag_train.device)
-    _check_weighted(x, per_token)
-
-    scalar = torch.tensor([0.5], dtype=torch.float32, device=flag_train.device)
-    _check_weighted(x, scalar)
-
-    full = torch.randn((2, 4, 16), dtype=dtype, device=flag_train.device)
-    _check_weighted(x, full, clamp_value=2.0)
 
 
 @pytest.mark.bias_swiglu_impl
@@ -370,10 +310,6 @@ def test_bias_swiglu_impl_rejects_bad_arguments():
         flag_train.megatron.bias_swiglu_impl(x, None, clamp_value=0.0)
     with pytest.raises(ValueError, match="greater than zero"):
         flag_train.megatron.bias_swiglu_impl(x, None, gate_clamp_scale=-1.0)
-    with pytest.raises(NotImplementedError, match="Bias is not supported"):
-        flag_train.megatron.weighted_bias_swiglu_impl(
-            x, x.new_zeros(8), x.new_ones((4, 1))
-        )
     with pytest.raises(ValueError, match="broadcast"):
         flag_train.megatron.bias_swiglu_impl(x, torch.randn((3,), device=device))
     # Forward only: the flags that used to control the saved activations raise.
@@ -381,10 +317,6 @@ def test_bias_swiglu_impl_rejects_bad_arguments():
         flag_train.megatron.bias_swiglu_impl(x, None, fp8_input_store=True)
     with pytest.raises(NotImplementedError, match="forward-only"):
         flag_train.megatron.bias_swiglu_impl(x, None, cpu_offload_input=True)
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        flag_train.megatron.weighted_bias_swiglu_impl(
-            x, None, x.new_ones((4, 1), dtype=torch.float32), fp8_input_store=True
-        )
 
 
 @pytest.mark.bias_swiglu_impl
@@ -411,38 +343,6 @@ def test_bias_swiglu_impl_requires_matching_bias_dtype(dtype):
 
 
 @pytest.mark.bias_swiglu_impl
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_weighted_bias_swiglu_impl_noncontiguous_weights(dtype):
-    utils.init_seed(8)
-    x = torch.randn((8, 64), dtype=dtype, device=flag_train.device)
-
-    per_token = torch.randn((8, 2), dtype=torch.float32, device=flag_train.device)[
-        :, ::2
-    ]
-    assert per_token.shape == (8, 1)
-    assert not per_token.is_contiguous()
-    _check_weighted(x, per_token)
-
-    elementwise = torch.randn((32, 8), dtype=dtype, device=flag_train.device).t()
-    assert elementwise.shape == (8, 32)
-    assert not elementwise.is_contiguous()
-    _check_weighted(x, elementwise, clamp_value=2.0)
-
-
-@pytest.mark.bias_swiglu_impl
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_weighted_bias_swiglu_impl_zero_stride_weights(dtype):
-    """A scalar expanded to the output shape exercises the stride-0 path."""
-    utils.init_seed(9)
-    x = torch.randn((8, 64), dtype=dtype, device=flag_train.device)
-    weights = torch.tensor(0.5, dtype=torch.float32, device=flag_train.device).expand(
-        8, 32
-    )
-    assert weights.stride() == (0, 0)
-    _check_weighted(x, weights)
-
-
-@pytest.mark.bias_swiglu_impl
 @pytest.mark.skipif(reference_megatron is None, reason="Megatron-LM is not installed")
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("with_bias", [False, True])
@@ -456,24 +356,5 @@ def test_bias_swiglu_impl_matches_megatron(dtype, with_bias):
 
     y_actual = flag_train.megatron.bias_swiglu_impl(x, bias)
     y_ref = reference_megatron.bias_swiglu_impl(x, bias)
-
-    _assert_megatron_close(y_actual, _reference(y_ref), dtype)
-
-
-@pytest.mark.bias_swiglu_impl
-@pytest.mark.skipif(
-    reference_megatron is None
-    or not hasattr(reference_megatron, "weighted_bias_swiglu_impl"),
-    reason="Megatron-LM weighted SwiGLU is not available",
-)
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_weighted_bias_swiglu_impl_matches_megatron(dtype):
-    """Differential test against Megatron-LM's weighted path."""
-    utils.init_seed(12)
-    x = torch.randn((16, 64), dtype=dtype, device=flag_train.device)
-    weights = torch.randn((16, 1), dtype=torch.float32, device=flag_train.device)
-
-    y_actual = flag_train.megatron.weighted_bias_swiglu_impl(x, None, weights)
-    y_ref = reference_megatron.weighted_bias_swiglu_impl(x, None, weights)
 
     _assert_megatron_close(y_actual, _reference(y_ref), dtype)

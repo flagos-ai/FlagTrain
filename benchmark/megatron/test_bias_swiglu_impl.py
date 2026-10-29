@@ -11,29 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Performance benchmark for bias_swiglu_impl / weighted_bias_swiglu_impl.
+"""Performance benchmark for bias_swiglu_impl.
 
-The baseline is Megatron-LM's own ``bias_swiglu_impl`` /
-``weighted_bias_swiglu_impl`` when it is installed. Those functions are
-PyTorch compositions decorated with ``@jit_fuser``, which is ``torch.compile``
-on torch >= 2.2, so the baseline is the compiled native implementation rather
-than eager PyTorch. When the installed Megatron-LM predates the clamp / SiTU
-variants, the main-branch implementation vendored in the appendix at the end of
-this file is used instead, so those cases are still compared against a compiled
-baseline.
+The baseline is Megatron-LM's own ``bias_swiglu_impl`` when it is installed.
+That function is a PyTorch composition decorated with ``@jit_fuser``, which is
+``torch.compile`` on torch >= 2.2, so the baseline is the compiled native
+implementation rather than eager PyTorch. When the installed Megatron-LM
+predates the clamp / SiTU variants, the main-branch implementation vendored in
+the appendix at the end of this file is used instead, so those cases are still
+compared against a compiled baseline.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the shapes
-below. Each test covers one dtype and prints the four variants back to back, so
+below. Each test covers one dtype and prints the three variants back to back, so
 a report can be read dtype by dtype. The operator is forward-only, so there are
-no backward cases. The plain path adds a ``[hidden]`` bias. The weighted path
-multiplies by a fp32 ``[*batch, 1]`` scale and passes ``bias=None``, matching
-Megatron-LM, which does not implement the weighted-with-bias combination.
-Megatron-LM wants flattened ``[token, 1]`` weights, so the wrapper reshapes
-``[*batch, 1]`` to ``[token, 1]`` first; that is the same view its own callers
-pass. The clamped and SiTU-GLU variants are benchmarked separately so their
-extra tanh/clamp work is visible instead of being folded into the plain
-numbers.
+no backward cases. The plain path adds a ``[hidden]`` bias. The clamped and
+SiTU-GLU variants are benchmarked separately so their extra tanh/clamp work is
+visible instead of being folded into the plain numbers.
 
 ``torch.compile`` recompiles per shape/dtype/requires-grad pattern. The
 default Dynamo recompile limit is smaller than this benchmark's case count, so
@@ -86,12 +80,6 @@ def bias_swiglu_ref(
     return torch.nn.functional.silu(gate) * linear
 
 
-def weighted_bias_swiglu_ref(x, bias, weights, **kwargs):
-    if bias is not None:
-        raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
-    return bias_swiglu_ref(x, None, **kwargs) * weights
-
-
 # Enough variants for 5 shapes x 3 dtypes of forward cases without Dynamo
 # falling back to eager halfway through the suite.
 _DYNAMO_RECOMPILE_LIMIT = 128
@@ -102,15 +90,7 @@ def _missing_kwargs(impl, kwargs):
     return [name for name in kwargs if name not in parameters]
 
 
-def _megatron_weighted(impl, x, bias, weights, **kwargs):
-    # Megatron-LM expects already-flattened ``[token, 1]`` weights; its own
-    # MoE callers pass that view. Reshaping here keeps the comparison equal.
-    if weights.ndim == 3:
-        weights = weights.reshape(-1, 1)
-    return impl(x, bias, weights, **kwargs)
-
-
-def _missing_baseline(weighted, op_kwargs, reason):
+def _missing_baseline(op_kwargs, reason):
     """Baseline for variants the installed Megatron-LM cannot serve.
 
     Uses the main-branch implementation vendored in the appendix at the end of
@@ -121,44 +101,37 @@ def _missing_baseline(weighted, op_kwargs, reason):
     appendix and this function and restore the call sites in ``base_op`` to
     ``functools.partial(eager, **op_kwargs)``.
     """
-    impl = weighted_bias_swiglu_impl if weighted else bias_swiglu_impl
-
     warnings.warn(
         f"{reason}; using the vendored main-branch implementation as the "
         "benchmark baseline",
         RuntimeWarning,
         stacklevel=3,
     )
-    if weighted:
-        return functools.partial(_megatron_weighted, impl, **op_kwargs)
-    return functools.partial(impl, **op_kwargs)
+    return functools.partial(bias_swiglu_impl, **op_kwargs)
 
 
-def base_op(weighted=False, **op_kwargs):
+def base_op(**op_kwargs):
     """Megatron-LM's native op when it supports the variant, else the vendored one.
 
     Mirrors ``base_op`` in ``test_quick_gelu.py``: the import happens here and
     a missing Megatron-LM is a warning plus a fallback, not a hard dependency.
     An installed Megatron-LM that predates the clamp / SiTU variants is served
-    by ``_missing_baseline``; the eager composition is its own last resort.
+    by ``_missing_baseline``.
     """
-    name = "weighted_bias_swiglu_impl" if weighted else "bias_swiglu_impl"
+    name = "bias_swiglu_impl"
     try:
         import megatron.core.fusions.fused_bias_swiglu
     except ImportError:
-        return _missing_baseline(weighted, op_kwargs, "Megatron-LM is unavailable")
+        return _missing_baseline(op_kwargs, "Megatron-LM is unavailable")
     impl = getattr(megatron.core.fusions.fused_bias_swiglu, name, None)
     if impl is None:
-        return _missing_baseline(weighted, op_kwargs, f"Megatron-LM has no {name}")
+        return _missing_baseline(op_kwargs, f"Megatron-LM has no {name}")
     missing = _missing_kwargs(impl, op_kwargs)
     if missing:
         return _missing_baseline(
-            weighted,
             op_kwargs,
             f"installed Megatron-LM {name} does not accept {missing}",
         )
-    if weighted:
-        return functools.partial(_megatron_weighted, impl, **op_kwargs)
     return functools.partial(impl, **op_kwargs)
 
 
@@ -257,15 +230,6 @@ def bias_swiglu_input_fn(shape, dtype, device):
     )
 
 
-def weighted_bias_swiglu_input_fn(shape, dtype, device):
-    weight_shape = shape[:-1] + (1,)
-    yield (
-        torch.randn(shape, dtype=dtype, device=device),
-        None,
-        torch.randn(weight_shape, dtype=torch.float32, device=device),
-    )
-
-
 def _run(input_fn, torch_op, train_op, op_name, op_kwargs=None, dtype=None):
     # ``torch_op`` is already a configured baseline (native or fallback);
     # ``op_kwargs`` only selects the variant of the operator under test.
@@ -288,35 +252,25 @@ def _run(input_fn, torch_op, train_op, op_name, op_kwargs=None, dtype=None):
     bench.run()
 
 
-# Table order inside one dtype group: (op_name, input_fn, train_op, op_kwargs, weighted).
+# Table order inside one dtype group: (op_name, input_fn, train_op, op_kwargs).
 _VARIANTS = [
     (
         "bias_swiglu_impl",
         bias_swiglu_input_fn,
         flag_train.megatron.bias_swiglu_impl,
         {},
-        False,
-    ),
-    (
-        "weighted_bias_swiglu_impl",
-        weighted_bias_swiglu_input_fn,
-        flag_train.megatron.weighted_bias_swiglu_impl,
-        {},
-        True,
     ),
     (
         "bias_swiglu_impl_clamped",
         bias_swiglu_input_fn,
         flag_train.megatron.bias_swiglu_impl,
         _CLAMPED_KWARGS,
-        False,
     ),
     (
         "bias_swiglu_impl_situ",
         bias_swiglu_input_fn,
         flag_train.megatron.bias_swiglu_impl,
         _SITU_KWARGS,
-        False,
     ),
 ]
 
@@ -325,10 +279,10 @@ _VARIANTS = [
 @pytest.mark.parametrize("dtype", _dtypes(), ids=lambda d: str(d).split(".")[-1])
 def test_bias_swiglu_impl_perf(dtype):
     """Every table for one dtype, so a report reads dtype by dtype."""
-    for op_name, input_fn, train_op, op_kwargs, weighted in _VARIANTS:
+    for op_name, input_fn, train_op, op_kwargs in _VARIANTS:
         _run(
             input_fn,
-            base_op(weighted=weighted, **op_kwargs),
+            base_op(**op_kwargs),
             train_op,
             op_name,
             op_kwargs=op_kwargs or None,
@@ -413,12 +367,6 @@ def bias_swiglu(y, bias):
 
 
 @jit_fuser
-def weighted_swiglu(y, weights):
-    dtype = y.dtype
-    res = swiglu(y) * weights
-    return res.to(dtype)
-
-
 @jit_fuser
 def clamped_swiglu(y, clamp_value):
     """Perform SwiGLU after clamping both halves of the input."""
@@ -437,13 +385,6 @@ def bias_clamped_swiglu(y, bias, clamp_value):
 
 
 @jit_fuser
-def clamped_weighted_swiglu(y, weights, clamp_value):
-    """Perform token-weighted clamped SwiGLU."""
-    dtype = y.dtype
-    res = clamped_swiglu(y, clamp_value) * weights
-    return res.to(dtype)
-
-
 @jit_fuser
 def _tanh_clamp_and_deriv(y: torch.Tensor, clamp_scale: float):
     """Soft-clamps ``y`` and returns the clamp derivative alongside it, both in fp32."""
@@ -470,17 +411,6 @@ def bias_situ_glu(y, bias, gate_clamp_scale: float, linear_clamp_scale: Optional
 
 
 @jit_fuser
-def weighted_situ_glu(y, weights, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
-    dtype = y.dtype
-    res = situ_glu(y, gate_clamp_scale, linear_clamp_scale) * weights
-    return res.to(dtype)
-
-
-# gradient of tanh approximation of gelu
-# gradient of actual gelu is:
-# 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
-
-
 class BiasSwiGLUFunction(torch.autograd.Function):
     """Forward-only stand-in for Megatron's autograd wrapper.
 
@@ -508,18 +438,6 @@ class SwiGLUFunction(torch.autograd.Function):
         return swiglu(input)
 
 
-class WeightedSwiGLUFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, weights, clamp_value, gate_clamp_scale, linear_clamp_scale):
-        if gate_clamp_scale is not None:
-            return weighted_situ_glu(
-                input, weights, gate_clamp_scale, linear_clamp_scale
-            )
-        if clamp_value is not None and clamp_value > 0:
-            return clamped_weighted_swiglu(input, weights, clamp_value)
-        return weighted_swiglu(input, weights)
-
-
 def bias_swiglu_impl(
     input,
     bias,
@@ -543,26 +461,3 @@ def bias_swiglu_impl(
             input, clamp_value, gate_clamp_scale, linear_clamp_scale
         )
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
-
-
-def weighted_bias_swiglu_impl(
-    input,
-    bias,
-    weights,
-    fp8_input_store=False,
-    clamp_value=None,
-    gate_clamp_scale=None,
-    linear_clamp_scale=None,
-):
-    ori_shape = input.shape
-    assert len(ori_shape) in [2, 3]
-    assert gate_clamp_scale is not None or linear_clamp_scale is None
-    assert gate_clamp_scale is None or clamp_value is None
-    input = input.view(-1, ori_shape[-1])
-    if bias is not None:
-        raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
-    output = WeightedSwiGLUFunction.apply(
-        input, weights, clamp_value, gate_clamp_scale, linear_clamp_scale
-    )
-    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
-# fmt: on
