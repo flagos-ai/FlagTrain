@@ -14,12 +14,11 @@
 """Performance benchmark for Megatron's scaled masked softmax forward.
 
 The baseline is Megatron-LM's ``ScaledMaskedSoftmax.forward``, the operator
-this port is a port *of*. ``megatron-core`` below ``0.20.0`` -- what this
-repository pins -- cannot supply it, so its one-line method body is vendored
-below and run against the same Apex CUDA extension. When that extension or
-``megatron-core >= 0.20.0`` is unavailable, the benchmark warns and falls back
-to ``masked_softmax_ref``, the plain-torch scale + sentinel + softmax
-composition. ``_BASELINE`` records which one was measured.
+this port is a port *of*. When ``megatron.core.fusions.fused_softmax`` cannot
+supply it, its one-line method body is vendored below and run against the same
+Apex CUDA extension. When that extension is unavailable, the benchmark warns
+and falls back to ``masked_softmax_ref``, the plain-torch scale + sentinel +
+softmax composition. ``_BASELINE`` records which one was measured.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). Both implementations read the
@@ -77,19 +76,6 @@ def masked_softmax_ref(inputs, mask, scale):
     return result.to(inputs.dtype)
 
 
-_MIN_NATIVE_VERSION = "0.20.0"
-
-
-def _parse_version(text):
-    parts = []
-    for chunk in text.split(".")[:3]:
-        digits = "".join(ch for ch in chunk if ch.isdigit())
-        parts.append(int(digits) if digits else 0)
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts)
-
-
 def _megatron_version():
     for distribution in ("megatron-core", "megatron"):
         try:
@@ -119,14 +105,13 @@ def _load_megatron_baseline():
         )
         return None
     version = _megatron_version()
-    if version is None or _parse_version(version) < _parse_version(_MIN_NATIVE_VERSION):
-        return "vendored"
     try:
         from megatron.core.fusions.fused_softmax import ScaledMaskedSoftmax
     except Exception as exc:  # pragma: no cover - depends on the installation
         warnings.warn(
-            f"megatron-core {version} is installed but its fused_softmax module "
-            f"could not be imported ({exc!r}); using the vendored baseline.",
+            "megatron.core.fusions.fused_softmax.ScaledMaskedSoftmax could not "
+            f"be imported ({exc!r}); using the vendored baseline "
+            f"(installed megatron-core: {version or 'absent'}).",
             RuntimeWarning,
             stacklevel=2,
         )
