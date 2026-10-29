@@ -7,12 +7,14 @@ from .fused_gated_norm import fused_gated_norm
 from .fused_indices_to_multihot import fused_indices_to_multihot
 from .fused_pad_routing_map import fused_pad_routing_map
 from .quick_gelu import quick_gelu
+from .weighted_squared_relu_impl import weighted_squared_relu_impl
 
 __all__ = [
     "fused_gated_norm",
     "fused_indices_to_multihot",
     "fused_pad_routing_map",
     "quick_gelu",
+    "weighted_squared_relu_impl",
 ]
 
 SpecOpRegistrar(registry=globals(), vendor=runtime_device.vendor_name).apply()
