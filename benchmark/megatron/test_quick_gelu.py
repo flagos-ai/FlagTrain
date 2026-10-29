@@ -17,10 +17,9 @@ The preferred baseline is Megatron-LM's official
 ``megatron.core.activations.quick_gelu`` interface. If Megatron-LM is not
 installed, the benchmark logs a warning and falls back to the equivalent
 PyTorch composition. Timing, warmup and synchronization come from
-``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode).
-``--level core`` runs the small, medium and large shapes below;
-``--level comprehensive`` adds the extra shapes. The operator is forward-only,
-so there is no backward benchmark.
+``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode). The shapes
+below are fixed, so ``--level`` does not change the case list. The operator is
+forward-only, so there is no backward benchmark.
 """
 
 import os
