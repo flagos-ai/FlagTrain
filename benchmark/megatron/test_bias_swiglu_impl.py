@@ -367,7 +367,6 @@ def bias_swiglu(y, bias):
 
 
 @jit_fuser
-@jit_fuser
 def clamped_swiglu(y, clamp_value):
     """Perform SwiGLU after clamping both halves of the input."""
     dtype = y.dtype
@@ -384,7 +383,6 @@ def bias_clamped_swiglu(y, bias, clamp_value):
     return clamped_swiglu(y + bias, clamp_value)
 
 
-@jit_fuser
 @jit_fuser
 def _tanh_clamp_and_deriv(y: torch.Tensor, clamp_scale: float):
     """Soft-clamps ``y`` and returns the clamp derivative alongside it, both in fp32."""
@@ -410,34 +408,6 @@ def bias_situ_glu(y, bias, gate_clamp_scale: float, linear_clamp_scale: Optional
     return situ_glu(y + bias, gate_clamp_scale, linear_clamp_scale)
 
 
-@jit_fuser
-class BiasSwiGLUFunction(torch.autograd.Function):
-    """Forward-only stand-in for Megatron's autograd wrapper.
-
-    The wrapper stays so the measured call path keeps Megatron's
-    ``Function.apply`` overhead; the saved tensors and the backward are dropped
-    because this benchmark only measures forward.
-    """
-
-    @staticmethod
-    def forward(ctx, input, bias, clamp_value, gate_clamp_scale, linear_clamp_scale):
-        if gate_clamp_scale is not None:
-            return bias_situ_glu(input, bias, gate_clamp_scale, linear_clamp_scale)
-        if clamp_value is not None and clamp_value > 0:
-            return bias_clamped_swiglu(input, bias, clamp_value)
-        return bias_swiglu(input, bias)
-
-
-class SwiGLUFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, clamp_value, gate_clamp_scale, linear_clamp_scale):
-        if gate_clamp_scale is not None:
-            return situ_glu(input, gate_clamp_scale, linear_clamp_scale)
-        if clamp_value is not None and clamp_value > 0:
-            return clamped_swiglu(input, clamp_value)
-        return swiglu(input)
-
-
 def bias_swiglu_impl(
     input,
     bias,
@@ -452,12 +422,18 @@ def bias_swiglu_impl(
     assert gate_clamp_scale is not None or linear_clamp_scale is None
     assert gate_clamp_scale is None or clamp_value is None
     input = input.view(-1, ori_shape[-1])
-    if bias is not None:
-        output = BiasSwiGLUFunction.apply(
-            input, bias, clamp_value, gate_clamp_scale, linear_clamp_scale
-        )
+    if gate_clamp_scale is not None:
+        if bias is None:
+            out = situ_glu(input, gate_clamp_scale, linear_clamp_scale)
+        else:
+            out = bias_situ_glu(input, bias, gate_clamp_scale, linear_clamp_scale)
+    elif clamp_value is not None and clamp_value > 0:
+        if bias is None:
+            out = clamped_swiglu(input, clamp_value)
+        else:
+            out = bias_clamped_swiglu(input, bias, clamp_value)
+    elif bias is None:
+        out = swiglu(input)
     else:
-        output = SwiGLUFunction.apply(
-            input, clamp_value, gate_clamp_scale, linear_clamp_scale
-        )
-    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+        out = bias_swiglu(input, bias)
+    return out if len(ori_shape) == 2 else out.view(ori_shape[0], ori_shape[1], -1)
