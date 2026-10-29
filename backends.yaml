@@ -71,6 +71,7 @@ backends:
       # pandas 3 first and leave an unimportable pair behind.
       - pandas==2.3.2
       - megatron-core==0.17.1
+      - scipy==1.15.3
 
   hygon:
     python: "3.10"
