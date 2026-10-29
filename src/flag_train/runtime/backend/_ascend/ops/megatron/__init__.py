@@ -28,10 +28,14 @@ from .fast_gelu import fast_gelu
 from .fused_gated_norm import fused_gated_norm
 from .fused_indices_to_multihot import fused_indices_to_multihot
 from .fused_pad_routing_map import fused_pad_routing_map
+from .scaled_upper_triang_masked_softmax_forward import (
+    scaled_upper_triang_masked_softmax_forward,
+)
 
 __all__ = [
     "fast_gelu",
     "fused_gated_norm",
     "fused_indices_to_multihot",
     "fused_pad_routing_map",
+    "scaled_upper_triang_masked_softmax_forward",
 ]

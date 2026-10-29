@@ -63,6 +63,7 @@ backends:
       # version instead of the other way round.
       - numpy==1.26.4
       - megatron-core==0.17.1
+      - scipy==1.15.3
 
   hygon:
     python: "3.10"
