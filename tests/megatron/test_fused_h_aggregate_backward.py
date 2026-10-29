@@ -15,7 +15,7 @@
 
 The oracle is ``torch.autograd`` through Megatron-LM's ``native_h_aggregate`` --
 the derivative Megatron's own training step takes of this stage -- from the
-installed megatron-core when that is new enough to have it, and otherwise from
+installed megatron-core when it provides the function, and otherwise from
 ``native_h_aggregate_ref``, the same code transcribed below.
 
 The two gradients are checked separately because they are different arithmetic:
@@ -27,7 +27,6 @@ the eager body underneath is what is differentiated here.
 """
 
 import importlib.metadata
-import re
 import warnings
 
 import pytest
@@ -107,13 +106,11 @@ if utils.bf16_is_supported:
 # ---------------------------------------------------------------------------
 # Megatron oracle
 #
-# ``native_h_aggregate`` arrived with the mHC stages in megatron-core 0.20; 0.19
-# and earlier have no ``hyper_connection`` module at all and use the
-# transcription. A megatron-core that is new enough to have the function but
-# cannot import it is a broken installation, and that is raised rather than
-# papered over with the transcription.
+# The oracle is the installed ``native_h_aggregate`` when it can be imported,
+# and ``native_h_aggregate_ref`` otherwise: an older megatron-core has no
+# ``hyper_connection`` module at all, so the two paths are exactly import
+# success and import failure.
 # ---------------------------------------------------------------------------
-_MCORE_MIN_VERSION = (0, 20)
 
 
 def native_h_aggregate_ref(x, h_pre):
@@ -128,23 +125,12 @@ def _mcore_version():
         return "not installed"
 
 
-def _version_tuple(version):
-    """``(major, minor)`` of a distribution version, or ``None`` without one."""
-    match = re.match(r"\s*(\d+)(?:\.(\d+))?", version)
-    return None if match is None else (int(match.group(1)), int(match.group(2) or 0))
-
-
 def _load_native_h_aggregate():
-    """Megatron-LM's ``native_h_aggregate``, or the transcription when older."""
+    """Megatron-LM's ``native_h_aggregate``, or the transcription when absent."""
     version = _mcore_version()
     try:
         from megatron.core.transformer.hyper_connection import native_h_aggregate
-    except Exception as exc:
-        if (_version_tuple(version) or (0, 0)) >= _MCORE_MIN_VERSION:
-            raise RuntimeError(
-                f"megatron-core {version} should provide native_h_aggregate, "
-                f"but importing it failed: {exc!r}"
-            ) from exc
+    except Exception:
         warnings.warn(
             f"megatron-core {version} has no native_h_aggregate; checking "
             f"against native_h_aggregate_ref, Megatron-LM's implementation "

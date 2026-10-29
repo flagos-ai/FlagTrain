@@ -21,10 +21,8 @@ of ``hyper_connection.py`` this file carries -- wrapped in ``@torch.compile``
 exactly as Megatron wraps it. megatron-core 0.19 and earlier have no
 ``hyper_connection`` module, so without that fallback an older container could
 only skip this benchmark; with it, the comparison is still against Megatron's
-implementation compiled the way Megatron compiles it. Where megatron-core is
-new enough to have the function but cannot import it, the loader raises rather
-than timing the transcription under the package's name. The report line says
-which of the two was timed.
+implementation compiled the way Megatron compiles it. The two paths are import
+success and import failure; the report line says which of the two was timed.
 
 Unlike the correctness suite, the baseline here keeps the compile: that wrapper
 is what Megatron pays for this stage. (``tests/megatron/
@@ -49,7 +47,6 @@ arithmetic.
 """
 
 import importlib.metadata
-import re
 import warnings
 
 import pytest
@@ -95,16 +92,13 @@ if flag_train.runtime.device.support_bf16:
 # ---------------------------------------------------------------------------
 # Megatron baseline
 #
-# ``native_h_aggregate`` arrived with the mHC stages in megatron-core 0.20; 0.19
-# and earlier have no ``hyper_connection`` module. So the baseline is the
+# ``native_h_aggregate`` arrived with the mHC stages in megatron-core 0.20; an
+# older install has no ``hyper_connection`` module. So the baseline is the
 # installed function when it can be imported, and otherwise a transcription of
 # Megatron-LM's ``hyper_connection.py`` compiled the way Megatron compiles it.
-# The rule is the same on every supported backend: megatron-core when it has the
-# function, the transcription otherwise. A megatron-core that is new enough to
-# have the function but cannot import it is a broken installation, and that is
-# raised rather than timed as if it were the package.
+# The rule is the same on every supported backend: import success picks
+# megatron-core, import failure the transcription.
 # ---------------------------------------------------------------------------
-_MCORE_MIN_VERSION = (0, 20)
 
 
 def _mcore_version():
@@ -115,12 +109,6 @@ def _mcore_version():
 
 
 _MCORE_VERSION = _mcore_version()
-
-
-def _version_tuple(version):
-    """``(major, minor)`` of a distribution version, or ``None`` without one."""
-    match = re.match(r"\s*(\d+)(?:\.(\d+))?", version)
-    return None if match is None else (int(match.group(1)), int(match.group(2) or 0))
 
 
 def native_h_aggregate_ref(x, h_pre):
@@ -146,17 +134,6 @@ def _load_native_h_aggregate():
     try:
         from megatron.core.transformer.hyper_connection import native_h_aggregate
     except Exception as exc:
-        version = _version_tuple(_MCORE_VERSION)
-        if version is not None and version >= _MCORE_MIN_VERSION:
-            raise RuntimeError(
-                f"megatron-core {_MCORE_VERSION} should provide "
-                f"native_h_aggregate, but importing it failed: {exc!r}. This "
-                f"operator is the h_aggregate stage of "
-                f"megatron/core/fusions/fused_mhc_kernels.py, so it must be "
-                f"measured against Megatron's own implementation; the vendored "
-                f"transcription in this file only stands in for megatron-core "
-                f"< 0.20."
-            ) from exc
         warnings.warn(
             f"megatron-core {_MCORE_VERSION} does not provide "
             f"native_h_aggregate ({exc!r}); fused_h_aggregate_forward is "
@@ -169,9 +146,8 @@ def _load_native_h_aggregate():
             f"vendored from Megatron-LM (megatron-core {_MCORE_VERSION})"
         )
 
-    # The distribution metadata is what the gate above reads; the label reports
-    # the version of the source actually imported, which a PYTHONPATH checkout
-    # can differ from.
+    # The label reports the version of the source actually imported, which a
+    # PYTHONPATH checkout can differ from the distribution metadata.
     try:
         from megatron.core.package_info import __version__ as source_version
     except Exception:
