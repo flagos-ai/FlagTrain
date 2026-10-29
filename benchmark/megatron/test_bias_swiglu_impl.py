@@ -24,10 +24,11 @@ baseline.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the shapes
-below. The operator is forward-only, so there are no backward cases. The plain
-path adds a ``[hidden]`` bias. The weighted path multiplies by a fp32
-``[*batch, 1]`` scale and passes ``bias=None``, matching Megatron-LM, which does
-not implement the weighted-with-bias combination.
+below. Each test covers one dtype and prints the four variants back to back, so
+a report can be read dtype by dtype. The operator is forward-only, so there are
+no backward cases. The plain path adds a ``[hidden]`` bias. The weighted path
+multiplies by a fp32 ``[*batch, 1]`` scale and passes ``bias=None``, matching
+Megatron-LM, which does not implement the weighted-with-bias combination.
 Megatron-LM wants flattened ``[token, 1]`` weights, so the wrapper reshapes
 ``[*batch, 1]`` to ``[token, 1]`` first; that is the same view its own callers
 pass. The clamped and SiTU-GLU variants are benchmarked separately so their
@@ -265,7 +266,7 @@ def weighted_bias_swiglu_input_fn(shape, dtype, device):
     )
 
 
-def _run(input_fn, torch_op, train_op, op_name, op_kwargs=None):
+def _run(input_fn, torch_op, train_op, op_name, op_kwargs=None, dtype=None):
     # ``torch_op`` is already a configured baseline (native or fallback);
     # ``op_kwargs`` only selects the variant of the operator under test.
     # The operator is forward-only, so there is no backward case to measure.
@@ -275,7 +276,7 @@ def _run(input_fn, torch_op, train_op, op_name, op_kwargs=None):
         input_fn=input_fn,
         op_name=op_name,
         torch_op=torch_op,
-        dtypes=_dtypes(),
+        dtypes=[dtype] if dtype is not None else _dtypes(),
         is_backward=False,
     )
     bench.set_train(train_op)
@@ -287,46 +288,52 @@ def _run(input_fn, torch_op, train_op, op_name, op_kwargs=None):
     bench.run()
 
 
-@pytest.mark.bias_swiglu_impl
-def test_bias_swiglu_impl_perf():
-    _run(
-        bias_swiglu_input_fn,
-        base_op(),
-        flag_train.megatron.bias_swiglu_impl,
+# Table order inside one dtype group: (op_name, input_fn, train_op, op_kwargs, weighted).
+_VARIANTS = [
+    (
         "bias_swiglu_impl",
-    )
-
-
-@pytest.mark.bias_swiglu_impl
-def test_weighted_bias_swiglu_impl_perf():
-    _run(
-        weighted_bias_swiglu_input_fn,
-        base_op(weighted=True),
-        flag_train.megatron.weighted_bias_swiglu_impl,
+        bias_swiglu_input_fn,
+        flag_train.megatron.bias_swiglu_impl,
+        {},
+        False,
+    ),
+    (
         "weighted_bias_swiglu_impl",
-    )
-
-
-@pytest.mark.bias_swiglu_impl
-def test_bias_swiglu_impl_clamped_perf():
-    _run(
-        bias_swiglu_input_fn,
-        base_op(**_CLAMPED_KWARGS),
-        flag_train.megatron.bias_swiglu_impl,
+        weighted_bias_swiglu_input_fn,
+        flag_train.megatron.weighted_bias_swiglu_impl,
+        {},
+        True,
+    ),
+    (
         "bias_swiglu_impl_clamped",
-        op_kwargs=_CLAMPED_KWARGS,
-    )
+        bias_swiglu_input_fn,
+        flag_train.megatron.bias_swiglu_impl,
+        _CLAMPED_KWARGS,
+        False,
+    ),
+    (
+        "bias_swiglu_impl_situ",
+        bias_swiglu_input_fn,
+        flag_train.megatron.bias_swiglu_impl,
+        _SITU_KWARGS,
+        False,
+    ),
+]
 
 
 @pytest.mark.bias_swiglu_impl
-def test_bias_swiglu_impl_situ_perf():
-    _run(
-        bias_swiglu_input_fn,
-        base_op(**_SITU_KWARGS),
-        flag_train.megatron.bias_swiglu_impl,
-        "bias_swiglu_impl_situ",
-        op_kwargs=_SITU_KWARGS,
-    )
+@pytest.mark.parametrize("dtype", _dtypes(), ids=lambda d: str(d).split(".")[-1])
+def test_bias_swiglu_impl_perf(dtype):
+    """Every table for one dtype, so a report reads dtype by dtype."""
+    for op_name, input_fn, train_op, op_kwargs, weighted in _VARIANTS:
+        _run(
+            input_fn,
+            base_op(weighted=weighted, **op_kwargs),
+            train_op,
+            op_name,
+            op_kwargs=op_kwargs or None,
+            dtype=dtype,
+        )
 
 
 # ===========================================================================
