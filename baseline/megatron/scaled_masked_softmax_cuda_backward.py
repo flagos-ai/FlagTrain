@@ -28,12 +28,11 @@ ports -- whose whole body is one call into Megatron-LM's Apex CUDA extension
         output_grads, softmax_results, scale_t[0]
     ), None, None
 
-The baseline is selected the same way as in the FlagTrain benchmark: the
-installed ``ScaledMaskedSoftmax`` when megatron-core is >= 0.20, and otherwise
-the same body vendored below against the same extension. The Apex extension is
-a hard dependency. Without it this module raises instead of measuring the
-benchmark's ``masked_backward_ref`` torch composition, because the record is
-meant to describe Megatron's fused kernel.
+The baseline is Megatron's ``ScaledMaskedSoftmax`` when megatron-core provides
+it, and otherwise the same body vendored below against the same extension. The
+Apex extension is a hard dependency. Without it this module raises instead of
+measuring the benchmark's ``masked_backward_ref`` torch composition, because the
+record is meant to describe Megatron's fused kernel.
 
 The operands are passed directly rather than obtained by differentiating a
 forward: the operator is the backward kernel. Its output is ``input_grads``;
@@ -47,9 +46,8 @@ Shapes, dtypes and the input construction are copied from
 (``_SHAPES`` and ``masked_backward_input_fn``).
 """
 
-import importlib.metadata
 import importlib.util
-import re
+import warnings
 
 import torch
 
@@ -70,25 +68,6 @@ _SHAPES = [
 
 _SCALE = 0.125
 _EXTENSION = "scaled_masked_softmax_cuda"
-
-# The version from which megatron-core's own ``ScaledMaskedSoftmax`` is the
-# baseline, as in the benchmark.
-_MIN_NATIVE_VERSION = (0, 20)
-
-
-def _version_tuple(version):
-    """``(major, minor)`` of a distribution version, or ``None`` without one."""
-    match = re.match(r"\s*(\d+)(?:\.(\d+))?", version)
-    return None if match is None else (int(match.group(1)), int(match.group(2) or 0))
-
-
-def _megatron_version():
-    for distribution in ("megatron-core", "megatron"):
-        try:
-            return importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            continue
-    return None
 
 
 def _require_extension():
@@ -115,7 +94,7 @@ class _SavedForBackward:
 
 
 def _vendored_backward(output_grads, softmax_results, scale):
-    """``ScaledMaskedSoftmax.backward``'s body, for an older megatron-core.
+    """``ScaledMaskedSoftmax.backward``'s body, when megatron-core lacks it.
 
     Upstream answers one value per forward input -- ``(input_grads, None,
     None)``, the ``None``s standing for ``mask`` and ``scale``, which have no
@@ -153,19 +132,18 @@ def _megatron_backward():
     global _NATIVE, _SCALED_MASKED_SOFTMAX
     if _NATIVE is None:
         _require_extension()
-        version = _megatron_version()
-        current = _version_tuple(version) if version is not None else None
-        if current is None or current < _MIN_NATIVE_VERSION:
+        try:
+            from megatron.core.fusions.fused_softmax import ScaledMaskedSoftmax
+        except Exception as exc:  # megatron-core absent, or without the class
+            warnings.warn(
+                "megatron.core.fusions.fused_softmax.ScaledMaskedSoftmax could "
+                f"not be imported ({exc!r}); using the vendored body against "
+                "the same Apex extension.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             _NATIVE = _vendored_backward
         else:
-            try:
-                from megatron.core.fusions.fused_softmax import ScaledMaskedSoftmax
-            except Exception as exc:
-                raise RuntimeError(
-                    f"megatron-core {version} should provide "
-                    "megatron.core.fusions.fused_softmax.ScaledMaskedSoftmax, "
-                    f"but importing it failed: {exc!r}"
-                ) from exc
             _SCALED_MASKED_SOFTMAX = ScaledMaskedSoftmax
             _NATIVE = _class_backward
     return _NATIVE

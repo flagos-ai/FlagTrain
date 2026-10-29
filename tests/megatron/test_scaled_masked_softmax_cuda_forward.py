@@ -24,12 +24,11 @@ The operator is ``ScaledMaskedSoftmax.forward`` in Megatron-LM's
   extension. Installing ``megatron-core`` does not ship that extension, so this
   comparison is skipped when the CUDA module itself is not importable.
 
-``megatron-core`` below ``0.20.0`` is what this repository pins (0.17.1 /
-0.19.2 across backends). The method body is vendored below and used as the
-Megatron baseline whenever the installed version is older than ``0.20.0`` or
-absent. That is feasible because the body is one call into the Apex extension;
-``test_vendored_baseline_matches_torch`` holds the copy to the composition so
-it cannot silently drift.
+``ScaledMaskedSoftmax`` is taken from the installed ``megatron-core`` whenever
+it can be imported; otherwise the method body is vendored below and used as the
+Megatron baseline. That is feasible because the body is one call into the Apex
+extension; ``test_vendored_baseline_matches_torch`` holds the copy to the
+composition so it cannot silently drift.
 """
 
 import importlib.metadata
@@ -86,18 +85,6 @@ _BENCH_SHAPES = [
 # Megatron baseline
 # ---------------------------------------------------------------------------
 
-_MIN_NATIVE_VERSION = "0.20.0"
-
-
-def _parse_version(text):
-    parts = []
-    for chunk in text.split(".")[:3]:
-        digits = "".join(ch for ch in chunk if ch.isdigit())
-        parts.append(int(digits) if digits else 0)
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts)
-
 
 def _megatron_version():
     for distribution in ("megatron-core", "megatron"):
@@ -109,16 +96,15 @@ def _megatron_version():
 
 
 def _load_megatron_native():
-    """Installed Megatron's class, or ``None`` when the version is too old."""
+    """Installed Megatron's class, or ``None`` when it cannot be imported."""
     version = _megatron_version()
-    if version is None or _parse_version(version) < _parse_version(_MIN_NATIVE_VERSION):
-        return None
     try:
         from megatron.core.fusions.fused_softmax import ScaledMaskedSoftmax
     except Exception as exc:  # pragma: no cover - depends on the installation
         warnings.warn(
-            f"megatron-core {version} is installed but its fused_softmax module "
-            f"could not be imported ({exc!r}); using the vendored baseline.",
+            "megatron.core.fusions.fused_softmax.ScaledMaskedSoftmax could not "
+            f"be imported ({exc!r}); using the vendored baseline "
+            f"(installed megatron-core: {version or 'absent'}).",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -138,7 +124,7 @@ _NATIVE = _load_megatron_native()
 
 
 def _megatron_forward(inputs, mask, scale):
-    """Megatron's forward body, native when new enough, else vendored."""
+    """Megatron's forward body, native when importable, else vendored."""
     if _NATIVE is None:
         return _vendored_forward(inputs, mask, scale)
     return _NATIVE[1].apply(inputs, mask, scale)
