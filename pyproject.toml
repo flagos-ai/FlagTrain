@@ -26,12 +26,12 @@ Issues = "https://github.com/flagos-ai/FlagTrain/issues"
 [project.optional-dependencies]
 # --- BEGIN auto-generated from backends.yaml ---
 
-# Use `--no-deps` during installation.
+# FlagOS images provide vendor-compatible torch and Triton builds. Install this
+# extra with `uv pip install -e ".[nvidia]"` so [tool.uv].exclude-dependencies
+# prevents DeepSpeed from replacing them. pip does not support this policy.
 nvidia = [
     "deepspeed==0.19.8",
     "deepspeed-kernels",
-    "hjson==3.1.0",     # deps for deepspeed
-    "py-cpuinfo==9.0.0",    # deps for deepspeed
 ]
 
 
@@ -39,6 +39,14 @@ nvidia = [
 
 test = [
     "pytest>=8.0",
+]
+
+[tool.uv]
+# DeepSpeed declares generic torch and Triton dependencies, but the FlagOS
+# runtime images already contain hardware-specific, compatible replacements.
+exclude-dependencies = [
+    "torch",
+    "triton",
 ]
 
 [tool.setuptools.packages.find]
