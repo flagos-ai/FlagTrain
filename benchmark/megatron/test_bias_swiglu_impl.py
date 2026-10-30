@@ -16,18 +16,20 @@
 The baseline is Megatron-LM's own ``bias_swiglu_impl`` when it is installed.
 That function is a PyTorch composition decorated with ``@jit_fuser``, which is
 ``torch.compile`` on torch >= 2.2, so the baseline is the compiled native
-implementation rather than eager PyTorch. When the installed Megatron-LM
-predates the clamp / SiTU variants, the main-branch implementation vendored in
-the appendix at the end of this file is used instead, so those cases are still
-compared against a compiled baseline.
+implementation rather than eager PyTorch. When megatron-core is older than
+0.20 (the first release with the clamp / SiTU arguments), or is not installed,
+the main-branch implementation vendored in the appendix at the end of this file
+is used instead, so every case is still compared against a compiled baseline.
+The choice is made once at import from the installed version, and the
+``Baseline:`` line printed by the test records which one ran.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the shapes
-below. Each test covers one dtype and prints the three variants back to back, so
-a report can be read dtype by dtype. The operator is forward-only, so there are
-no backward cases. The plain path adds a ``[hidden]`` bias. The clamped and
-SiTU-GLU variants are benchmarked separately so their extra tanh/clamp work is
-visible instead of being folded into the plain numbers.
+below. One benchmark table covers the three activations: every row carries the
+variant label and ``--dtypes`` chooses the dtypes. The operator is
+forward-only, so there are no backward cases. The plain path adds a
+``[hidden]`` bias. The clamped and SiTU-GLU rows stay separate so their extra
+tanh/clamp work is visible instead of being folded into the plain numbers.
 
 ``torch.compile`` recompiles per shape/dtype/requires-grad pattern. The
 default Dynamo recompile limit is smaller than this benchmark's case count, so
@@ -35,9 +37,9 @@ the module raises it; otherwise the baseline silently falls back to eager and
 the comparison is meaningless.
 """
 
-import functools
-import inspect
+import importlib.metadata
 import os
+import re
 import warnings
 from typing import Optional
 
@@ -53,8 +55,10 @@ _CORE_SHAPES = [
     (64, 64),
     (1024, 1024),
     (4096, 4096),
-    (4, 8192, 4096),
-    (8, 4096, 11008),
+    (16384, 4096),
+    (2048, 11008),
+    (16, 128, 8192),
+    (256, 32768),
 ]
 
 
@@ -80,59 +84,28 @@ def bias_swiglu_ref(
     return torch.nn.functional.silu(gate) * linear
 
 
-# Enough variants for 5 shapes x 3 dtypes of forward cases without Dynamo
-# falling back to eager halfway through the suite.
+# Enough variants for 7 shapes x 3 activations x 3 dtypes of forward cases
+# without Dynamo falling back to eager halfway through the suite.
 _DYNAMO_RECOMPILE_LIMIT = 128
 
-
-def _missing_kwargs(impl, kwargs):
-    parameters = inspect.signature(impl).parameters
-    return [name for name in kwargs if name not in parameters]
+# megatron-core 0.20 is the first release with the clamp / SiTU arguments.
+_MCORE_MIN_VERSION = (0, 20)
 
 
-def _missing_baseline(op_kwargs, reason):
-    """Baseline for variants the installed Megatron-LM cannot serve.
-
-    Uses the main-branch implementation vendored in the appendix at the end of
-    this file so the clamp / SiTU cases are still compared against a compiled
-    Megatron instead of the eager composition.
-
-    Once the minimum supported megatron-core ships those variants, delete the
-    appendix and this function and restore the call sites in ``base_op`` to
-    ``functools.partial(eager, **op_kwargs)``.
-    """
-    warnings.warn(
-        f"{reason}; using the vendored main-branch implementation as the "
-        "benchmark baseline",
-        RuntimeWarning,
-        stacklevel=3,
-    )
-    return functools.partial(bias_swiglu_impl, **op_kwargs)
-
-
-def base_op(**op_kwargs):
-    """Megatron-LM's native op when it supports the variant, else the vendored one.
-
-    Mirrors ``base_op`` in ``test_quick_gelu.py``: the import happens here and
-    a missing Megatron-LM is a warning plus a fallback, not a hard dependency.
-    An installed Megatron-LM that predates the clamp / SiTU variants is served
-    by ``_missing_baseline``.
-    """
-    name = "bias_swiglu_impl"
+def _mcore_version():
     try:
-        import megatron.core.fusions.fused_bias_swiglu
-    except ImportError:
-        return _missing_baseline(op_kwargs, "Megatron-LM is unavailable")
-    impl = getattr(megatron.core.fusions.fused_bias_swiglu, name, None)
-    if impl is None:
-        return _missing_baseline(op_kwargs, f"Megatron-LM has no {name}")
-    missing = _missing_kwargs(impl, op_kwargs)
-    if missing:
-        return _missing_baseline(
-            op_kwargs,
-            f"installed Megatron-LM {name} does not accept {missing}",
-        )
-    return functools.partial(impl, **op_kwargs)
+        return importlib.metadata.version("megatron-core")
+    except Exception:
+        return "not installed"
+
+
+_MCORE_VERSION = _mcore_version()
+
+
+def _version_tuple(version):
+    """``(major, minor)`` of a distribution version, or ``None`` without one."""
+    match = re.match(r"\s*(\d+)(?:\.(\d+))?", version)
+    return None if match is None else (int(match.group(1)), int(match.group(2) or 0))
 
 
 def _stabilize_megatron_compile():
@@ -210,84 +183,59 @@ def _dtypes():
     return dtypes
 
 
-class _FixedShapeBenchmark(base.GenericBenchmark):
-    """Shapes are fixed here because ``benchmark/core_shapes.yaml`` does not exist yet.
-
-    ``Benchmark.set_shapes`` opens that file, so an override is required for an
-    operator that is not listed in one. This matches ``QuickGeluBenchmark``.
-    """
-
+class BiasSwigluImplBenchmark(base.GenericBenchmark):
     DEFAULT_SHAPES = _CORE_SHAPES
 
     def set_shapes(self, shape_file=None):
         self.shapes = list(_CORE_SHAPES)
 
 
+# Variant label -> operator kwargs. The label travels with each input row, so
+# one benchmark table covers all three activations.
+_VARIANTS = {
+    "plain": {},
+    "clamped": _CLAMPED_KWARGS,
+    "situ": _SITU_KWARGS,
+}
+
+
 def bias_swiglu_input_fn(shape, dtype, device):
-    yield (
-        torch.randn(shape, dtype=dtype, device=device),
-        torch.randn((shape[-1],), dtype=dtype, device=device),
-    )
+    x = torch.randn(shape, dtype=dtype, device=device)
+    bias = torch.randn((shape[-1],), dtype=dtype, device=device)
+    for variant in _VARIANTS:
+        yield (x, bias, variant)
 
 
-def _run(input_fn, torch_op, train_op, op_name, op_kwargs=None, dtype=None):
-    # ``torch_op`` is already a configured baseline (native or fallback);
-    # ``op_kwargs`` only selects the variant of the operator under test.
-    # The operator is forward-only, so there is no backward case to measure.
-    if op_kwargs:
-        train_op = functools.partial(train_op, **op_kwargs)
-    bench = _FixedShapeBenchmark(
-        input_fn=input_fn,
-        op_name=op_name,
-        torch_op=torch_op,
-        dtypes=[dtype] if dtype is not None else _dtypes(),
-        is_backward=False,
-    )
-    bench.set_train(train_op)
-    # On Ascend, enable parallel scheduling of all blocks to avoid excessive logical cores
-    # and reduce scheduling overhead when the logical core count exceeds 65,535.
-    # See https://github.com/flagos-ai/FlagGems/pull/7304
-    if flag_train.vendor_name == "ascend":
-        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
-    bench.run()
+def torch_op(x, bias, variant):
+    """Installed Megatron >= 0.20, or the vendored main-branch copy."""
+    return _BASELINE_IMPL(x, bias, **_VARIANTS[variant])
 
 
-# Table order inside one dtype group: (op_name, input_fn, train_op, op_kwargs).
-_VARIANTS = [
-    (
-        "bias_swiglu_impl",
-        bias_swiglu_input_fn,
-        flag_train.megatron.bias_swiglu_impl,
-        {},
-    ),
-    (
-        "bias_swiglu_impl_clamped",
-        bias_swiglu_input_fn,
-        flag_train.megatron.bias_swiglu_impl,
-        _CLAMPED_KWARGS,
-    ),
-    (
-        "bias_swiglu_impl_situ",
-        bias_swiglu_input_fn,
-        flag_train.megatron.bias_swiglu_impl,
-        _SITU_KWARGS,
-    ),
-]
+def train_op(x, bias, variant):
+    """The operator under test."""
+    return flag_train.megatron.bias_swiglu_impl(x, bias, **_VARIANTS[variant])
 
 
 @pytest.mark.bias_swiglu_impl
-@pytest.mark.parametrize("dtype", _dtypes(), ids=lambda d: str(d).split(".")[-1])
-def test_bias_swiglu_impl_perf(dtype):
-    """Every table for one dtype, so a report reads dtype by dtype."""
-    for op_name, input_fn, train_op, op_kwargs in _VARIANTS:
-        _run(
-            input_fn,
-            base_op(**op_kwargs),
-            train_op,
-            op_name,
-            op_kwargs=op_kwargs or None,
-            dtype=dtype,
-        )
+def test_bias_swiglu_impl_perf():
+    """Plain, clamped, and SiTU-GLU rows for every shape in one table."""
+    print(f"\nBaseline: {_BASELINE}")
+    # On Ascend, enable parallel scheduling of all blocks to avoid excessive
+    # logical cores and reduce scheduling overhead when the logical core count
+    # exceeds 65,535.
+    # See https://github.com/flagos-ai/FlagGems/pull/7304
+    if flag_train.vendor_name == "ascend":
+        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
+
+    bench = BiasSwigluImplBenchmark(
+        input_fn=bias_swiglu_input_fn,
+        op_name="bias_swiglu_impl",
+        torch_op=torch_op,
+        dtypes=_dtypes(),
+        is_backward=False,
+    )
+    bench.set_train(train_op)
+    bench.run()
 
 
 # ===========================================================================
@@ -297,44 +245,29 @@ def test_bias_swiglu_impl_perf(dtype):
 # tag yet; these variants are expected to reach a release with 0.20.0).
 #   https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/fusions/fused_bias_swiglu.py
 #
-# The megatron-core installed on this machine is 0.19.2. Its fused_bias_swiglu
-# has no clamp / SiTU variants, so those benchmark cases would otherwise fall
-# back to the eager composition; vendoring the main-branch code keeps them
-# compared against a compiled Megatron.
+# The megatron-core releases this file runs against on older machines
+# predate 0.20 and have no clamp / SiTU arguments, so those benchmark cases
+# would otherwise fall back to the eager composition; vendoring the
+# main-branch code keeps them compared against a compiled Megatron.
+# ``_load_baseline`` below picks this copy whenever megatron-core < 0.20 or is
+# not installed.
 #
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 #
-# Changes from upstream: the three Megatron-internal imports are replaced
-# (jit_fuser -> torch.compile, nvtx_decorator -> no-op, transformer_engine's
-# propagate_te_grouped_tensor_marker -> identity), ``F.`` is expanded to
-# ``torch.nn.functional.``, and the backward functions plus the saved-tensor
-# bookkeeping are dropped because this benchmark measures forward only. The
-# forward math is verbatim, which is why it sits under ``fmt: off``: black
-# must not reformat it, so it can be re-synced with upstream. Benchmark
-# baseline only, never a correctness oracle.
+# Changes from upstream: ``jit_fuser`` is replaced by ``torch.compile`` and
+# ``F.`` is expanded to ``torch.nn.functional.``. The backward functions, the
+# saved-tensor bookkeeping, and the Megatron-internal decorators are dropped
+# because this benchmark measures forward only. The forward math is verbatim,
+# which is why it sits under ``fmt: off``: black must not reformat it, so it
+# can be re-synced with upstream. Benchmark baseline only, never a correctness
+# oracle.
 #
-# When the minimum supported megatron-core ships these variants, delete this
-# appendix and ``_missing_baseline``, and drop the dispatch branch in
-# ``base_op``.
+# Once every supported megatron-core is >= 0.20 this appendix can be deleted
+# together with ``_load_baseline`` and the ``_BASELINE_IMPL`` indirection.
 # ===========================================================================
-# fmt: off
 
 jit_fuser = torch.compile
-
-
-def nvtx_decorator(message=None):
-    """No-op stand-in for ``megatron.core.utils.nvtx_decorator``."""
-
-    def wrap(fn):
-        return fn
-
-    return wrap
-
-
-def propagate_te_grouped_tensor_marker(source, target):
-    """Identity stand-in: the benchmark passes plain dense tensors."""
-    return target
 
 
 @jit_fuser
@@ -403,12 +336,14 @@ def situ_glu(y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
 
 
 @jit_fuser
-def bias_situ_glu(y, bias, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+def bias_situ_glu(
+    y, bias, gate_clamp_scale: float, linear_clamp_scale: Optional[float]
+):
     """Bias addition followed by SiTU-GLU. The clamps act on the full pre-activation."""
     return situ_glu(y + bias, gate_clamp_scale, linear_clamp_scale)
 
 
-def bias_swiglu_impl(
+def _vendored_bias_swiglu_impl(
     input,
     bias,
     fp8_input_store=False,
@@ -437,3 +372,35 @@ def bias_swiglu_impl(
     else:
         out = bias_swiglu(input, bias)
     return out if len(ori_shape) == 2 else out.view(ori_shape[0], ori_shape[1], -1)
+
+
+def _load_baseline():
+    """Installed Megatron when it has the clamp/SiTU arguments, else vendored."""
+    version = _version_tuple(_MCORE_VERSION)
+    if version is not None and version >= _MCORE_MIN_VERSION:
+        try:
+            from megatron.core.fusions.fused_bias_swiglu import (
+                bias_swiglu_impl as installed,
+            )
+        except ImportError as exc:
+            reason = f"megatron-core {_MCORE_VERSION} cannot import it: {exc}"
+        else:
+            return installed, f"megatron-core {_MCORE_VERSION}"
+    elif _MCORE_VERSION == "not installed":
+        reason = "Megatron-LM is not installed"
+    else:
+        reason = (
+            f"megatron-core {_MCORE_VERSION} predates the clamp/SiTU arguments "
+            f"(need >= {_MCORE_MIN_VERSION[0]}.{_MCORE_MIN_VERSION[1]})"
+        )
+
+    warnings.warn(
+        f"{reason}; using the vendored main-branch implementation as the "
+        "benchmark baseline",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return _vendored_bias_swiglu_impl, "vendored main-branch implementation"
+
+
+_BASELINE_IMPL, _BASELINE = _load_baseline()

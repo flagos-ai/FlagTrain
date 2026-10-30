@@ -13,14 +13,19 @@
 # limitations under the License.
 """Correctness tests for fused bias + SwiGLU (forward only).
 
-The reference is the eager formula Megatron-LM checks its own fusion against:
-SiLU (or SiTU) of the two halves, with the bias added by ordinary
-broadcasting. A separate differential test compares the plain path against
-``megatron.core.fusions.fused_bias_swiglu`` when Megatron-LM is installed, so
-the kernel is not only checked against a formula written for this file.
-Under ``--ref cpu`` those operands are moved to the CPU and upcast, so the
-comparison is against a higher-precision CPU result.
-Tolerances are ``train_assert_close``'s defaults.
+The reference is Megatron-LM's own ``bias_swiglu_impl`` once megatron-core
+ships the clamp / SiTU arguments (0.20), so the kernel is checked against the
+implementation it ports. Older installs, and the ``--ref cpu`` run, compare
+against ``bias_swiglu_ref``: the eager formula Megatron-LM checks its own
+fusion against, SiLU (or SiTU) of the two halves with the bias added by
+ordinary broadcasting. That formula covers every variant and is always
+available, so the suite still runs without Megatron-LM.
+
+Under ``--ref cpu`` the operands are moved to the CPU and upcast, so the
+comparison is against a higher-precision CPU result. The Megatron reference
+also sees upcast operands: its ``jit_fuser`` is a no-op outside CUDA, so adding
+the bias in the input dtype would otherwise make the reference the inaccurate
+side. Tolerances are ``train_assert_close``'s defaults.
 
 Only the forward output is checked: the backward is a separate operator. The
 ``fp8_input_store`` and ``cpu_offload_input`` flags stay for Megatron-LM
@@ -28,7 +33,8 @@ signature compatibility but have nothing left to save, so passing either one is
 expected to raise. ``bias`` must have the same dtype as ``input``.
 """
 
-import warnings
+import importlib.metadata
+import re
 
 import pytest
 import torch
@@ -37,23 +43,47 @@ import flag_train
 
 from .. import accuracy_utils as utils
 
+# megatron-core 0.20 is the first release with the clamp / SiTU arguments.
+_MCORE_MIN_VERSION = (0, 20)
 
-def base_op():
-    """Megatron-LM's SwiGLU module, or ``None`` when it is not installed.
 
-    Mirrors ``base_op`` in ``test_quick_gelu.py``: the import happens here and
-    a missing Megatron-LM is a warning, not a collection error.
-    """
+def _mcore_version():
     try:
-        import megatron.core.fusions.fused_bias_swiglu
-    except ImportError:
-        warnings.warn(
-            "Megatron-LM is unavailable; skipping the differential tests",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        return importlib.metadata.version("megatron-core")
+    except Exception:
+        return "not installed"
+
+
+_MCORE_VERSION = _mcore_version()
+
+
+def _version_tuple(version):
+    """``(major, minor)`` of a distribution version, or ``None`` without one."""
+    match = re.match(r"\s*(\d+)(?:\.(\d+))?", version)
+    return None if match is None else (int(match.group(1)), int(match.group(2) or 0))
+
+
+def _load_megatron_impl():
+    """Installed ``bias_swiglu_impl`` when it has the clamp/SiTU arguments.
+
+    Returns ``None`` below 0.20, where the eager formula is the reference.
+    A version new enough to have the arguments but unable to import them is a
+    broken install and raises instead of silently skipping Megatron.
+    """
+    version = _version_tuple(_MCORE_VERSION)
+    if version is None or version < _MCORE_MIN_VERSION:
         return None
-    return megatron.core.fusions.fused_bias_swiglu
+    try:
+        from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+    except Exception as exc:
+        raise RuntimeError(
+            f"megatron-core {_MCORE_VERSION} should provide bias_swiglu_impl "
+            f"with the clamp/SiTU arguments, but importing it failed: {exc!r}"
+        ) from exc
+    return bias_swiglu_impl
+
+
+_megatron_impl = _load_megatron_impl()
 
 
 def _keep_compile_in_process():
@@ -73,7 +103,6 @@ def _keep_compile_in_process():
 
 
 _keep_compile_in_process()
-reference_megatron = base_op()
 
 # Empty, unaligned (half = 3 and 17), and MLP-like ranks. The last dim is even.
 _SHAPES = [
@@ -97,23 +126,27 @@ _BIAS_SHAPES = [
     (4, 7, 32),
 ]
 
+# name -> (input std, operator kwargs). The std puts a meaningful share of a
+# normal sample across the variant's threshold:
+#   clamped 1.5 / 3.0 = 0.5 sigma  -> ~62% clamped
+#   situ gate 4 / 5.0 = 0.8 sigma  -> ~42% in the tanh saturation region
+#        linear 2.5 / 5.0 = 0.5 sigma -> ~62% soft-clamped
+#   plain keeps the standard normal.
 _VARIANTS = {
-    "plain": {},
-    "clamped": {"clamp_value": 1.5},
-    "situ": {"gate_clamp_scale": 4.0},
-    "situ_linear": {"gate_clamp_scale": 4.0, "linear_clamp_scale": 2.5},
+    "plain": (1.0, {}),
+    "clamped": (3.0, {"clamp_value": 1.5}),
+    "situ": (5.0, {"gate_clamp_scale": 4.0}),
+    "situ_linear": (5.0, {"gate_clamp_scale": 4.0, "linear_clamp_scale": 2.5}),
 }
 
 
 def bias_swiglu_ref(
     x,
     bias=None,
-    cpu_offload_input=False,
     clamp_value=None,
     gate_clamp_scale=None,
     linear_clamp_scale=None,
 ):
-    del cpu_offload_input
     y = x if bias is None else x + bias
     gate, linear = torch.chunk(y, 2, dim=-1)
     if gate_clamp_scale is not None:
@@ -139,38 +172,19 @@ def _assert_close(actual, expected, dtype):
     utils.train_assert_close(utils.to_reference(actual), expected, dtype)
 
 
-# Megatron-LM's baseline is ``@jit_fuser``, which is ``torch.compile`` on
-# torch >= 2.2: where the compiler fuses, the forward keeps fp32 intermediates
-# and agrees with this kernel to a few 1e-7; where it falls back to eager, it
-# rounds at every step and lands up to ~1.5 ulp away in practice. fp16 and bf16
-# therefore allow four ulp of their own dtype. Only the forward output uses this
-# table; this operator has no backward.
-_MEGATRON_TOLERANCES = {
-    torch.float32: {"rtol": 1.0e-6, "atol": 1.0e-6},
-    torch.float16: {"rtol": 4 * torch.finfo(torch.float16).eps, "atol": 1.0e-3},
-    torch.bfloat16: {"rtol": 4 * torch.finfo(torch.bfloat16).eps, "atol": 1.0e-2},
-}
+def _expected_output(x, bias, **kwargs):
+    """Megatron-LM at 0.20+, the eager formula otherwise or under ``--ref cpu``.
 
-
-def _assert_megatron_close(actual, expected, dtype):
-    torch.testing.assert_close(
-        actual.detach().float().cpu(),
-        expected.detach().float().cpu(),
-        **_MEGATRON_TOLERANCES[dtype],
-    )
-
-
-def _variant_kwargs(name):
-    return dict(_VARIANTS[name])
-
-
-def _scale_for(name):
-    # Push a share of the values into the clamp or the tanh saturation region.
-    if name == "plain":
-        return 1.0
-    if name == "clamped":
-        return 3.0
-    return 5.0
+    The Megatron side gets contiguous operands: its ``input.view(-1, hidden)``
+    rejects the transposed inputs this suite deliberately feeds the operator.
+    """
+    if _megatron_impl is not None and not utils.TO_CPU:
+        return _megatron_impl(
+            x.contiguous(),
+            None if bias is None else bias.contiguous(),
+            **kwargs,
+        )
+    return bias_swiglu_ref(x, bias, **kwargs)
 
 
 def _check_bias_swiglu(x, bias, **kwargs):
@@ -180,7 +194,7 @@ def _check_bias_swiglu(x, bias, **kwargs):
     assert y.shape[:-1] == x.shape[:-1]
     assert y.dtype == dtype
 
-    expected = bias_swiglu_ref(_reference(x), _reference(bias), **kwargs)
+    expected = _expected_output(_reference(x), _reference(bias), **kwargs)
     _assert_close(y, expected, dtype)
 
 
@@ -208,19 +222,19 @@ def test_bias_swiglu_impl_bias(shape, dtype):
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_swiglu_impl_variants(variant, dtype):
     utils.init_seed(1)
-    scale = _scale_for(variant)
+    scale, kwargs = _VARIANTS[variant]
     x = torch.randn((16, 64), dtype=dtype, device=flag_train.device) * scale
-    _check_bias_swiglu(x, None, **_variant_kwargs(variant))
+    _check_bias_swiglu(x, None, **kwargs)
 
 
 @pytest.mark.bias_swiglu_impl
 @pytest.mark.parametrize("variant", list(_VARIANTS))
 def test_bias_swiglu_impl_variants_bias(variant):
     utils.init_seed(1)
-    scale = _scale_for(variant)
+    scale, kwargs = _VARIANTS[variant]
     x = torch.randn((16, 64), dtype=torch.float16, device=flag_train.device) * scale
     bias = torch.randn((64,), dtype=torch.float16, device=flag_train.device)
-    _check_bias_swiglu(x, bias, **_variant_kwargs(variant))
+    _check_bias_swiglu(x, bias, **kwargs)
 
 
 @pytest.mark.bias_swiglu_impl
@@ -312,20 +326,16 @@ def test_bias_swiglu_impl_rejects_bad_arguments():
         flag_train.megatron.bias_swiglu_impl(x, None, gate_clamp_scale=-1.0)
     with pytest.raises(ValueError, match="broadcast"):
         flag_train.megatron.bias_swiglu_impl(x, torch.randn((3,), device=device))
+    # An empty input must not skip the bias checks.
+    with pytest.raises(ValueError, match="broadcast"):
+        flag_train.megatron.bias_swiglu_impl(
+            torch.empty((0, 8), device=device), torch.randn((3,), device=device)
+        )
     # Forward only: the flags that used to control the saved activations raise.
     with pytest.raises(NotImplementedError, match="forward-only"):
         flag_train.megatron.bias_swiglu_impl(x, None, fp8_input_store=True)
     with pytest.raises(NotImplementedError, match="forward-only"):
         flag_train.megatron.bias_swiglu_impl(x, None, cpu_offload_input=True)
-
-
-@pytest.mark.bias_swiglu_impl
-def test_bias_swiglu_impl_empty_input_validates_bias():
-    """An empty input must not skip the bias checks."""
-    device = flag_train.device
-    x = torch.empty((0, 8), device=device)
-    with pytest.raises(ValueError, match="broadcast"):
-        flag_train.megatron.bias_swiglu_impl(x, torch.randn((3,), device=device))
 
 
 @pytest.mark.bias_swiglu_impl
@@ -340,21 +350,3 @@ def test_bias_swiglu_impl_requires_matching_bias_dtype(dtype):
         flag_train.megatron.bias_swiglu_impl(
             x, torch.randn((8,), dtype=other, device=device)
         )
-
-
-@pytest.mark.bias_swiglu_impl
-@pytest.mark.skipif(reference_megatron is None, reason="Megatron-LM is not installed")
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-@pytest.mark.parametrize("with_bias", [False, True])
-def test_bias_swiglu_impl_matches_megatron(dtype, with_bias):
-    """Differential test against Megatron-LM's own plain SwiGLU path."""
-    utils.init_seed(11)
-    x = torch.randn((16, 64), dtype=dtype, device=flag_train.device)
-    bias = (
-        torch.randn((64,), dtype=dtype, device=flag_train.device) if with_bias else None
-    )
-
-    y_actual = flag_train.megatron.bias_swiglu_impl(x, bias)
-    y_ref = reference_megatron.bias_swiglu_impl(x, bias)
-
-    _assert_megatron_close(y_actual, _reference(y_ref), dtype)

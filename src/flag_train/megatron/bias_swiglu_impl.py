@@ -76,11 +76,6 @@ def _check_input(tensor, name):
         )
 
 
-def _check_same_device(tensor, name, device):
-    if tensor.device != device:
-        raise ValueError(f"{name} is on {tensor.device}, expected {device}")
-
-
 def _positive_scale(value, name):
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise TypeError(f"{name} needs a finite float, got {type(value).__name__}")
@@ -96,38 +91,32 @@ def _resolve_variant(clamp_value, gate_clamp_scale, linear_clamp_scale):
     A non-positive ``clamp_value`` is rejected. Megatron-LM's kernel treats
     that as the unclamped SwiGLU; the config layer already forbids it, and
     silently ignoring it would hide a bad call.
+
+    Returns ``(mode, scale, linear_scale)``. ``scale`` is the hard clamp for
+    clamped SwiGLU and the gate soft clamp for SiTU-GLU; ``linear_scale`` is
+    set only for the SiTU-GLU variant that clamps the linear half too.
     """
     if gate_clamp_scale is not None and clamp_value is not None:
         raise ValueError("gate_clamp_scale and clamp_value cannot both be set")
     if linear_clamp_scale is not None and gate_clamp_scale is None:
         raise ValueError("linear_clamp_scale requires gate_clamp_scale")
 
-    has_linear_clamp = False
     if gate_clamp_scale is not None:
-        gate_clamp_scale = _positive_scale(gate_clamp_scale, "gate_clamp_scale")
-        if linear_clamp_scale is not None:
-            linear_clamp_scale = _positive_scale(
-                linear_clamp_scale, "linear_clamp_scale"
-            )
-            has_linear_clamp = True
-        return _MODE_SITU, gate_clamp_scale, linear_clamp_scale, has_linear_clamp
+        scale = _positive_scale(gate_clamp_scale, "gate_clamp_scale")
+        linear_scale = (
+            None
+            if linear_clamp_scale is None
+            else _positive_scale(linear_clamp_scale, "linear_clamp_scale")
+        )
+        return _MODE_SITU, scale, linear_scale
 
     if clamp_value is not None:
-        clamp_value = _positive_scale(clamp_value, "clamp_value")
-        return _MODE_CLAMPED, clamp_value, None, False
+        return _MODE_CLAMPED, _positive_scale(clamp_value, "clamp_value"), None
 
-    return _MODE_PLAIN, None, None, False
-
-
-def _can_broadcast_to(tensor, shape):
-    try:
-        torch.broadcast_to(tensor, shape)
-    except RuntimeError:
-        return False
-    return True
+    return _MODE_PLAIN, None, None
 
 
-def _prepare_bias(bias, n_rows, hidden):
+def _prepare_bias(bias, flat):
     """Return a kernel bias tensor and a mode.
 
     Mode vector is one row of ``hidden`` values shared by every token, which
@@ -138,15 +127,29 @@ def _prepare_bias(bias, n_rows, hidden):
     if bias is None:
         return None, _BIAS_NONE
     _check_input(bias, "bias_swiglu bias")
+    if bias.device != flat.device:
+        raise ValueError(
+            f"bias_swiglu bias is on {bias.device}, expected {flat.device}"
+        )
+    if bias.dtype != flat.dtype:
+        raise ValueError(
+            "bias_swiglu bias must have the input dtype, got "
+            f"{bias.dtype} for {flat.dtype}"
+        )
+
+    n_rows, hidden = flat.shape
     flat_shape = (n_rows, hidden)
-    if not _can_broadcast_to(bias, flat_shape):
+    try:
+        expanded = torch.broadcast_to(bias, flat_shape)
+    except RuntimeError:
         raise ValueError(
             "bias_swiglu bias must broadcast with the flattened input "
             f"{flat_shape}, got {tuple(bias.shape)}"
-        )
-    if hidden == 0 or n_rows == 0:
+        ) from None
+    # Empty inputs still reach this point so a bad bias is rejected. Keep the
+    # guard before indexing a row: with no rows there is no row 0 to copy.
+    if n_rows == 0 or hidden == 0:
         return bias, _BIAS_VECTOR
-    expanded = torch.broadcast_to(bias, flat_shape)
     if expanded.stride(0) == 0:
         # Same values on every token. Copy one row, not the whole broadcast.
         return expanded[0].contiguous(), _BIAS_VECTOR
@@ -227,52 +230,14 @@ def _bias_swiglu_forward_kernel(
         tl.store(y_row + cols, out.to(y_ptr.dtype.element_ty), mask=mask)
 
 
-def _block_size(n_cols):
-    """Power-of-two column tile, capped at the tuned maximum."""
-    return max(_MIN_BLOCK_SIZE, min(_BLOCK_SIZE, triton.next_power_of_2(n_cols)))
-
-
-def _num_warps(block):
-    """Do not launch threads that have no columns to read on a narrow row."""
+def _launch_config(n_cols):
+    """Power-of-two column tile and the warps needed to cover it."""
+    block = max(_MIN_BLOCK_SIZE, min(_BLOCK_SIZE, triton.next_power_of_2(n_cols)))
     if block <= 64:
-        return 1
+        return block, 1
     if block <= 256:
-        return 2
-    return _NUM_WARPS
-
-
-def _launch_forward(
-    x,
-    bias,
-    bias_mode,
-    y,
-    variant,
-    clamp_value,
-    gate_scale,
-    linear_scale,
-):
-    mode, has_linear_clamp = variant
-    n_rows, hidden = x.shape
-    n_cols = hidden // 2
-    grid = (n_rows,)
-    block = _block_size(n_cols)
-    with torch_device_fn.device(x.device):
-        _bias_swiglu_forward_kernel[grid](
-            x,
-            # The constexpr mode stops the kernel from reading this pointer,
-            # but Triton still type-checks the argument, so reuse ``x``.
-            x if bias is None else bias,
-            y,
-            n_cols,
-            0.0 if clamp_value is None else clamp_value,
-            1.0 if gate_scale is None else gate_scale,
-            1.0 if linear_scale is None else linear_scale,
-            BIAS_MODE=bias_mode,
-            MODE=mode,
-            HAS_LINEAR_CLAMP=has_linear_clamp,
-            BLOCK=block,
-            num_warps=_num_warps(block),
-        )
+        return block, 2
+    return block, _NUM_WARPS
 
 
 def _flatten_input(x):
@@ -292,65 +257,38 @@ def _flatten_input(x):
     return flat, out_shape
 
 
-def _empty_output(x, out_shape):
-    return x.new_empty(out_shape)
+def _forward(flat, bias, mode, scale, linear_scale):
+    """Run the kernel over a flattened ``[rows, hidden]`` view.
 
-
-def _forward_from_flat(
-    flat, bias, out_shape, clamp_value, gate_scale, linear_scale, variant
-):
+    The bias is validated before the empty-input shortcut, so an empty call
+    rejects a bad bias exactly like a non-empty one.
+    """
     n_rows, hidden = flat.shape
     n_cols = hidden // 2
-    # Validate and normalize the optional operands before the empty-input
-    # shortcut, so an empty call rejects a bad bias exactly like a non-empty one.
-    bias_tensor, bias_mode = _prepare_bias(bias, n_rows, hidden)
-    if bias is not None:
-        _check_same_device(bias, "bias_swiglu bias", flat.device)
-        if bias.dtype != flat.dtype:
-            raise ValueError(
-                "bias_swiglu bias must have the input dtype, got "
-                f"{bias.dtype} for {flat.dtype}"
-            )
+    bias_tensor, bias_mode = _prepare_bias(bias, flat)
     if n_rows == 0 or n_cols == 0:
-        return _empty_output(flat, (n_rows, n_cols)).view(out_shape)
+        return flat.new_empty((n_rows, n_cols))
 
+    block, num_warps = _launch_config(n_cols)
     y = flat.new_empty((n_rows, n_cols))
-    _launch_forward(
-        flat,
-        bias_tensor,
-        bias_mode,
-        y,
-        variant,
-        clamp_value,
-        gate_scale,
-        linear_scale,
-    )
-    return y.view(out_shape)
-
-
-def _check_forward_only_flags(fp8_input_store, cpu_offload_input):
-    if fp8_input_store or cpu_offload_input:
-        raise NotImplementedError(
-            "bias_swiglu_impl is forward-only; fp8_input_store and "
-            "cpu_offload_input only affected the activations saved for the "
-            "backward"
+    with torch_device_fn.device(flat.device):
+        _bias_swiglu_forward_kernel[(n_rows,)](
+            flat,
+            # The constexpr mode stops the kernel from reading this pointer,
+            # but Triton still type-checks the argument, so reuse ``flat``.
+            flat if bias_tensor is None else bias_tensor,
+            y,
+            n_cols,
+            0.0 if mode != _MODE_CLAMPED else scale,
+            1.0 if mode != _MODE_SITU else scale,
+            1.0 if linear_scale is None else linear_scale,
+            BIAS_MODE=bias_mode,
+            MODE=mode,
+            HAS_LINEAR_CLAMP=linear_scale is not None,
+            BLOCK=block,
+            num_warps=num_warps,
         )
-
-
-def _apply(x, bias, clamp_value, gate_clamp_scale, linear_clamp_scale):
-    flat, out_shape = _flatten_input(x)
-    mode, resolved, resolved_linear, has_linear_clamp = _resolve_variant(
-        clamp_value, gate_clamp_scale, linear_clamp_scale
-    )
-    return _forward_from_flat(
-        flat,
-        bias,
-        out_shape,
-        resolved if mode == _MODE_CLAMPED else None,
-        resolved if mode == _MODE_SITU else None,
-        resolved_linear if has_linear_clamp else None,
-        (mode, has_linear_clamp),
-    )
+    return y
 
 
 def bias_swiglu_impl(
@@ -392,11 +330,15 @@ def bias_swiglu_impl(
         raise TypeError(
             f"bias_swiglu bias needs a tensor or None, got {type(bias).__name__}"
         )
-    _check_forward_only_flags(fp8_input_store, cpu_offload_input)
-    return _apply(
-        input,
-        bias,
-        clamp_value,
-        gate_clamp_scale,
-        linear_clamp_scale,
+    if fp8_input_store or cpu_offload_input:
+        raise NotImplementedError(
+            "bias_swiglu_impl is forward-only; fp8_input_store and "
+            "cpu_offload_input only affected the activations saved for the "
+            "backward"
+        )
+
+    flat, out_shape = _flatten_input(input)
+    mode, scale, linear_scale = _resolve_variant(
+        clamp_value, gate_clamp_scale, linear_clamp_scale
     )
+    return _forward(flat, bias, mode, scale, linear_scale).view(out_shape)
