@@ -23,8 +23,10 @@ Shapes and dtypes are copied from
 ``FlagTrain/benchmark/megatron/test_bias_swiglu_impl.py`` (``_CORE_SHAPES`` and
 ``_dtypes``). The last input dimension is the concatenated ``[gate | linear]``,
 so the output keeps half of it. The bias is the ``skip_bias_add`` ``[hidden]``
-tensor added to both halves. The weighted entry point is a separate operator
-and gets its own file.
+tensor added to both halves. Only the plain SwiGLU activation is collected: the
+clamped and SiTU variants run the same kernel with two extra min/max ops, and
+``clamp_value`` / ``gate_clamp_scale`` only exist from megatron-core 0.20 on,
+while this file must also work with the version installed here.
 
 Megatron decorates the inner helpers of that module with ``@jit_fuser``, which
 is ``torch.compile`` on torch >= 2.2. Like ``quick_gelu.py`` this module
@@ -50,8 +52,10 @@ _SHAPES = [
     (64, 64),
     (1024, 1024),
     (4096, 4096),
-    (4, 8192, 4096),
-    (8, 4096, 11008),
+    (16384, 4096),
+    (2048, 11008),
+    (16, 128, 8192),
+    (256, 32768),
 ]
 
 _MEGATRON_BIAS_SWIGLU_IMPL = None
