@@ -3,6 +3,7 @@
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime.backend import SpecOpRegistrar
 
+from .bias_swiglu_impl import bias_swiglu_impl
 from .fast_gelu import fast_gelu
 from .fused_gated_norm import fused_gated_norm
 from .fused_indices_to_multihot import fused_indices_to_multihot
@@ -12,6 +13,7 @@ from .fused_proj_rms_forward import fused_proj_rms_forward
 from .quick_gelu import quick_gelu
 
 __all__ = [
+    "bias_swiglu_impl",
     "fast_gelu",
     "fused_gated_norm",
     "fused_indices_to_multihot",
