@@ -18,10 +18,10 @@ belongs to is readable from the path: an override for
 ``flag_train.deepspeed.<name>`` is defined in ``deepspeed/<name>.py`` and
 re-exported by ``deepspeed/__init__.py``.
 
-Empty on purpose: no operator in this backend needs an implementation of its own
-yet. It exists so ``import_vendor_extra_lib`` finds an ``ops`` package rather than
-printing "no specialized common operators were found" on every import, and so this
-backend's layout matches the others'.
+This package defines no operator itself: the ones this backend specialises live in the
+subpackages below. It exists so ``import_vendor_extra_lib`` finds an ``ops`` package
+rather than printing "no specialized common operators were found" on every import, and
+so this backend's layout matches the others'.
 
 ``SpecOpRegistrar`` reads this module and every subpackage below it, taking each
 package's operators from its ``__all__`` and writing each one over the same-named

@@ -7,6 +7,7 @@ from .blocked_flash import blocked_flash
 from .evoformer_attn import evoformer_attn
 from .lamb import lamb
 from .lion import multi_tensor_lion
+from .mixed_gemm import mixed_gemm
 from .mixed_moe_gemm import mixed_moe_gemm
 from .multi_tensor_adam import multi_tensor_adam
 from .packbits import packbits
@@ -17,6 +18,7 @@ __all__ = [
     "blocked_flash",
     "evoformer_attn",
     "lamb",
+    "mixed_gemm",
     "mixed_moe_gemm",
     "multi_tensor_adam",
     "multi_tensor_lion",

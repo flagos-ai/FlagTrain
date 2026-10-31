@@ -21,12 +21,17 @@ override belongs to is readable from the path.
 ``blocked_flash`` is here because the generic launcher rejects this device
 outright, sizes its tile for more shared memory than the BI-V150 has, and
 compiles its two-loop KV walk into wrong numbers here; the module's docstring
-has all three. To specialise another, define it under this package, re-export
-it here (``from .lamb import lamb``) and list it in ``__all__``, which is what
+has all three.
+
+``mixed_gemm`` is specialised here: the generic fused kernel cannot be pipelined
+on this backend's Triton and, unpipelined, stays 3-4x behind the vendor BLAS past
+L2. To specialise another, define it under this package, re-export it here
+(``from .lamb import lamb``) and list it in ``__all__``, which is what
 ``SpecOpRegistrar`` registers.
 """
 
 from .blocked_flash import blocked_flash
+from .mixed_gemm import mixed_gemm
 from .wf6af16_linear import wf6af16_linear
 
-__all__ = ["blocked_flash", "wf6af16_linear"]
+__all__ = ["blocked_flash", "mixed_gemm", "wf6af16_linear"]

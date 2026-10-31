@@ -17,12 +17,17 @@ A specialised operator goes in the same-named module here as the generic one it
 replaces -- ``deepspeed/blocked_flash.py`` beside
 ``flag_train/deepspeed/blocked_flash.py`` -- and is listed in ``__all__`` below,
 which is what ``SpecOpRegistrar`` registers.
+
+``mixed_gemm`` is specialised here: this backend lowers bf16 through ``i16``, which the
+generic kernel's integer-to-bf16 conversion does not survive.
 """
 
 from .blocked_flash import blocked_flash
+from .mixed_gemm import mixed_gemm
 from .wf6af16_linear import wf6af16_linear
 
 __all__ = [
     "blocked_flash",
+    "mixed_gemm",
     "wf6af16_linear",
 ]
