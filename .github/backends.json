@@ -39,7 +39,7 @@
     "label": "vendor/Hygon",
     "gpu_check": "tools/gpu_check_hygon.sh",
     "label_gated": true,
-    "prebuilt_env": true,
+    "prebuilt_env": false,
     "enabled": true,
     "container": {
       "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-hygon-dtk26.04:2.2.0",
@@ -57,7 +57,7 @@
     "label": "vendor/Iluvatar",
     "gpu_check": "tools/gpu_check_iluvatar.sh",
     "label_gated": true,
-    "prebuilt_env": true,
+    "prebuilt_env": false,
     "enabled": true,
     "container": {
       "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-iluvatar-corex4.5.0:2.2.0",
@@ -76,7 +76,7 @@
     "label": "vendor/MetaX",
     "gpu_check": "tools/gpu_check_metax.sh",
     "label_gated": true,
-    "prebuilt_env": true,
+    "prebuilt_env": false,
     "enabled": true,
     "container": {
       "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-metax-maca3.8.1.3:2.2.0",
@@ -94,14 +94,14 @@
     "label": "vendor/MooreThreads",
     "gpu_check": "tools/gpu_check_mthreads.sh",
     "label_gated": true,
-    "prebuilt_env": true,
+    "prebuilt_env": false,
     "enabled": true,
     "container": {
       "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-mthreads-musa5.2.0:2.2.0",
       "options": "--device /dev/mtgpu.0 --device /dev/mtgpu.1 --device /dev/mtgpu.2 --device /dev/mtgpu.3 --device /dev/mtgpu.4 --device /dev/mtgpu.5 --device /dev/mtgpu.6 --device /dev/mtgpu.7 --device /dev/dri --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864 -v /usr/bin/mthreads-gmi:/usr/bin/mthreads-gmi:ro",
       "runs_on": "flagtrain-mthreads-s5000-0"
     },
-    "note": "Container job on the FlagOS runtime image, like hygon/iluvatar/metax: it already ships torch + torch_musa + the MUSA flagtree, so setup_env.sh --prebuilt installs nothing but FlagTrain and the test deps. mthreads-gmi is bind-mounted read-only from the host because tools/gpu_check_mthreads.sh runs inside the container; drop the -v if the image turns out to carry it already (FlagGems passes the same mount, expressed as container.volumes, which this repo's schema does not have)."
+    "note": "Container job on the FlagOS runtime image, like hygon/iluvatar/metax. prebuilt_env is false like every vendor, so setup_env.sh --no-prebuilt installs backends.yaml's torch/torch_musa, the MUSA flagtree and megatron-core on top of the image instead of trusting whatever it ships. mthreads-gmi is bind-mounted read-only from the host because tools/gpu_check_mthreads.sh runs inside the container; drop the -v if the image turns out to carry it already (FlagGems passes the same mount, expressed as container.volumes, which this repo's schema does not have)."
   },
   {
     "backend": "thead",
@@ -114,13 +114,13 @@
     "label": "vendor/THead",
     "gpu_check": "tools/gpu_check_thead.sh",
     "label_gated": true,
-    "prebuilt_env": true,
+    "prebuilt_env": false,
     "enabled": true,
     "container": {
       "image": "pkg.flytiger-eco.com/docker_release/pytorch:v2.1.1-2.10.0-ubuntu24.04-cuda13.0-py312",
       "options": "--device=/dev/alixpu --device=/dev/alixpu_ctl --device=/dev/alixpu_ppu0 --device=/dev/alixpu_ppu1 --device=/dev/alixpu_ppu2 --device=/dev/alixpu_ppu3 --device=/dev/alixpu_ppu4 --device=/dev/alixpu_ppu5 --device=/dev/alixpu_ppu6 --device=/dev/alixpu_ppu7 --device=/dev/alixpu_ppu8 --device=/dev/alixpu_ppu9 --device=/dev/alixpu_ppu10 --device=/dev/alixpu_ppu11 --device=/dev/alixpu_ppu12 --device=/dev/alixpu_ppu13 --device=/dev/alixpu_ppu14 --device=/dev/alixpu_ppu15 --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864",
       "runs_on": "flagcicd-810e"
     },
-    "note": "No FlagOS runtime image exists for this vendor, so the job runs in the vendor's own pytorch image and, like FlagGems' thead job, installs nothing on top of it: whatever that image ships (torch, and hopefully flagtree/triton-ppu) is the environment. If the first run fails with a missing torch/triton, flip prebuilt_env to false and setup_env.sh will install backends.yaml's PPU stack instead -- that installs torch from a source tarball and can replace the image's driver-matched build, which is why it is not the default."
+    "note": "No FlagOS runtime image exists for this vendor, and the vendor's pytorch image carries torch/triton but not the test reference packages (megatron-core), so, like ascend, the job runs --no-prebuilt and setup_env.sh installs backends.yaml's pins (the PPU stack plus megatron-core) out of the vendor index and the mirror. Keep the torch pin aligned with the image's driver-matched build (2.10.0, PPU 2.1.1): pip leaves an exactly matching install alone, while a mismatched pin reinstalls it -- possibly from a source tarball -- which is the cost this configuration accepts in exchange for the reference packages."
   }
 ]

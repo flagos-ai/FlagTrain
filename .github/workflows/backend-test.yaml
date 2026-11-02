@@ -27,13 +27,12 @@
 #                 (--ref=cpu --quick), and the performance suites.
 #
 #   test-container a vendor whose backend entry carries a container: block runs
-#                 in that image on the vendor's runner. The runtime images
-#                 already ship that vendor's torch and triton, so
-#                 tools/setup_env.sh only adds FlagTrain and the test
-#                 dependencies; thead is the exception (prebuilt_env false),
-#                 whose image is the vendor's own and gets the vendor stack
-#                 installed from backends.yaml first. Runs correctness, the
-#                 quick-CPU pass and the performance suites.
+#                 in that image on the vendor's runner and installs
+#                 backends.yaml's pins over it first: prebuilt_env is false for
+#                 every vendor, so tools/setup_env.sh --no-prebuilt adds the
+#                 vendor stack and the test reference packages rather than
+#                 trusting what the image ships. Runs correctness, the quick-CPU
+#                 pass and the performance suites.
 #
 #   test-native   a vendor with no container: block runs on the runner itself,
 #                 with tools/setup_env.sh --no-prebuilt building the python

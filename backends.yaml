@@ -1,14 +1,14 @@
 pypi_base: "https://resource.flagos.net/repository/flagos-pypi-{vendor}/simple"
 mirror: "https://mirrors.aliyun.com/pypi/simple"
 
-# Per-platform version pins. For the five vendor platforms the FlagOS runtime
-# image (harbor.baai.ac.cn/flagos-runtime/flagos-runtime-<backend>:2.2.0) is
-# what the CI container runs, and these fields document the stack inside it;
-# tools/setup_env.sh installs them only with --no-prebuilt, which today means
-# thead (its image is the vendor's own, with no FlagOS stack). Values come from
-# FlagGems' src/flag_gems/backends.yaml and build-infra's configs.yaml /
-# runtime/*.md, which are also where the drift between a pin here and the
-# version in a prebuilt image is resolved: the image wins, we install nothing.
+# Per-platform version pins. Container jobs run their vendor's image (the
+# FlagOS runtime image for the FlagOS platforms, the vendor's own pytorch image
+# for thead) and tools/setup_env.sh installs these pins on top of it with
+# --no-prebuilt; every backend that calls setup_env uses that mode today, so
+# this file -- not whatever the image happens to ship -- decides the tested
+# stack. Values come from FlagGems' src/flag_gems/backends.yaml and
+# build-infra's configs.yaml / runtime/*.md, and a drift between a pin here and
+# the image is resolved by the pin, because it is installed.
 #
 # `env:` is applied by tools/setup_env.sh with $VAR expanded against the
 # running environment (a value that still holds an unexpanded $VAR after that
@@ -83,7 +83,7 @@ backends:
     deps:
       - torch==2.9.0+das.opt1.dtk2604
       - flash_attn==2.8.3+das.opt1.dtk2604.torch290
-      - megatron-core==0.17.1
+      - megatron-core==0.16.1
 
   iluvatar:
     python: "3.12"
@@ -140,6 +140,9 @@ backends:
       - torch==2.9.1+musa5.2.0
       - torch_musa==2.9.1
       - mkl==2024.0.0
+      # The Megatron tests compare against Megatron's own kernels; without it
+      # they cannot collect. Same generation as hygon's torch 2.9 pin.
+      - megatron-core==0.16.1
 
   thead:
     python: "3.12"
