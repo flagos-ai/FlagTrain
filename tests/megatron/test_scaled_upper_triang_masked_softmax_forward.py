@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import megatron.core.fusions.fused_softmax
+import importlib.util
+import warnings
+
 import pytest
 import torch
 
@@ -45,6 +47,67 @@ if flag_train.vendor_name == "ascend":
 
 _SCALES = [0.0, 0.125, 1.0, -0.5, 2]
 
+_EXTENSION = "scaled_upper_triang_masked_softmax_cuda"
+
+
+# ``megatron-core``'s pip wheel ships the class but not the Apex extension its
+# forward imports, so probe the extension and fall back to the torch composition.
+def _load_megatron_apply():
+    try:
+        from megatron.core.fusions.fused_softmax import ScaledUpperTriangMaskedSoftmax
+    except Exception as exc:
+        warnings.warn(
+            "Megatron-LM's ScaledUpperTriangMaskedSoftmax could not be imported "
+            f"({exc!r}); using scaled_upper_triang_masked_softmax_ref.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    if (
+        flag_train.vendor_name != "ascend"
+        and importlib.util.find_spec(_EXTENSION) is None
+    ):
+        warnings.warn(
+            "Megatron-LM's ScaledUpperTriangMaskedSoftmax needs the Apex CUDA "
+            f"extension {_EXTENSION!r}, which is not installed; using "
+            "scaled_upper_triang_masked_softmax_ref.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    return ScaledUpperTriangMaskedSoftmax.apply
+
+
+_MEGATRON_APPLY = _load_megatron_apply()
+_BASELINE = (
+    "megatron-core ScaledUpperTriangMaskedSoftmax"
+    if _MEGATRON_APPLY is not None
+    else "scaled_upper_triang_masked_softmax_ref (torch)"
+)
+
+
+def scaled_upper_triang_masked_softmax_ref(x, scale):
+    scores = x.to(torch.float32) * scale
+    rows = torch.arange(x.shape[-2], device=x.device).unsqueeze(-1)
+    cols = torch.arange(x.shape[-1], device=x.device).unsqueeze(0)
+    masked = cols > rows
+    scores = scores.masked_fill(masked, float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    return probs.masked_fill(masked, 0.0).to(x.dtype)
+
+
+def _reference(x, scale):
+    if _MEGATRON_APPLY is None:
+        return scaled_upper_triang_masked_softmax_ref(x, scale)
+    # The fused kernel reads dense rows; the composition does not need the copy.
+    return _MEGATRON_APPLY(x.contiguous(), scale)
+
+
+@pytest.mark.scaled_upper_triang_masked_softmax_forward
+def test_baseline_source():
+    assert _BASELINE
+    print(f"\nBaseline: {_BASELINE}")
+
 
 @pytest.mark.scaled_upper_triang_masked_softmax_forward
 @pytest.mark.parametrize("shape", _SHAPES)
@@ -54,9 +117,7 @@ def test_scaled_upper_triang_masked_softmax_forward(shape, dtype, scale):
     utils.init_seed(0)
     x = torch.randn(shape, dtype=dtype, device=flag_train.device)
 
-    ref = megatron.core.fusions.fused_softmax.ScaledUpperTriangMaskedSoftmax.apply(
-        x, scale
-    )
+    ref = _reference(x, scale)
     res = flag_train.megatron.scaled_upper_triang_masked_softmax_forward(x, scale)
 
     # Megatron needs device inputs and returns device tensors; only the
@@ -90,9 +151,7 @@ def test_scaled_upper_triang_masked_softmax_forward_values(dtype):
     neg_inf[1, 20, 25] = float("-inf")
 
     for x in (wide, equal, neg_inf):
-        ref = megatron.core.fusions.fused_softmax.ScaledUpperTriangMaskedSoftmax.apply(
-            x, 1.0
-        )
+        ref = _reference(x, 1.0)
         res = flag_train.megatron.scaled_upper_triang_masked_softmax_forward(x, 1.0)
 
         if utils.TO_CPU:
@@ -115,9 +174,7 @@ def test_scaled_upper_triang_masked_softmax_forward_non_contiguous(dtype):
     for x in (transposed, strided):
         assert not x.is_contiguous()
 
-        ref = megatron.core.fusions.fused_softmax.ScaledUpperTriangMaskedSoftmax.apply(
-            x.contiguous(), 0.125
-        )
+        ref = _reference(x, 0.125)
         res = flag_train.megatron.scaled_upper_triang_masked_softmax_forward(x, 0.125)
 
         if utils.TO_CPU:

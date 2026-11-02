@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import megatron.core.fusions.fused_softmax
+import importlib.util
+import warnings
+
 import pytest
 import torch
 
@@ -46,6 +48,61 @@ _DTYPES = [torch.float16, torch.bfloat16]
 if flag_train.vendor_name == "ascend":
     _DTYPES.append(torch.float32)
 
+_EXTENSION = "scaled_upper_triang_masked_softmax_cuda"
+
+
+# ``megatron-core``'s pip wheel ships the class but not the Apex extension its
+# forward imports, so probe the extension and fall back to the torch composition.
+def _load_megatron_apply():
+    try:
+        from megatron.core.fusions.fused_softmax import ScaledUpperTriangMaskedSoftmax
+    except Exception as exc:
+        warnings.warn(
+            "Megatron-LM's ScaledUpperTriangMaskedSoftmax could not be imported "
+            f"({exc!r}); measuring scaled_upper_triang_masked_softmax_ref.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    if (
+        flag_train.vendor_name != "ascend"
+        and importlib.util.find_spec(_EXTENSION) is None
+    ):
+        warnings.warn(
+            "Megatron-LM's ScaledUpperTriangMaskedSoftmax needs the Apex CUDA "
+            f"extension {_EXTENSION!r}, which is not installed; measuring "
+            "scaled_upper_triang_masked_softmax_ref.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    return ScaledUpperTriangMaskedSoftmax.apply
+
+
+# Resolved once, so the first-use import is not counted in the measurement.
+_megatron_apply = _load_megatron_apply()
+_BASELINE = (
+    "megatron-core ScaledUpperTriangMaskedSoftmax"
+    if _megatron_apply is not None
+    else "scaled_upper_triang_masked_softmax_ref (torch)"
+)
+
+
+def scaled_upper_triang_masked_softmax_ref(x, scale):
+    scores = x.to(torch.float32) * scale
+    rows = torch.arange(x.shape[-2], device=x.device).unsqueeze(-1)
+    cols = torch.arange(x.shape[-1], device=x.device).unsqueeze(0)
+    masked = cols > rows
+    scores = scores.masked_fill(masked, float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    return probs.masked_fill(masked, 0.0).to(x.dtype)
+
+
+def torch_op(x, scale):
+    if _megatron_apply is None:
+        return scaled_upper_triang_masked_softmax_ref(x, scale)
+    return _megatron_apply(x, scale)
+
 
 class _ScaledUpperTriangMaskedSoftmaxBenchmark(base.GenericBenchmark):
     DEFAULT_SHAPES = _SHAPES
@@ -60,10 +117,11 @@ def scaled_upper_triang_masked_softmax_input_fn(shape, dtype, device):
 
 @pytest.mark.scaled_upper_triang_masked_softmax_forward
 def test_scaled_upper_triang_masked_softmax_forward():
+    print(f"\nBaseline: {_BASELINE}")
     bench = _ScaledUpperTriangMaskedSoftmaxBenchmark(
         input_fn=scaled_upper_triang_masked_softmax_input_fn,
         op_name="scaled_upper_triang_masked_softmax_forward",
-        torch_op=megatron.core.fusions.fused_softmax.ScaledUpperTriangMaskedSoftmax.apply,
+        torch_op=torch_op,
         dtypes=_DTYPES,
     )
     bench.set_train(flag_train.megatron.scaled_upper_triang_masked_softmax_forward)
