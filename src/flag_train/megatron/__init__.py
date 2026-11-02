@@ -1,8 +1,5 @@
 """Megatron-related implementations."""
 
-from flag_train.runtime import device as runtime_device
-from flag_train.runtime.backend import SpecOpRegistrar
-
 from .bias_swiglu_impl import bias_swiglu_impl
 from .fast_gelu import fast_gelu
 from .fused_gated_norm import fused_gated_norm
@@ -29,4 +26,5 @@ __all__ = [
     "weighted_squared_relu_impl",
 ]
 
-SpecOpRegistrar(registry=globals(), vendor=runtime_device.vendor_name).apply()
+# The vendor-operator registration for these names runs in flag_train/__init__.py
+# once this package and its siblings are fully imported -- see the comment there.
