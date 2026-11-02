@@ -59,7 +59,7 @@ what keeps the reference-launcher tests working: they monkeypatch the capability
 reader in the module it is defined in, and that has to be the generic module
 whichever backend dispatched here.
 
-Registration is by name. ``_metax/ops/__init__.py`` re-exports this module's
+Registration is by name. ``_metax/deepspeed/__init__.py`` re-exports this module's
 ``blocked_flash`` straight from here, and ``SpecOpRegistrar`` writes it over the
 same-named generic function in ``flag_train.deepspeed`` when that package is
 imported -- the namespace the tests and the benchmark read the operator from.

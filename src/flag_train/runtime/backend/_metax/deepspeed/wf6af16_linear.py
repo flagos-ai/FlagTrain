@@ -58,7 +58,7 @@ stock autotuner does not treat as "skip this config".
 The reduction kernel is imported from the generic module; it has no MetaX
 divergence.
 
-Registration is by name. ``_metax/ops/deepspeed/__init__.py`` re-exports this
+Registration is by name. ``_metax/deepspeed/__init__.py`` re-exports this
 module's ``wf6af16_linear``, and ``SpecOpRegistrar`` writes it over the
 same-named generic function in ``flag_train.deepspeed`` when that package is
 imported -- the namespace the tests and the benchmark read the operator from.

@@ -24,7 +24,9 @@ vendor_info = VendorDescriptor(
 
 CUSTOMIZED_UNUSED_OPS = ()
 
-# Specialised operators live in ``ops/`` and are written over the generic ones by
-# ``SpecOpRegistrar`` when ``flag_train.deepspeed`` is imported. See ``ops/__init__.py``.
+# Specialised operators live in ``deepspeed/``, ``megatron/`` and
+# ``transformer_engine/`` and are written over the generic ones by
+# ``SpecOpRegistrar`` when the matching ``flag_train`` package is imported. See
+# each package's ``__init__.py``.
 
 __all__ = ["*"]

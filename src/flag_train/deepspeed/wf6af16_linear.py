@@ -64,7 +64,7 @@ def _gemm_configs():
     space.
 
     The bare kernel is also wrapped by vendor backends with their own tuning
-    (see e.g. ``runtime/backend/_metax/ops/deepspeed/wf6af16_linear.py``), so
+    (see e.g. ``runtime/backend/_metax/deepspeed/wf6af16_linear.py``), so
     this list carries only the generic choices.
     """
     configs = []

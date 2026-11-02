@@ -25,6 +25,12 @@ from ..common import vendors
 from . import backend_utils
 from .backend_utils import BackendEventBase
 
+# Backend-root packages that mirror a generic ``flag_train`` package and hold its
+# specialisations, in registration order: a later package's same-named operator
+# wins. ``BackendArchEvent`` and ``TritonVersionEvent`` skip them when they look
+# for a version-specialised directory.
+_OPERATOR_PACKAGES = ("deepspeed", "megatron", "transformer_engine")
+
 
 def operator_functions(module):
     """Return the ``(name, function)`` pairs ``module`` offers as operators.
@@ -51,10 +57,10 @@ def operator_functions(module):
 def iter_package_functions(module):
     """Yield ``(name, function)`` for ``module`` and every subpackage below it.
 
-    ``ops/`` is a package of packages -- an operator lives in
-    ``ops/<generic_pkg>/<name>.py`` and is re-exported by that subpackage's
-    ``__init__.py`` -- so reading the top-level module alone misses every
-    specialised operator: importing the parent does not import its subpackages,
+    A backend operator package mirrors a generic ``flag_train`` package -- an
+    operator lives in ``<pkg>/<name>.py`` and is re-exported by that package's
+    ``__init__.py`` -- so reading the top-level module alone misses operators
+    hidden in a subpackage: importing the parent does not import its subpackages,
     and only the parent was being read.
 
     A subpackage yields after its parent, and subpackages are visited in name
@@ -92,8 +98,7 @@ class BackendState:
         self.torch_device_object = None
         self.torch_device_fn_device = None
         self.tl_extra_backend_module = None
-        self.ops_module = None
-        self.fused_module = None
+        self.operator_modules = None
         self.heuristic_config_module = None
         self.vendor_extra_lib_imported = False
         self.device_fn_cache = {}
@@ -135,11 +140,12 @@ class TritonVersionEvent(BackendEventBase):
         dir_name = f"triton_{self.version}"
         backend_path = Path(path or _state.vendor_module.__path__[0])
         backend_path = backend_path.parent if backend_path.is_file() else backend_path
-        excluded = ("ops", "fused")
         return {
             p.name: str(p)
             for p in backend_path.iterdir()
-            if p.is_dir() and p.name not in excluded and not p.name.startswith("_")
+            if p.is_dir()
+            and p.name not in _OPERATOR_PACKAGES
+            and not p.name.startswith("_")
         }.get(dir_name, None)
 
     def get_functions_from_module(self, module):
@@ -250,11 +256,12 @@ class BackendArchEvent(BackendEventBase):
     def _get_supported_archs(self, path=None):
         path = Path(path or _state.vendor_module.__path__[0])
         path = path.parent if path.is_file() else path
-        excluded = ("ops", "fused")
         return {
             p.name: str(p)
             for p in path.iterdir()
-            if p.is_dir() and p.name not in excluded and not p.name.startswith("_")
+            if p.is_dir()
+            and p.name not in _OPERATOR_PACKAGES
+            and not p.name.startswith("_")
         }
 
     def get_supported_archs(self):
@@ -319,12 +326,10 @@ def _import_module_safe(module_name, vendor_name, module_type):
 def import_vendor_extra_lib(vendor_name=None):
     if _state.vendor_extra_lib_imported:
         return
-    _state.ops_module = _import_module_safe(
-        f"_{vendor_name}.ops", vendor_name, "common"
-    )
-    _state.fused_module = _import_module_safe(
-        f"_{vendor_name}.fused", vendor_name, "fused"
-    )
+    _state.operator_modules = {
+        package: _import_module_safe(f"_{vendor_name}.{package}", vendor_name, package)
+        for package in _OPERATOR_PACKAGES
+    }
     _state.vendor_extra_lib_imported = True
 
 
@@ -449,8 +454,8 @@ def get_customized_ops(vendor_name=None):
     # and caching a partial answer over this one. Registration itself runs once,
     # from flag_train/__init__.py, after every generic operator is imported.
     _state.customized_ops = []
-    _state.customized_ops += iter_package_functions(_state.ops_module)
-    _state.customized_ops += iter_package_functions(_state.fused_module)
+    for module in _state.operator_modules.values():
+        _state.customized_ops += iter_package_functions(module)
     return _state.customized_ops
 
 

@@ -52,7 +52,7 @@ by construction, which neither the DeepSpeed A100 profile map's odd factors
 nor a misaligned user choice guarantee; the constraint below (``split_k * 4``
 dividing K, plus a floor on slice length) is the generic launcher's.
 
-Registration is by name. ``_ascend/ops/deepspeed/__init__.py`` re-exports this
+Registration is by name. ``_ascend/deepspeed/__init__.py`` re-exports this
 module's ``wf6af16_linear``, and ``SpecOpRegistrar`` writes it over the
 same-named generic function in ``flag_train.deepspeed`` when that package is
 imported -- the namespace the tests and the benchmark read the operator from.

@@ -272,7 +272,7 @@ def _fallback_lgamma(x):
 def _fallback_j0(x):
     # Bessel J0(x) for float32/float64, used when a backend's libdevice lacks a
     # native j0 (e.g. the cambricon mlu fork).  Body adapted verbatim from the
-    # verified metax kernel (runtime/backend/_metax/ops/special_bessel_j0.py):
+    # verified metax kernel:
     #   |x| <= 8  -> 20-term Taylor series  J0 = sum (-1)^k (x^2/4)^k / (k!)^2
     #   |x| >  8  -> fdlibm pzero/qzero asymptotic form (public-domain SunPro
     #                e_j0.c band-8 coefficients; same as glibc/CUDA libdevice).
