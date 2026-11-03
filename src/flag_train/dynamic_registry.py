@@ -306,6 +306,63 @@ class DynamicOpOverride:
             self._originals[full_name] = original
         self._overrides[full_name] = impl_func
 
+    def _snapshot_state(self) -> tuple:
+        """Capture private override state for transactional rollback."""
+        return (
+            dict(self._overrides),
+            dict(self._originals),
+            set(self._tracked),
+            dict(self._call_counts),
+        )
+
+    def _rollback_state(self, snapshot) -> None:
+        """Undo overrides applied since ``snapshot``.
+
+        Module attributes changed by this registry are put back to their
+        snapshot value (or removed when the override introduced them), and the
+        bookkeeping -- including call tracking for pre-existing overrides -- is
+        restored exactly. Rollback is best effort and never raises: a cleanup
+        problem must not hide the original configuration error.
+        """
+        overrides, originals, tracked, call_counts = snapshot
+
+        for full_name in set(self._originals) | set(self._overrides):
+            unchanged_override = (
+                overrides.get(full_name, _MISSING)
+                is self._overrides.get(full_name, _MISSING)
+            )
+            unchanged_original = (
+                originals.get(full_name, _MISSING)
+                is self._originals.get(full_name, _MISSING)
+            )
+            if unchanged_override and unchanged_original:
+                continue
+
+            module_name, attr_name = full_name.rsplit(".", 1)
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            try:
+                if full_name in overrides:
+                    # A pre-existing override was replaced during this call;
+                    # put the previous implementation back.
+                    setattr(module, attr_name, overrides[full_name])
+                else:
+                    original = self._originals.get(full_name, _MISSING)
+                    if original is not _MISSING:
+                        setattr(module, attr_name, original)
+                    elif attr_name in vars(module):
+                        delattr(module, attr_name)
+            except Exception as exc:
+                warnings.warn(
+                    f"Failed to roll back override for '{full_name}': {exc}"
+                )
+
+        self._overrides = overrides
+        self._originals = originals
+        self._tracked = tracked
+        self._call_counts = call_counts
+
     def override(
         self,
         op_name: str,

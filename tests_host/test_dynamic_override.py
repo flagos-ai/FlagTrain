@@ -394,6 +394,159 @@ def test_cli_ambiguous_name_exits_with_alternatives(operator_tree, capsys):
     assert "flag_train.deepspeed.shared_op" in stderr
 
 
+def test_failed_cli_application_rolls_back_new_override(
+    operator_tree, tmp_path, capsys
+):
+    original = _add_export(operator_tree, "megatron", "foo", "orig")
+    filepath = _write_candidate(tmp_path, "candidate", "candidate")
+    registry = DynamicOpOverride()
+
+    with pytest.raises(SystemExit):
+        apply_overrides_from_args(
+            _args(
+                override=[
+                    "megatron.foo={}:candidate".format(filepath),
+                    "outside.foo={}:candidate".format(filepath),
+                ]
+            ),
+            registry=registry,
+        )
+
+    package = operator_tree.package("megatron")
+    assert package.foo is original
+    assert package.foo() == "orig"
+    assert registry.list_overrides() == []
+    assert registry._originals == {}
+    assert registry._tracked == set()
+    assert registry._call_counts == {}
+
+    stderr = capsys.readouterr().err
+    assert "outside" in stderr
+    assert "never invoked" not in stderr
+
+
+def test_failed_cli_application_restores_preexisting_overrides_exactly(
+    operator_tree, tmp_path
+):
+    _add_export(operator_tree, "megatron", "foo", "orig")
+    _add_export(operator_tree, "deepspeed", "bar", "orig-bar")
+    old_path = _write_candidate(tmp_path, "old_foo", "old")
+    new_path = _write_candidate(tmp_path, "new_foo", "new")
+    registry = DynamicOpOverride()
+
+    assert registry.override_from_file("megatron.foo", old_path, "old_foo")
+    old_impl = operator_tree.package("megatron").foo
+    assert old_impl() == "old"
+    other_candidate = _candidate("bar-override")
+    assert registry.override("deepspeed.bar", other_candidate)
+
+    old_overrides = list(registry.list_overrides())
+    old_originals = dict(registry._originals)
+    old_tracked = set(registry._tracked)
+    old_counts = dict(registry._call_counts)
+
+    with pytest.raises(SystemExit), pytest.warns(
+        UserWarning, match="Failed to load"
+    ):
+        apply_overrides_from_args(
+            _args(
+                override=[
+                    "megatron.foo={}:new_foo".format(new_path),
+                    # The later candidate names a function that does not exist.
+                    "megatron.missing={}:absent".format(new_path),
+                ]
+            ),
+            registry=registry,
+        )
+
+    package = operator_tree.package("megatron")
+    assert package.foo is old_impl
+    assert operator_tree.package("deepspeed").bar is other_candidate
+    assert registry.list_overrides() == old_overrides
+    assert registry._originals == old_originals
+    assert registry._tracked == old_tracked
+    assert registry._call_counts == old_counts
+    assert package.foo() == "old"
+
+
+def test_failed_cli_after_config_application_rolls_back_config_overrides(
+    operator_tree, tmp_path
+):
+    original = _add_export(operator_tree, "megatron", "alpha", "orig-alpha")
+    filepath = _write_candidate(tmp_path, "alpha_candidate", "cfg-alpha")
+    config_path = tmp_path / "overrides.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "overrides": {
+                    "megatron.alpha": {
+                        "file": filepath,
+                        "function": "alpha_candidate",
+                    }
+                }
+            }
+        )
+    )
+    registry = DynamicOpOverride()
+
+    with pytest.raises(SystemExit):
+        apply_overrides_from_args(
+            _args(
+                override_config=str(config_path),
+                override=["outside.foo={}:alpha_candidate".format(filepath)],
+            ),
+            registry=registry,
+        )
+
+    package = operator_tree.package("megatron")
+    assert package.alpha is original
+    assert package.alpha() == "orig-alpha"
+    assert registry.list_overrides() == []
+    assert registry._originals == {}
+    assert registry._tracked == set()
+    assert registry._call_counts == {}
+
+
+def test_failed_later_config_candidate_rolls_back_earlier_config_entry(
+    operator_tree, tmp_path
+):
+    original = _add_export(operator_tree, "megatron", "alpha", "orig-alpha")
+    _add_export(operator_tree, "deepspeed", "beta", "orig-beta")
+    filepath = _write_candidate(tmp_path, "alpha_candidate", "cfg-alpha")
+    config_path = tmp_path / "overrides.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "overrides": {
+                    "megatron.alpha": {
+                        "file": filepath,
+                        "function": "alpha_candidate",
+                    },
+                    "deepspeed.beta": {
+                        "file": str(tmp_path / "missing.py"),
+                        "function": "beta_candidate",
+                    },
+                }
+            }
+        )
+    )
+    registry = DynamicOpOverride()
+
+    with pytest.raises(SystemExit), pytest.warns(
+        UserWarning, match="Failed to load"
+    ):
+        apply_overrides_from_args(
+            _args(override_config=str(config_path)), registry=registry
+        )
+
+    assert operator_tree.package("megatron").alpha is original
+    assert operator_tree.package("deepspeed").beta() == "orig-beta"
+    assert registry.list_overrides() == []
+    assert registry._originals == {}
+    assert registry._tracked == set()
+    assert registry._call_counts == {}
+
+
 def test_alias_does_not_leak_first_override_as_original(operator_tree):
     original = _add_export(operator_tree, "megatron", "packbits", "orig")
     first = _candidate("first")
