@@ -12,24 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host-only tests for dynamic operator override target resolution."""
+"""Host-only tests for dynamic operator override target resolution.
 
+The shared modules are imported from the isolated synthetic package created
+by ``tests_host/conftest.py``; importing this module must not touch a real or
+sentinel ``flag_train`` package.
+"""
+
+import runpy
+import sys
 import types
+from pathlib import Path
 
 import pytest
 import yaml
 
-from flag_train.cli_override import (
+from _flagtrain_override_host.cli_override import (
     apply_overrides_from_args,
     load_override_config,
     parse_override_spec,
 )
-from flag_train.dynamic_registry import (
+from _flagtrain_override_host.dynamic_registry import (
     DynamicOpOverride,
     OverrideResolutionError,
     default_impl_name,
     resolve_operator_target,
 )
+
+_HOST_DIR = Path(__file__).resolve().parent
 
 
 def _original(value):
@@ -69,6 +79,33 @@ def _add_export(tree, package_name, op_name, value):
     setattr(package, op_name, impl)
     package.__all__.append(op_name)
     return impl
+
+
+def test_host_suite_import_preserves_existing_flag_train_modules():
+    """Collection must not replace a real/sentinel ``flag_train`` tree."""
+    sentinel_root = types.ModuleType("flag_train")
+    sentinel_root.existing_operator = object()
+    sentinel_child = types.ModuleType("flag_train.megatron")
+    sentinel_root.megatron = sentinel_child
+
+    sys.modules["flag_train"] = sentinel_root
+    sys.modules["flag_train.megatron"] = sentinel_child
+    try:
+        runpy.run_path(
+            str(_HOST_DIR / "conftest.py"), run_name="_host_conftest_probe"
+        )
+        runpy.run_path(
+            str(_HOST_DIR / "test_dynamic_override.py"),
+            run_name="_host_tests_probe",
+        )
+
+        assert sys.modules["flag_train"] is sentinel_root
+        assert sys.modules["flag_train.megatron"] is sentinel_child
+        assert sentinel_root.megatron is sentinel_child
+        assert "existing_operator" in vars(sentinel_root)
+    finally:
+        sys.modules.pop("flag_train", None)
+        sys.modules.pop("flag_train.megatron", None)
 
 
 @pytest.mark.parametrize(
