@@ -23,7 +23,7 @@ backends:
       PATH: /usr/local/cuda/bin:$PATH
       LD_LIBRARY_PATH: /usr/local/cuda-13.3/compat:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
     deps:
-      - torch==2.11.0+cu130
+      # torch==2.11.0+cu130
       - torchaudio==2.11.0+cu130
       - torchvision==0.26.0+cu130
       - deepspeed==0.19.7
@@ -52,7 +52,7 @@ backends:
       # the tests import is what left the first native ascend venv without the
       # vendor's own runtime deps; the shared test dependencies (including
       # numpy) are installed by tools/setup_env.sh on top of this.
-      - torch==2.10.0+cpu
+      # torch==2.10.0+cpu
       - torch-npu==2.10.0
       - cann-shmem==1.6.0
       - decorator==5.1.1
@@ -81,7 +81,7 @@ backends:
     env_source:
       - /opt/dtk-26.04/env.sh
     deps:
-      - torch==2.9.0+das.opt1.dtk2604
+      # torch==2.9.0+das.opt1.dtk2604
       - flash_attn==2.8.3+das.opt1.dtk2604.torch290
       - megatron-core==0.16.1
 
@@ -96,7 +96,7 @@ backends:
       LD_LIBRARY_PATH: $COREX_ROOT/lib:$LD_LIBRARY_PATH
       CPATH: /usr/local/cuda-10.2/include
     deps:
-      - torch==2.10.0+corex.4.5.0.20260804
+      # torch==2.10.0+corex.4.5.0.20260804
       - torchaudio==2.10.0+corex.4.5.0.20260804
       - torchvision==0.25.0+corex.4.5.0.20260804
       - numpy<2
@@ -117,7 +117,7 @@ backends:
       - flash_linear_attention==0.5.0+metax3.8.1.0torch2.10
       - flash_mla==1.0.1+metax3.8.1.0torch2.10
       - numpy==2.3.5
-      - torch==2.10.0+metax3.8.1.0
+      # torch==2.10.0+metax3.8.1.0
       - torchcodec==0.6.0+metax3.8.1.0
       - torchaudio==2.4.1+metax3.8.1.0
       - torchvision==0.25.0+metax3.8.1.0
@@ -137,7 +137,7 @@ backends:
       PATH: $MUSA_HOME/bin:$PATH
       LD_LIBRARY_PATH: $VIRTUAL_ENV/lib:$MUSA_HOME/lib:$LD_LIBRARY_PATH
     deps:
-      - torch==2.9.1+musa5.2.0
+      # torch==2.9.1+musa5.2.0
       - torch_musa==2.9.1
       - mkl==2024.0.0
       # The Megatron tests compare against Megatron's own kernels; without it
@@ -151,5 +151,5 @@ backends:
     env_source:
       - /usr/local/PPU_SDK/envsetup.sh
     deps:
-      - torch==2.10.0+v0.1.0.ppu2.1.1
+      # torch==2.10.0+v0.1.0.ppu2.1.1
       - megatron-core==0.17.1
