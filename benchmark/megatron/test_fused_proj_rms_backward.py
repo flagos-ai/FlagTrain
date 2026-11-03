@@ -317,6 +317,10 @@ def fused_proj_rms_backward_input_fn(shape, dtype, device):
 
     ``r`` comes from *our* forward, because that is the tensor the operator is
     handed in training: the forward saves it and the backward consumes it.
+
+    This remains the single input factory: ``fused_proj_rms_backward_build_inputs``
+    below reuses it, so the legacy iterator and a selected case draw the same
+    tensors in the same order.
     """
     M, N, K = shape
     x = torch.randn((M, K), dtype=dtype, device=device)
@@ -329,6 +333,33 @@ def fused_proj_rms_backward_input_fn(shape, dtype, device):
     grad_r = torch.randn((M, 1), dtype=dtype, device=device)
     _, r = flag_train.megatron.fused_proj_rms_forward(x, weight, _EPS)
     yield x, weight, grad_proj, grad_r, r
+
+
+def fused_proj_rms_backward_case(shape, dtype):
+    """Tensor-free plan for one ``(M, N, K)`` case.
+
+    The plan names every tensor the operator is handed and carries the ``eps``
+    the forward uses, so ``--list-cases`` can describe the workload without
+    allocating tensors or running either implementation.
+    """
+    M, N, K = shape
+    yield base.consts.BenchmarkCasePlan(
+        shape={
+            "x": (M, K),
+            "weight": (N, K),
+            "grad_proj": (M, N),
+            "grad_r": (M, 1),
+            "r": (M, 1),
+        },
+        params={"eps": _EPS},
+        builder_args=(tuple(shape),),
+    )
+
+
+def fused_proj_rms_backward_build_inputs(plan, dtype, device):
+    """Materialize one selected plan with the legacy input factory."""
+    (shape,) = plan.builder_args
+    return next(fused_proj_rms_backward_input_fn(shape, dtype, device))
 
 
 def torch_op(x, weight, grad_proj, grad_r, r):
@@ -346,7 +377,8 @@ def test_fused_proj_rms_backward_perf():
     print(f"\nBaseline: {_BASELINE}")
 
     bench = FusedProjRmsBackwardBenchmark(
-        input_fn=fused_proj_rms_backward_input_fn,
+        case_fn=fused_proj_rms_backward_case,
+        build_inputs_fn=fused_proj_rms_backward_build_inputs,
         op_name="fused_proj_rms_backward",
         torch_op=torch_op,
         dtypes=_DTYPES,
