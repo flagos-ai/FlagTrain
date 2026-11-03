@@ -346,16 +346,35 @@ class Benchmark:
     def set_train(self, train_op):
         self.train_op = train_op
 
-    def get_latency(self, op, *args, **kwargs):
+    def get_latency(self, op, *args, _reference_candidate=False, **kwargs):
         fn = lambda: op(*args, **kwargs)
         if self.is_backward:
+            # Building the graph is preparation: it happens before any timing
+            # and, on its own, does not prove the derivative ran.
             out = fn()
             dout = torch.randn_like(out)
             # fn = lambda: out.backward(dout, retain_graph=True)
             xs = list(filter(lambda x: torch.is_tensor(x) and x.requires_grad, args))
-            fn = lambda: torch.autograd.grad(
-                (out,), xs, grad_outputs=(dout,), retain_graph=True
-            )
+
+            def run_derivative():
+                return torch.autograd.grad(
+                    (out,), xs, grad_outputs=(dout,), retain_graph=True
+                )
+
+            fn = run_derivative
+            if _reference_candidate:
+                state = reference_execution()
+                if state is not None and state.enabled:
+
+                    def timed_reference_derivative():
+                        grads = run_derivative()
+                        # Only the actual timed autograd call on the selected
+                        # reference's graph counts; the baseline path does not
+                        # pass this flag and is never counted.
+                        state.candidate_derivative_calls += 1
+                        return grads
+
+                    fn = timed_reference_derivative
         if Config.mode == consts.BenchMode.OPERATOR:
             n_warm, n_rep = get_iter_count(fn)
             for i in range(n_warm):
@@ -674,31 +693,44 @@ class Benchmark:
 
     def _measure_input(self, input, case_id=None):
         metric = BenchmarkMetrics(case_id=case_id)
-        if reference_mode_enabled() and self.is_backward:
-            raise ReferenceContractError(
-                f"{self.op_name}: --ref-as-candidate does not support "
-                "is_backward=True; the timed backward call does not invoke "
-                "the reference itself."
-            )
         try:
+            reference_candidate = None
+            execution = None
+            if reference_mode_enabled():
+                execution = reference_execution()
+                # Select the explicit reference before any timing, including
+                # the native baseline. A missing or non-callable reference must
+                # surface as a contract error, never as a TypeError from the
+                # baseline timer.
+                reference_candidate = select_candidate(
+                    None, self.torch_op, self.op_name
+                )
             args, kwargs = self.unpack_to_args_kwargs(input)
             metric.shape_detail = self.record_shapes(*args, **kwargs)
             if "latency_base" in self.to_bench_metrics and not Config.skip_native:
                 metric.latency_base = self.get_latency(self.torch_op, *args, **kwargs)
             if "latency" in self.to_bench_metrics:
                 if reference_mode_enabled():
-                    # The explicit torch_op is the reference. Do not resolve
-                    # the ordinary candidate (train_op) in this mode.
-                    execution = reference_execution()
-                    before = execution.candidate_calls
-                    candidate = select_candidate(
-                        None, self.torch_op, self.op_name
+                    if self.is_backward:
+                        before = execution.candidate_derivative_calls
+                    else:
+                        before = execution.candidate_calls
+                    metric.latency = self.get_latency(
+                        reference_candidate,
+                        *args,
+                        _reference_candidate=True,
+                        **kwargs,
                     )
-                    metric.latency = self.get_latency(candidate, *args, **kwargs)
-                    if execution.candidate_calls <= before:
+                    if self.is_backward:
+                        executed = execution.candidate_derivative_calls > before
+                        preparation = "the candidate-side derivative"
+                    else:
+                        executed = execution.candidate_calls > before
+                        preparation = "the declared reference"
+                    if not executed:
                         raise ReferenceContractError(
                             f"{self.op_name}: reference candidate timer did "
-                            "not invoke the declared reference."
+                            f"not execute {preparation}."
                         )
                     execution.completed_timings += 1
                     metric.candidate_source = "reference"
@@ -772,12 +804,6 @@ class Benchmark:
         if reference_mode_enabled() and "latency" not in self.to_bench_metrics:
             raise ReferenceContractError(
                 "--ref-as-candidate requires the candidate latency metric."
-            )
-        if reference_mode_enabled() and self.is_backward:
-            raise ReferenceContractError(
-                f"{self.op_name}: --ref-as-candidate does not support "
-                "is_backward=True; the timed backward call does not invoke "
-                "the reference itself."
             )
         ignored_reason = self.base_data_ignored_reason()
         if ignored_reason:

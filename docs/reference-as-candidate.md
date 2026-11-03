@@ -47,8 +47,19 @@ pytest tests -m "<operator>" --ref-as-candidate
 
 The benchmark timing path uses the benchmark's explicit `torch_op` as the
 candidate-side reference. It does not fall back to `train_op` or `use_train`,
-and it does not resolve an eager candidate. The native-baseline timing is
-unchanged and is not counted as candidate execution.
+and it does not resolve an eager candidate. The explicit reference is validated
+before any timing, including the native baseline, so a missing or non-callable
+`torch_op` reports the reference-contract error rather than a generic timer
+failure. The native-baseline timing is unchanged and is not counted as
+candidate execution.
+
+Backward benchmarks keep their ordinary autograd-based timing. The selected
+reference is run once to build its graph outside the timed region, and the
+timed operation is `torch.autograd.grad` on that graph. Only those candidate-side
+derivative calls can satisfy the reference contract: constructing the graph, or
+running the baseline derivative, is not treated as candidate execution. Explicit
+backward operator benchmarks (functions that take the output gradient as an
+input and keep `is_backward=False`) are unaffected.
 
 ```sh
 pytest benchmark -m "<operator>" --level core --ref-as-candidate --record json

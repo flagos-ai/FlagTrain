@@ -30,14 +30,44 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SHARED_SOURCE = REPO_ROOT / "src" / "flag_train" / "reference_candidate.py"
-HOST_PYTHON = os.environ.get(
-    "FLAGTRAIN_HOST_PYTHON",
-    "/Users/tao/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3",
-)
-PY39_SITE = "/Users/tao/Library/Python/3.9/lib/python/site-packages"
+
+
+def _subprocess_python():
+    """Use the interpreter running this suite, never a checkout-specific path."""
+    return sys.executable or "python3"
+
+
+def _dependency_paths():
+    """Search roots of the modules the synthetic subprocess suites import.
+
+    Computed from this interpreter's own import configuration so the helper
+    also works when the suite is launched with a managed Python whose
+    dependencies live on an externally provided ``sys.path``.
+    """
+    roots = []
+    for module in (pytest, yaml):
+        location = Path(module.__file__).resolve()
+        for entry in sys.path:
+            if not entry:
+                continue
+            root = Path(entry).resolve()
+            if root == location or root in location.parents:
+                roots.append(str(root))
+                break
+        else:
+            roots.append(
+                str(
+                    location.parent.parent
+                    if location.name == "__init__.py"
+                    else location.parent
+                )
+            )
+    return list(dict.fromkeys(roots))
+
 
 SYNTHETIC_CONFTEST = """
 import importlib.util
@@ -73,7 +103,7 @@ def _load_shared():
 def _run_pytest(suite: Path, *args):
     code = (
         "import sys; "
-        f"sys.path.insert(0, {PY39_SITE!r}); "
+        f"sys.path[:0] = {_dependency_paths()!r}; "
         "import pytest; "
         f"raise SystemExit(pytest.main({list(args)!r}))"
     )
@@ -90,7 +120,7 @@ def _run_pytest(suite: Path, *args):
         }
     )
     return subprocess.run(
-        [HOST_PYTHON, "-B", "-c", code],
+        [_subprocess_python(), "-B", "-c", code],
         cwd=suite,
         env=env,
         capture_output=True,
@@ -108,6 +138,33 @@ def _write_suite(directory, source):
 def _run_suite(tmp_path, source, *args):
     suite = _write_suite(tmp_path / "suite", source)
     return _run_pytest(suite, "-p", "no:cacheprovider", "-q", "--tb=short", *args)
+
+
+def test_subprocess_selection_is_portable():
+    """The helper derives both interpreter and import roots at runtime."""
+    assert _subprocess_python() == (sys.executable or "python3")
+    roots = [Path(root).resolve() for root in _dependency_paths()]
+    assert roots
+    for module in (pytest, yaml):
+        location = Path(module.__file__).resolve()
+        assert any(root == location or root in location.parents for root in roots)
+
+
+def test_subprocess_suite_can_import_dependencies_from_current_paths(tmp_path):
+    result = _run_suite(
+        tmp_path,
+        """
+        import sys
+        import pytest
+        import yaml
+
+        def test_dependencies():
+            assert pytest.__version__
+            assert yaml.__name__ == "yaml"
+            assert sys.executable
+        """,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -558,13 +615,45 @@ def _install_benchmark_stubs():
     torch = types.ModuleType("torch")
 
     class Tensor:
-        pass
+        def __init__(self, value=0.0, requires_grad=False):
+            self.value = value
+            self.requires_grad = requires_grad
+
+        def clone(self):
+            return Tensor(self.value, self.requires_grad)
+
+        def requires_grad_(self, mode=True):
+            self.requires_grad = mode
+            return self
+
+        def size(self):
+            return (1,)
 
     class Dtype:
         pass
 
     torch.Tensor = Tensor
     torch.dtype = Dtype
+    torch.is_tensor = lambda value: isinstance(value, Tensor)
+    torch.is_floating_point = lambda value: True
+    torch.randn_like = lambda value: Tensor(1.0)
+
+    grad_calls = []
+
+    def autograd_grad(outputs, inputs, grad_outputs=None, retain_graph=False):
+        # Make the timed closure observable and non-zero-duration.
+        _tick()
+        grad_calls.append(
+            {
+                "outputs": outputs,
+                "inputs": inputs,
+                "grad_outputs": grad_outputs,
+                "retain_graph": retain_graph,
+            }
+        )
+        return tuple(Tensor(0.0) for _ in inputs)
+
+    torch.autograd = SimpleNamespace(grad=autograd_grad, calls=grad_calls)
     for name in (
         "float16",
         "float32",
@@ -650,7 +739,7 @@ def _loaded_benchmark():
         if name in prefixes or any(name.startswith(p + ".") for p in prefixes)
     }
     try:
-        _install_benchmark_stubs()
+        torch, _ = _install_benchmark_stubs()
         conftest, captured = _install_benchmark_conftest_stub()
         consts = importlib.import_module("benchmark.consts")
         base = importlib.import_module("benchmark.base")
@@ -661,6 +750,7 @@ def _loaded_benchmark():
             base=base,
             consts=consts,
             refc=refc,
+            torch=torch,
             Config=conftest.Config,
             captured=captured,
         )
@@ -681,6 +771,19 @@ def _make_bench(env, torch_op, train_op=None, metrics=("latency",)):
     bench.train_op = train_op
     bench.to_bench_metrics = list(metrics)
     return bench
+
+
+def _make_backward_bench(env, torch_op, train_op=None, metrics=("latency",)):
+    bench = env.base.Benchmark(
+        op_name="synthetic_backward", torch_op=torch_op, is_backward=True
+    )
+    bench.train_op = train_op
+    bench.to_bench_metrics = list(metrics)
+    return bench
+
+
+def _backward_input(env):
+    return (env.torch.Tensor(1.0, requires_grad=True),)
 
 
 def test_benchmark_reference_mode_times_torch_op_not_train_op():
@@ -751,20 +854,32 @@ def test_benchmark_baseline_call_alone_is_not_candidate_execution():
             metric = bench._measure_input((1,))
 
         assert reference_calls
+        assert state.reference_selected is True
         assert state.candidate_calls == 0
         assert state.completed_timings == 0
         assert not hasattr(metric, "candidate_source")
 
 
-def test_benchmark_missing_reference_fails():
+@pytest.mark.parametrize("skip_native", [False, True])
+@pytest.mark.parametrize(
+    "metrics", [("latency_base", "latency"), ("latency_base",), ("latency",)]
+)
+@pytest.mark.parametrize("reference", [None, object()], ids=["none", "noncallable"])
+def test_benchmark_reference_is_validated_before_baseline(
+    metrics, skip_native, reference
+):
     with _loaded_benchmark() as env:
-        bench = _make_bench(env, None)
+        bench = _make_bench(env, reference, metrics=metrics)
+        env.Config.skip_native = skip_native
         with env.refc.reference_test_mode(True, "benchmark.node") as state:
             with pytest.raises(
                 pytest.fail.Exception, match="No predefined reference"
             ):
                 bench._measure_input((1,))
         assert state.contract_errors
+        assert "not callable" not in state.contract_errors[0]
+        assert state.candidate_calls == 0
+        assert state.completed_timings == 0
 
 
 def test_benchmark_reference_mode_requires_latency_metric():
@@ -779,20 +894,108 @@ def test_benchmark_reference_mode_requires_latency_metric():
                 bench.run()
 
 
-def test_benchmark_reference_mode_rejects_backward_timer():
+def test_benchmark_reference_mode_backward_times_candidate_derivative():
     with _loaded_benchmark() as env:
-        bench = env.base.Benchmark(
-            op_name="synthetic_backward",
-            torch_op=lambda value: value,
-            is_backward=True,
+        reference_calls = []
+
+        def reference(value):
+            reference_calls.append(value)
+            _tick()
+            return env.torch.Tensor(0.0)
+
+        bench = _make_backward_bench(
+            env, reference, metrics=("latency_base", "latency")
         )
-        bench.to_bench_metrics = ["latency"]
+        with env.refc.reference_test_mode(True, "benchmark.node") as state:
+            metric = bench._measure_input(_backward_input(env))
+
+        # The selected reference built the graph, and the timed operation ran
+        # the real autograd closure on that graph.
+        assert reference_calls
+        assert env.torch.autograd.calls
+        assert state.candidate_calls > 0
+        assert state.candidate_derivative_calls > 0
+        assert state.completed_timings == 1
+        assert metric.candidate_source == "reference"
+        assert metric.latency is not None
+    assert env.refc.reference_mode_enabled() is False
+    assert env.refc.reference_execution() is None
+
+
+def test_benchmark_backward_baseline_derivative_is_not_candidate_execution():
+    with _loaded_benchmark() as env:
+
+        def reference(value):
+            _tick()
+            return env.torch.Tensor(0.0)
+
+        bench = _make_backward_bench(env, reference, metrics=("latency_base",))
+        with env.refc.reference_test_mode(True, "benchmark.node") as state:
+            metric = bench._measure_input(_backward_input(env))
+
+        assert env.torch.autograd.calls  # the baseline derivative did run
+        assert state.candidate_calls == 0
+        assert state.candidate_derivative_calls == 0
+        assert state.completed_timings == 0
+        assert not hasattr(metric, "candidate_source")
+
+
+def test_benchmark_backward_graph_only_timer_cannot_satisfy_contract():
+    with _loaded_benchmark() as env:
+        reference_calls = []
+
+        def reference(value):
+            reference_calls.append(value)
+            _tick()
+            return env.torch.Tensor(0.0)
+
+        bench = _make_backward_bench(env, reference)
+
+        def graph_only_timer(op, *args, _reference_candidate=False, **kwargs):
+            # Prepare the forward graph and return a number without ever
+            # executing the derivative closure.
+            op(*args, **kwargs)
+            return 1.0
+
+        bench.get_latency = graph_only_timer
         with env.refc.reference_test_mode(True, "benchmark.node") as state:
             with pytest.raises(
-                env.refc.ReferenceContractError, match="does not support is_backward"
+                pytest.fail.Exception, match="candidate-side derivative"
             ):
-                bench._measure_input((1,))
+                bench._measure_input(_backward_input(env))
+
+        assert reference_calls  # graph construction did happen
+        assert env.torch.autograd.calls == []
+        assert state.candidate_calls > 0  # forward preparation is not proof
+        assert state.candidate_derivative_calls == 0
+        assert state.completed_timings == 0
         assert state.contract_errors
+
+
+def test_benchmark_default_backward_timing_still_uses_autograd():
+    with _loaded_benchmark() as env:
+        reference_calls = []
+        train_calls = []
+
+        def reference(value):
+            reference_calls.append(value)
+            _tick()
+            return env.torch.Tensor(0.0)
+
+        def train_op(value):
+            train_calls.append(value)
+            _tick()
+            return env.torch.Tensor(0.0)
+
+        bench = _make_backward_bench(
+            env, reference, train_op, metrics=("latency_base", "latency")
+        )
+        metric = bench._measure_input(_backward_input(env))
+
+        assert reference_calls and train_calls
+        assert env.torch.autograd.calls
+        assert metric.latency is not None
+        assert not hasattr(metric, "candidate_source")
 
 
 def test_benchmark_report_marks_reference_source_only_when_selected():

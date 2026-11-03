@@ -57,6 +57,7 @@ class _Execution:
     nodeid: str
     reference_calls: int = 0
     candidate_calls: int = 0
+    candidate_derivative_calls: int = 0
     reference_selected: bool = False
     completed_timings: int = 0
     selection_empty: bool = False
@@ -266,6 +267,7 @@ class _ReferenceCandidatePlugin:
         # Fixture calls happen before this hook and must not satisfy the test.
         state.reference_calls = 0
         state.candidate_calls = 0
+        state.candidate_derivative_calls = 0
         state.completed_timings = 0
         state.selection_empty = False
         outcome = yield
