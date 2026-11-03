@@ -655,6 +655,12 @@ class BenchmarkResult:
 
         # Convert to dict and handle tuple serialization for shape_detail
         result_dict = asdict(self)
+        # Reference timing is not optimized candidate performance; identify it
+        # only when the opt-in mode actually recorded a source.
+        for metric_dict, metric in zip(result_dict["result"], self.result):
+            source = getattr(metric, "candidate_source", None)
+            if source:
+                metric_dict["candidate_source"] = source
         native_baseline_skip_reason = getattr(self, "native_baseline_skip_reason", None)
         if native_baseline_skip_reason:
             result_dict["native_baseline_skip_reason"] = native_baseline_skip_reason

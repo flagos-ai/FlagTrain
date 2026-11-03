@@ -25,6 +25,12 @@ import triton
 import yaml
 
 import flag_train
+from flag_train.reference_candidate import (
+    ReferenceContractError,
+    reference_execution,
+    reference_mode_enabled,
+    select_candidate,
+)
 from flag_train.utils import shape_utils
 
 from . import consts
@@ -534,6 +540,11 @@ class Benchmark:
             result.base_data_ignored = ignored_reason
         print(result)
         result_dict = asdict(result)
+        if reference_mode_enabled():
+            for metric_dict, metric in zip(result_dict["result"], result.result):
+                source = getattr(metric, "candidate_source", None)
+                if source:
+                    metric_dict["candidate_source"] = source
         if Config.native_baseline_skip_reason:
             result_dict["native_baseline_skip_reason"] = (
                 Config.native_baseline_skip_reason
@@ -569,6 +580,11 @@ class Benchmark:
     def _run_cases(self, case_ids: Optional[Collection[str]]):
         cases = self._collect_cases()
         available_ids = [case.case_id for case in cases]
+        if reference_mode_enabled():
+            reference_execution().selection_empty = (
+                case_ids is not None
+                and not set(case_ids).intersection(available_ids)
+            )
 
         select_all = case_ids is None
         selected = set(case_ids or [])
@@ -658,13 +674,35 @@ class Benchmark:
 
     def _measure_input(self, input, case_id=None):
         metric = BenchmarkMetrics(case_id=case_id)
+        if reference_mode_enabled() and self.is_backward:
+            raise ReferenceContractError(
+                f"{self.op_name}: --ref-as-candidate does not support "
+                "is_backward=True; the timed backward call does not invoke "
+                "the reference itself."
+            )
         try:
             args, kwargs = self.unpack_to_args_kwargs(input)
             metric.shape_detail = self.record_shapes(*args, **kwargs)
             if "latency_base" in self.to_bench_metrics and not Config.skip_native:
                 metric.latency_base = self.get_latency(self.torch_op, *args, **kwargs)
             if "latency" in self.to_bench_metrics:
-                if self.train_op:
+                if reference_mode_enabled():
+                    # The explicit torch_op is the reference. Do not resolve
+                    # the ordinary candidate (train_op) in this mode.
+                    execution = reference_execution()
+                    before = execution.candidate_calls
+                    candidate = select_candidate(
+                        None, self.torch_op, self.op_name
+                    )
+                    metric.latency = self.get_latency(candidate, *args, **kwargs)
+                    if execution.candidate_calls <= before:
+                        raise ReferenceContractError(
+                            f"{self.op_name}: reference candidate timer did "
+                            "not invoke the declared reference."
+                        )
+                    execution.completed_timings += 1
+                    metric.candidate_source = "reference"
+                elif self.train_op:
                     metric.latency = self.get_latency(self.train_op, *args, **kwargs)
                 else:
                     if self.op_name == "zero_":
@@ -731,6 +769,16 @@ class Benchmark:
             return
 
         self.init_user_config()
+        if reference_mode_enabled() and "latency" not in self.to_bench_metrics:
+            raise ReferenceContractError(
+                "--ref-as-candidate requires the candidate latency metric."
+            )
+        if reference_mode_enabled() and self.is_backward:
+            raise ReferenceContractError(
+                f"{self.op_name}: --ref-as-candidate does not support "
+                "is_backward=True; the timed backward call does not invoke "
+                "the reference itself."
+            )
         ignored_reason = self.base_data_ignored_reason()
         if ignored_reason:
             # Once per operator, not once per shape: what changes is which
