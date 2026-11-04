@@ -211,6 +211,30 @@ def masked_backward_autograd(scores, mask, output_grads, scale):
     return grad
 
 
+# Query rows per reference chunk. The benchmark shapes are far too large for a
+# single oracle tensor -- ``masked_softmax_ref`` alone peaks at ~24 GiB on
+# ``(4, 16, 4096, 4096)`` fp32 -- and both the softmax and its gradient
+# factorise over the query axis, so the oracle is evaluated chunk by chunk.
+_REFERENCE_CHUNK = 256
+
+
+def masked_softmax_ref_chunked(scores, mask, scale, dtype):
+    """``masked_softmax_ref`` chunked over the query axis and cast to ``dtype``.
+
+    Each row's softmax depends only on that row, so this answers the same
+    values as the whole-tensor call without its several full-size fp32
+    temporaries (which is what the largest benchmark shape cannot hold).
+    """
+    out = torch.empty(scores.shape, dtype=dtype, device=scores.device)
+    sq = scores.shape[2]
+    for start in range(0, sq, _REFERENCE_CHUNK):
+        stop = start + _REFERENCE_CHUNK
+        out[:, :, start:stop] = masked_softmax_ref(
+            scores[:, :, start:stop], mask[..., start:stop, :], scale
+        )
+    return out
+
+
 def _reference(tensor):
     return utils.to_reference(tensor.detach(), upcast=True)
 
@@ -255,7 +279,7 @@ def test_gradient_matches_autograd(shape, dtype):
     utils.init_seed(0)
     scores = torch.randn(shape, dtype=torch.float32, device=flag_train.device)
     mask = _padding_mask(shape)
-    y = masked_softmax_ref(scores, mask, _SCALE).to(dtype)
+    y = masked_softmax_ref_chunked(scores, mask, _SCALE, dtype)
     dy = torch.randn(shape, dtype=dtype, device=flag_train.device)
 
     dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
@@ -264,10 +288,19 @@ def test_gradient_matches_autograd(shape, dtype):
     assert dx.dtype == dtype
     assert dx.is_contiguous()
     # The oracle runs where the reference runs: on the host under ``--ref cpu``.
-    expected = masked_backward_autograd(
-        _reference(scores), mask, _reference(dy), _SCALE
-    )
-    _assert_close(dx, expected, dtype)
+    # Like ``y`` above, it is evaluated chunk by chunk over the query axis: a
+    # row's gradient depends only on that row, and the whole-tensor autograd
+    # oracle does not fit the largest benchmark shape on a 32 GiB device.
+    sq = scores.shape[2]
+    for start in range(0, sq, _REFERENCE_CHUNK):
+        stop = start + _REFERENCE_CHUNK
+        expected = masked_backward_autograd(
+            _reference(scores[:, :, start:stop]),
+            mask[..., start:stop, :],
+            _reference(dy[:, :, start:stop]),
+            _SCALE,
+        )
+        _assert_close(dx[:, :, start:stop], expected, dtype)
 
 
 @pytest.mark.scaled_masked_softmax_cuda_backward
@@ -435,6 +468,11 @@ def test_vendored_baseline_matches_torch(dtype):
     ],
 )
 def test_rejects_invalid_arguments(case, match):
+    if case == "dtype" and not flag_train.runtime.device.support_fp64:
+        # The fp64 rejection cannot be exercised where the device has no fp64:
+        # torch_npu's Tensor.double() silently keeps float32, so the guard
+        # would be handed a supported dtype and would rightly not raise.
+        pytest.skip("device does not support fp64")
     dy = torch.randn((2, 2, 4, 4), dtype=torch.float32, device=flag_train.device)
     y = _softmax_like(dy)
     if case == "ndim":

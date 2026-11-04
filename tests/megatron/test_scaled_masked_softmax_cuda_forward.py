@@ -158,7 +158,12 @@ def masked_softmax_ref(inputs, mask, scale):
     # The mask is built on the device while ``--ref cpu`` has already moved the
     # scores to the host, and ``masked_fill`` refuses to mix the two, so the
     # mask follows the scores.
-    masked = mask.to(scores.device).bool().expand_as(scores)
+    # Materialise the mask before broadcasting: torch_musa's ``masked_fill``
+    # returns wrong values when the mask is a non-contiguous view (e.g. a
+    # transposed mask), even though the scores it fills may be contiguous.
+    # A contiguous source expanded to stride 0 in the head dimension is read
+    # correctly.
+    masked = mask.to(scores.device).bool().contiguous().expand_as(scores)
     scores = scores.masked_fill(masked, _MASKED_SCORE)
     row_max = scores.max(dim=-1, keepdim=True).values
     numerator = torch.exp(scores - row_max)
@@ -273,9 +278,15 @@ def test_forward(shape, build_mask, dtype):
     _assert_forward_close(out, scores, mask, dtype)
 
     # Masked keys are exactly zero, and every row that keeps a key is a
-    # distribution over the keys it keeps.
+    # distribution over the keys it keeps. The select is chunked over the
+    # query axis like the reference above: torch_npu's boolean indexing
+    # allocates a workspace proportional to the mask's numel (~48 bytes per
+    # element whatever the True count), which is ~49 GiB on the largest
+    # benchmark shape.
     masked = mask.expand_as(out)
-    assert torch.count_nonzero(out[masked]) == 0
+    for start in range(0, out.shape[2], _REFERENCE_CHUNK):
+        stop = start + _REFERENCE_CHUNK
+        assert torch.count_nonzero(out[:, :, start:stop][masked[:, :, start:stop]]) == 0
     attended_rows = ~masked.all(dim=-1)
     sums = out.to(torch.float32).sum(dim=-1)[attended_rows]
     tolerance = 1e-2 if dtype is torch.bfloat16 else 2e-3
@@ -427,6 +438,11 @@ def test_vendored_baseline_matches_torch(dtype):
     ],
 )
 def test_rejects_invalid_arguments(case, match):
+    if case == "dtype" and not flag_train.runtime.device.support_fp64:
+        # The fp64 rejection cannot be exercised where the device has no fp64:
+        # torch_npu's Tensor.double() silently keeps float32, so the guard
+        # would be handed a supported dtype and would rightly not raise.
+        pytest.skip("device does not support fp64")
     scores = torch.randn((2, 2, 4, 4), dtype=torch.float32, device=flag_train.device)
     mask = _padding_mask(scores.shape)
     args = (scores, mask, _SCALE)

@@ -24,4 +24,10 @@ To specialise an operator, define it under this package, re-export it here
 overrides.
 """
 
-__all__ = []
+from .scaled_masked_softmax_cuda_backward import scaled_masked_softmax_cuda_backward
+from .scaled_masked_softmax_cuda_forward import scaled_masked_softmax_cuda_forward
+
+__all__ = [
+    "scaled_masked_softmax_cuda_backward",
+    "scaled_masked_softmax_cuda_forward",
+]
