@@ -64,7 +64,7 @@
         "quick_gelu",
         "quick_gelu_backward",
         "unpackbits",
-        "wf6af16_linear"
+        "cuda_wf6af16_linear"
       ],
       "latency_warmup_ms": 25,
       "latency_rep_ms": 100,

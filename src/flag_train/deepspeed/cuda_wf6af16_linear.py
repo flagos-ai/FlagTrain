@@ -32,7 +32,7 @@ row-major and dense:
 
 This module only carries the compute kernel; quantizing weights and packing
 them into this layout is input preparation, and reference helpers for it live
-with the tests (``tests/deepspeed/test_wf6af16_linear.py``).
+with the tests (``tests/deepspeed/test_cuda_wf6af16_linear.py``).
 
 Dequantization mirrors the CUDA kernel bit-for-bit at the value level:
 ``code -> sign * 2^(e-3) * (1 + m/4)`` (with the ``e == 0`` subnormal branch
@@ -64,7 +64,7 @@ def _gemm_configs():
     space.
 
     The bare kernel is also wrapped by vendor backends with their own tuning
-    (see e.g. ``runtime/backend/_metax/deepspeed/wf6af16_linear.py``), so
+    (see e.g. ``runtime/backend/_metax/deepspeed/cuda_wf6af16_linear.py``), so
     this list carries only the generic choices.
     """
     configs = []
@@ -93,7 +93,7 @@ def _gemm_configs():
 
 
 @triton.jit
-def _wf6af16_linear_gemm(
+def _cuda_wf6af16_linear_gemm(
     out_ptr,
     a_ptr,
     w2_ptr,
@@ -240,17 +240,17 @@ def _wf6af16_linear_gemm(
 
 # The bare JIT function above is what vendor backends wrap with their own
 # autotune space; the generic wrapper keeps the name the launcher calls.
-wf6af16_linear_kernel = libentry()(
+cuda_wf6af16_linear_kernel = libentry()(
     triton.autotune(
         configs=_gemm_configs(),
         key=["M", "N", "K", "split_k"],
-    )(_wf6af16_linear_gemm)
+    )(_cuda_wf6af16_linear_gemm)
 )
 
 
 @libentry()
 @triton.jit
-def wf6af16_split_k_reduce_kernel(
+def cuda_wf6af16_split_k_reduce_kernel(
     ws_ptr,
     out_ptr,
     total,
@@ -435,7 +435,7 @@ def _pick_split_k(tokens, out_channels, in_channels):
     return 1
 
 
-def wf6af16_linear(
+def cuda_wf6af16_linear(
     output,
     hidden_states,
     weights_2bit,
@@ -473,7 +473,7 @@ def wf6af16_linear(
     Returns:
         Tensor: ``output``.
     """
-    logger.debug("TRAIN WF6AF16_LINEAR")
+    logger.debug("TRAIN CUDA_WF6AF16_LINEAR")
 
     assert hidden_states.dtype == torch.float16, "activations must be fp16"
     assert output.dtype == torch.float16, "output must be fp16"
@@ -481,7 +481,7 @@ def wf6af16_linear(
     assert weights_2bit.dtype == torch.uint8 and weights_4bit.dtype == torch.uint8
     assert (
         hidden_states.device.type == flag_train.device
-    ), f"wf6af16_linear only supports {flag_train.device} tensors"
+    ), f"cuda_wf6af16_linear only supports {flag_train.device} tensors"
 
     tokens = tokens if tokens is not None else hidden_states.shape[0]
     in_channels = in_channels if in_channels is not None else hidden_states.shape[1]
@@ -494,14 +494,14 @@ def wf6af16_linear(
     assert weights_4bit.shape == (out_channels, in_channels // 2)
     # The kernel indexes raw pointers with row-major strides.
     for t in (output, hidden_states, weights_2bit, weights_4bit, scale):
-        assert t.is_contiguous(), "wf6af16_linear requires contiguous tensors"
+        assert t.is_contiguous(), "cuda_wf6af16_linear requires contiguous tensors"
 
     if split_k is None:
         split_k = _pick_split_k(tokens, out_channels, in_channels)
     elif in_channels % (split_k * 4) != 0:
         # Each slice must start on a byte boundary (4 codes per byte).
         logger.debug(
-            "wf6af16_linear: split_k=%d misaligns K=%d slices, using split_k=1",
+            "cuda_wf6af16_linear: split_k=%d misaligns K=%d slices, using split_k=1",
             split_k,
             in_channels,
         )
@@ -532,7 +532,7 @@ def wf6af16_linear(
 
     with torch_device_fn.device(hidden_states.device):
         if split_k == 1:
-            wf6af16_linear_kernel[grid](
+            cuda_wf6af16_linear_kernel[grid](
                 output,
                 hidden_states,
                 weights_2bit,
@@ -551,7 +551,7 @@ def wf6af16_linear(
                 dtype=torch.float32,
                 device=hidden_states.device,
             )
-            wf6af16_linear_kernel[grid](
+            cuda_wf6af16_linear_kernel[grid](
                 workspace,
                 hidden_states,
                 weights_2bit,
@@ -565,7 +565,7 @@ def wf6af16_linear(
                 WIDE_LOAD=wide_load,
             )
             total = tokens * out_channels
-            wf6af16_split_k_reduce_kernel[(triton.cdiv(total, 1024),)](
+            cuda_wf6af16_split_k_reduce_kernel[(triton.cdiv(total, 1024),)](
                 workspace,
                 output,
                 total,

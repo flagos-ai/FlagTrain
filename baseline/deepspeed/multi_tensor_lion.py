@@ -21,7 +21,7 @@ collecting a baseline or falling back to a torch reference. DeepSpeed is loaded
 lazily on the first call, so ops discovery does not trigger its JIT.
 
 The input construction follows
-``FlagTrain/benchmark/deepspeed/test_lion.py::lion_input_fn``: ``gs``/``ps``/``ms``
+``FlagTrain/benchmark/deepspeed/test_multi_tensor_lion.py::multi_tensor_lion_input_fn``: ``gs``/``ps``/``ms``
 each hold ``n_tensors`` tensors of length ``numel``.
 """
 
@@ -31,7 +31,7 @@ OP_NAME = "multi_tensor_lion"
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 IS_INPLACE = True
 
-# benchmark/deepspeed/test_lion.py::_LION_SHAPES
+# benchmark/deepspeed/test_multi_tensor_lion.py::_MULTI_TENSOR_LION_SHAPES
 _SHAPES = [
     (8, 1024),
     (64, 1024),

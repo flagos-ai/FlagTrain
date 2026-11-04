@@ -265,6 +265,7 @@ def _run(M, n, K, x_dtype, weight_dtype, aux_dtype, grads, with_r, seed=0):
         _check(result, ref, dtype)
 
 
+@pytest.mark.fused_proj_rms_compute_h_backward
 @pytest.mark.parametrize("M,n,K", _CASES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_backward_vs_reference(M, n, K, dtype):
@@ -274,6 +275,7 @@ def test_backward_vs_reference(M, n, K, dtype):
     _run(M, n, K, dtype, dtype, dtype, (True, True, True), True)
 
 
+@pytest.mark.fused_proj_rms_compute_h_backward
 @pytest.mark.parametrize("M,n,K", [(33, 4, 2048), (64, 2, 512)])
 def test_backward_activation_dtype_with_fp32_weight(M, n, K):
     """mHC's real case: bf16 activations with keep_in_fp32 mapping parameters."""
@@ -281,6 +283,7 @@ def test_backward_activation_dtype_with_fp32_weight(M, n, K):
     _run(M, n, K, x_dtype, torch.float32, torch.float32, (True, True, True), True)
 
 
+@pytest.mark.fused_proj_rms_compute_h_backward
 @pytest.mark.parametrize(
     "grads,with_r",
     [
@@ -294,6 +297,7 @@ def test_backward_partial_grads(grads, with_r):
     _run(64, 4, 512, torch.float32, torch.float32, torch.float32, grads, with_r)
 
 
+@pytest.mark.fused_proj_rms_compute_h_backward
 def test_backward_rejects_bad_arguments():
     """Catch silent wrong layouts and mis-sized saved tensors before launching."""
     x, weight, alpha_pre, alpha_post, alpha_res, bias = _inputs(

@@ -13,7 +13,7 @@
 # limitations under the License.
 """Ascend WF6-AF16 linear.
 
-The generic implementation is ``flag_train.deepspeed.wf6af16_linear`` and is
+The generic implementation is ``flag_train.deepspeed.cuda_wf6af16_linear`` and is
 what every backend without an override runs. None of it survives this
 backend's compiler (BiShengHIR, CANN 9.0, measured on a 910B4):
 
@@ -53,7 +53,7 @@ nor a misaligned user choice guarantee; the constraint below (``split_k * 4``
 dividing K, plus a floor on slice length) is the generic launcher's.
 
 Registration is by name. ``_ascend/deepspeed/__init__.py`` re-exports this
-module's ``wf6af16_linear``, and ``SpecOpRegistrar`` writes it over the
+module's ``cuda_wf6af16_linear``, and ``SpecOpRegistrar`` writes it over the
 same-named generic function in ``flag_train.deepspeed`` when that package is
 imported -- the namespace the tests and the benchmark read the operator from.
 """
@@ -65,7 +65,7 @@ import triton
 import triton.language as tl
 
 import flag_train
-from flag_train.deepspeed.wf6af16_linear import wf6af16_split_k_reduce_kernel
+from flag_train.deepspeed.cuda_wf6af16_linear import cuda_wf6af16_split_k_reduce_kernel
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
@@ -123,7 +123,7 @@ def _dequant_fp6(code):
 
 
 @triton.jit
-def _wf6af16_linear_gemm_ascend(
+def _cuda_wf6af16_linear_gemm_ascend(
     out_ptr,
     a_ptr,
     w2_ptr,
@@ -141,7 +141,7 @@ def _wf6af16_linear_gemm_ascend(
     """One tile of ``C = (W * scales) @ A^T`` with FP6 weights unpacked inline.
 
     Same contract as the generic
-    ``flag_train.deepspeed.wf6af16_linear._wf6af16_linear_gemm`` minus the
+    ``flag_train.deepspeed.cuda_wf6af16_linear._cuda_wf6af16_linear_gemm`` minus the
     WIDE_LOAD path; the unpack is restructured into four interleave-free
     K-streams (see the module docstring). ``W`` is the packed FP6 weight
     ``[M, K]`` (2-bit + 4-bit slices), ``A`` the fp16 activation ``[N, K]``
@@ -250,11 +250,11 @@ def _wf6af16_linear_gemm_ascend(
 
 # The bare JIT function above is wrapped with the Ascend-verified autotune
 # space; the test suite reads the configs back off this object.
-wf6af16_linear_kernel = libentry()(
+cuda_wf6af16_linear_kernel = libentry()(
     triton.autotune(
         configs=_gemm_configs(),
         key=["M", "N", "K", "split_k"],
-    )(_wf6af16_linear_gemm_ascend)
+    )(_cuda_wf6af16_linear_gemm_ascend)
 )
 
 
@@ -278,7 +278,7 @@ def _pick_split_k(tokens, out_channels, in_channels):
     return split_k
 
 
-def wf6af16_linear(
+def cuda_wf6af16_linear(
     output,
     hidden_states,
     weights_2bit,
@@ -291,11 +291,11 @@ def wf6af16_linear(
 ):
     """FP6-weight FP16-activation linear: ``output = hidden @ (W * scale)^T``.
 
-    Same contract as the generic ``flag_train.deepspeed.wf6af16_linear``;
+    Same contract as the generic ``flag_train.deepspeed.cuda_wf6af16_linear``;
     only the kernel variant, the tuning space, and the split-K choice differ
     (see the module docstring).
     """
-    logger.debug("TRAIN_ASCEND WF6AF16_LINEAR")
+    logger.debug("TRAIN_ASCEND CUDA_WF6AF16_LINEAR")
 
     assert hidden_states.dtype == torch.float16, "activations must be fp16"
     assert output.dtype == torch.float16, "output must be fp16"
@@ -303,7 +303,7 @@ def wf6af16_linear(
     assert weights_2bit.dtype == torch.uint8 and weights_4bit.dtype == torch.uint8
     assert (
         hidden_states.device.type == flag_train.device
-    ), f"wf6af16_linear only supports {flag_train.device} tensors"
+    ), f"cuda_wf6af16_linear only supports {flag_train.device} tensors"
 
     tokens = tokens if tokens is not None else hidden_states.shape[0]
     in_channels = in_channels if in_channels is not None else hidden_states.shape[1]
@@ -316,14 +316,14 @@ def wf6af16_linear(
     assert weights_4bit.shape == (out_channels, in_channels // 2)
     # The kernel indexes raw pointers with row-major strides.
     for t in (output, hidden_states, weights_2bit, weights_4bit, scale):
-        assert t.is_contiguous(), "wf6af16_linear requires contiguous tensors"
+        assert t.is_contiguous(), "cuda_wf6af16_linear requires contiguous tensors"
 
     if split_k is None:
         split_k = _pick_split_k(tokens, out_channels, in_channels)
     elif in_channels % (split_k * 4) != 0:
         # Each slice must start on a byte boundary (4 codes per byte).
         logger.debug(
-            "wf6af16_linear: split_k=%d misaligns K=%d slices, using split_k=1",
+            "cuda_wf6af16_linear: split_k=%d misaligns K=%d slices, using split_k=1",
             split_k,
             in_channels,
         )
@@ -338,7 +338,7 @@ def wf6af16_linear(
 
     with torch_device_fn.device(hidden_states.device):
         if split_k == 1:
-            wf6af16_linear_kernel[grid](
+            cuda_wf6af16_linear_kernel[grid](
                 output,
                 hidden_states,
                 weights_2bit,
@@ -356,7 +356,7 @@ def wf6af16_linear(
                 dtype=torch.float32,
                 device=hidden_states.device,
             )
-            wf6af16_linear_kernel[grid](
+            cuda_wf6af16_linear_kernel[grid](
                 workspace,
                 hidden_states,
                 weights_2bit,
@@ -369,7 +369,7 @@ def wf6af16_linear(
                 SPLIT_K_MODE=True,
             )
             total = tokens * out_channels
-            wf6af16_split_k_reduce_kernel[(triton.cdiv(total, 1024),)](
+            cuda_wf6af16_split_k_reduce_kernel[(triton.cdiv(total, 1024),)](
                 workspace,
                 output,
                 total,

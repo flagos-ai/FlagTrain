@@ -19,7 +19,7 @@ Oracle selection:
   implementation ports. Where the ``deepspeed`` package is available, the
   operator is verified against it directly.
 * Where DeepSpeed is unavailable on the host, the oracle falls back to
-  ``lion_ref``, a plain-torch composition of the same contract. Under
+  ``multi_tensor_lion_ref``, a plain-torch composition of the same contract. Under
   ``--ref cpu`` it genuinely executes on the CPU, which makes it an
   independent oracle rather than a second reading of the same device
   arithmetic; see ``_reference_copy``.
@@ -74,21 +74,21 @@ def _reference_copy(tensor):
     """An independent copy of ``tensor``, on the device the reference must use.
 
     ``--ref cpu`` pushes the reference *computation* onto the CPU, not merely its
-    result, so every operand ``lion_ref`` is handed comes from here and no kernel
+    result, so every operand ``multi_tensor_lion_ref`` is handed comes from here and no kernel
     of the reference runs on the accelerator. That is what makes it an
     independent oracle -- a reference evaluated by the same device arithmetic it
     is checking can only confirm the arithmetic agrees with itself.
-    ``lion_ref`` checks this rather than trusting it; the comparison helpers move
+    ``multi_tensor_lion_ref`` checks this rather than trusting it; the comparison helpers move
     the operator's own output across afterwards.
 
-    ``lion_ref`` steps its parameters in place, so the copy is not optional: on a
+    ``multi_tensor_lion_ref`` steps its parameters in place, so the copy is not optional: on a
     non-CPU reference ``to_reference`` returns its argument unchanged, and the
     reference would then corrupt the operator's operands.
     """
     return utils.to_reference(tensor).clone()
 
 
-def lion_ref(
+def multi_tensor_lion_ref(
     chunk_size,
     noop_flag,
     tensor_lists,
@@ -141,7 +141,7 @@ _DEEPSPEED_UNAVAILABLE_MSG = (
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
 
 
-def _load_deepspeed_lion():
+def _load_deepspeed_multi_tensor_lion():
     """``(op, version)`` for DeepSpeed's multi_tensor_lion, or ``(None, None)``.
 
     ``FusedLionBuilder`` JIT-compiles the CUDA source shipped inside the
@@ -165,34 +165,39 @@ def _load_deepspeed_lion():
 
 
 # Resolved once, at module import time.
-_deepspeed_lion, _DEEPSPEED_VERSION = _load_deepspeed_lion()
+_deepspeed_multi_tensor_lion, _DEEPSPEED_VERSION = _load_deepspeed_multi_tensor_lion()
 
 # The torch reference is always available, so only the DeepSpeed checks skip.
 requires_deepspeed_reference = pytest.mark.skipif(
-    _deepspeed_lion is None, reason=_DEEPSPEED_UNAVAILABLE_MSG
+    _deepspeed_multi_tensor_lion is None, reason=_DEEPSPEED_UNAVAILABLE_MSG
 )
 
 
 def _oracle():
-    """The default oracle: DeepSpeed's op where available, else ``lion_ref``."""
-    return _deepspeed_lion if _deepspeed_lion is not None else lion_ref
+    """The default oracle: DeepSpeed's op where available, else ``multi_tensor_lion_ref``."""
+    return (
+        _deepspeed_multi_tensor_lion
+        if _deepspeed_multi_tensor_lion is not None
+        else multi_tensor_lion_ref
+    )
 
 
 def _oracle_lists(gs, ps, ms):
     """Operand copies for the default oracle, on the device it must use.
 
-    DeepSpeed runs on the accelerator, so plain clones; ``lion_ref`` may need
+    DeepSpeed runs on the accelerator, so plain clones; ``multi_tensor_lion_ref`` may need
     CPU operands under ``--ref cpu``.
     """
-    if _deepspeed_lion is not None:
+    if _deepspeed_multi_tensor_lion is not None:
         return _clone_lists(gs, ps, ms)
     return _reference_lists(gs, ps, ms)
 
 
 def _oracle_atol(dtype):
     """The DeepSpeed oracle is a cross-implementation check (see ``_ds_atol``);
-    ``lion_ref`` shares our arithmetic exactly, so the strict default holds."""
-    return _ds_atol(dtype) if _deepspeed_lion is not None else 1e-4
+    ``multi_tensor_lion_ref`` shares our arithmetic exactly, so the strict default holds.
+    """
+    return _ds_atol(dtype) if _deepspeed_multi_tensor_lion is not None else 1e-4
 
 
 def _noop_flag():
@@ -303,7 +308,7 @@ def _assert_step_matches(
 @pytest.mark.multi_tensor_lion
 @pytest.mark.parametrize("n_tensors,numel", [(1, 1024), (4, 4096), (16, 16384)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_lion(n_tensors, numel, dtype):
+def test_multi_tensor_lion(n_tensors, numel, dtype):
     """A single Lion step must match the default oracle: DeepSpeed's
     multi_tensor_lion where available, the torch reference otherwise."""
     gs, ps, ms = _make_triplet(n_tensors, numel, dtype)
@@ -328,7 +333,7 @@ def test_lion(n_tensors, numel, dtype):
 
 @pytest.mark.multi_tensor_lion
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-def test_lion_matches_reference(dtype):
+def test_multi_tensor_lion_matches_reference(dtype):
     """Run several Lion steps and compare against the torch reference.
 
     Multiple parameter tensors, fresh gradients each step, accumulating first
@@ -355,13 +360,19 @@ def test_lion_matches_reference(dtype):
         # Lion reads the gradient but never writes it, so the operator and the
         # reference may be handed the same values.
         _step(flag_train.deepspeed.multi_tensor_lion, grads, train_ps, train_ms, step)
-        _step(lion_ref, [_reference_copy(g) for g in grads], ref_ps, ref_ms, step)
+        _step(
+            multi_tensor_lion_ref,
+            [_reference_copy(g) for g in grads],
+            ref_ps,
+            ref_ms,
+            step,
+        )
 
     _assert_step_matches(train_ps, train_ms, ref_ps, ref_ms)
 
 
 @pytest.mark.multi_tensor_lion
-def test_lion_mixed_dtypes():
+def test_multi_tensor_lion_mixed_dtypes():
     """A single call may mix dtypes; the implementation groups by dtype and
     launches once per group (mirroring FusedLion.step). DeepSpeed's op itself
     is always called per dtype group, so the torch reference is the oracle."""
@@ -373,7 +384,7 @@ def test_lion_mixed_dtypes():
     _step(flag_train.deepspeed.multi_tensor_lion, train_gs, train_ps, train_ms, 1)
 
     ref_gs, ref_ps, ref_ms = _reference_lists(gs, ps, ms)
-    _step(lion_ref, ref_gs, ref_ps, ref_ms, 1)
+    _step(multi_tensor_lion_ref, ref_gs, ref_ps, ref_ms, 1)
     _assert_step_matches(train_ps, train_ms, ref_ps, ref_ms)
 
 
@@ -401,7 +412,7 @@ def test_matches_deepspeed_oracle(dtype):
         _step(
             flag_train.deepspeed.multi_tensor_lion, train_gs, train_ps, train_ms, step
         )
-        _step(_deepspeed_lion, ds_gs, ds_ps, ds_ms, step)
+        _step(_deepspeed_multi_tensor_lion, ds_gs, ds_ps, ds_ms, step)
     p_masks = [~u for u in unsafe]
     _assert_step_matches(
         train_ps, train_ms, ds_ps, ds_ms, atol=_ds_atol(dtype), p_masks=p_masks
@@ -414,18 +425,18 @@ def test_matches_deepspeed_oracle(dtype):
 def test_reference_matches_deepspeed(dtype):
     """Cross-check the two oracles against each other.
 
-    Hosts without DeepSpeed fall back to ``lion_ref`` as the oracle; that
-    fallback is only meaningful if ``lion_ref`` itself agrees with DeepSpeed's
+    Hosts without DeepSpeed fall back to ``multi_tensor_lion_ref`` as the oracle; that
+    fallback is only meaningful if ``multi_tensor_lion_ref`` itself agrees with DeepSpeed's
     operator, so pin the two against each other where both exist.
     """
     gs, ps, ms = _make_triplet(8, 16384, dtype)
     p_masks = _sign_safe_mask(gs, ms)
 
     ds_gs, ds_ps, ds_ms = _clone_lists(gs, ps, ms)
-    _step(_deepspeed_lion, ds_gs, ds_ps, ds_ms, 1)
+    _step(_deepspeed_multi_tensor_lion, ds_gs, ds_ps, ds_ms, 1)
 
     ref_gs, ref_ps, ref_ms = _reference_lists(gs, ps, ms)
-    _step(lion_ref, ref_gs, ref_ps, ref_ms, 1)
+    _step(multi_tensor_lion_ref, ref_gs, ref_ps, ref_ms, 1)
 
     _assert_step_matches(
         ref_ps, ref_ms, ds_ps, ds_ms, atol=_ds_atol(dtype), p_masks=p_masks

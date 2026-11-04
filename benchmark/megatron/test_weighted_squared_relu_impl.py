@@ -19,7 +19,7 @@ backend this operator ships on (``_MEGATRON_BASELINE_VENDORS``): like
 run against Megatron -- a missing import, or a plain weighted call that fails
 here -- instead of timing against a PyTorch composition. megatron-core before
 0.20.0 has no ``clamp_scale``, so on that interface the clamped rows are left
-out and ``weighted_squared_relu`` still runs against Megatron. The test prints
+out and ``weighted_squared_relu_impl`` still runs against Megatron. The test prints
 the resolved baseline before timing.
 
 The three variants (``weighted_squared_relu``, ``clamped_squared_relu`` and
@@ -378,7 +378,7 @@ class WeightedSquaredReluBenchmark(base.GenericBenchmark):
             self.shapes += list(_COMPREHENSIVE_SHAPES)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 def test_weighted_squared_relu_perf():
     # State the reference first, so a run whose numbers moved says whether the
     # baseline it moved against is the one the platform was supposed to pick.

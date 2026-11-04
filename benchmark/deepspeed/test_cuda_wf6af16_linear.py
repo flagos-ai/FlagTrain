@@ -19,7 +19,7 @@ The baseline follows ``_DEEPSPEED_BASELINE_VENDORS`` below:
   **is** the baseline. The CUDA kernel asserts ``__CUDA_ARCH__ == 800``, so on
   any other architecture it cannot run -- the baseline falls back to the torch
   reference there rather than measuring nothing;
-* everywhere else the baseline is ``wf6af16_ref``, an unfused torch
+* everywhere else the baseline is ``cuda_wf6af16_ref``, an unfused torch
   composition (unpack, dequantize to an fp16 weight matrix, cuBLAS GEMM). It
   is not a competitor, and the speedup there says how far the kernel is from
   *a* correct implementation rather than from the best one.
@@ -41,7 +41,7 @@ from .. import base
 # ladder (1..64) is dense because the split-K heuristic switches there; the
 # prefill shapes reach past the map's 768-token ceiling. The channel pairs
 # mirror the sizes DeepSpeed's split-K map is profiled for.
-_WF6AF16_SHAPES = [
+_CUDA_WF6AF16_SHAPES = [
     (1, 4096, 4096),
     (4, 4096, 4096),
     (8, 4096, 4096),
@@ -116,7 +116,7 @@ def _unpack_weights_fp6(weights_2bit, weights_4bit):
     return ((top2 << 4) | low4).to(torch.uint8)
 
 
-def wf6af16_ref(hidden_states, weights_2bit, weights_4bit, scales):
+def cuda_wf6af16_ref(hidden_states, weights_2bit, weights_4bit, scales):
     """Unfused torch baseline: dequantize, then a plain fp16 GEMM."""
     codes = _unpack_weights_fp6(weights_2bit, weights_4bit)
     table = _fp6_e3m2_table(device=codes.device)
@@ -134,7 +134,7 @@ def wf6af16_ref(hidden_states, weights_2bit, weights_4bit, scales):
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
 
-def _load_deepspeed_wf6af16():
+def _load_deepspeed_cuda_wf6af16():
     """DeepSpeed's cuda_wf6af16_linear, or ``None`` when it cannot run here.
 
     Besides the extension building at all, the kernel hard-codes
@@ -159,7 +159,7 @@ def _load_deepspeed_wf6af16():
         # means the torch reference is timed instead.
         return None
 
-    def deepspeed_wf6af16(hidden_states, weights_2bit, weights_4bit, scales):
+    def deepspeed_cuda_wf6af16(hidden_states, weights_2bit, weights_4bit, scales):
         out_channels = scales.shape[0]
         tokens, in_channels = hidden_states.shape
         # weights_2bit/weights_4bit here are DeepSpeed's own packing, produced
@@ -186,31 +186,31 @@ def _load_deepspeed_wf6af16():
 
     # The DeepSpeed packing needs the host-side preprocess_weight; expose it
     # so the input setup can pre-pack.
-    deepspeed_wf6af16.preprocess_weight = inf_module.preprocess_weight
-    return deepspeed_wf6af16
+    deepspeed_cuda_wf6af16.preprocess_weight = inf_module.preprocess_weight
+    return deepspeed_cuda_wf6af16
 
 
 # Resolved once, so the first-use JIT compile is not counted in the measurement.
-_deepspeed_wf6af16 = _load_deepspeed_wf6af16()
+_deepspeed_cuda_wf6af16 = _load_deepspeed_cuda_wf6af16()
 
 _BASELINE = (
     "deepspeed cuda_wf6af16_linear"
-    if _deepspeed_wf6af16 is not None
-    else "wf6af16_ref (torch)"
+    if _deepspeed_cuda_wf6af16 is not None
+    else "cuda_wf6af16_ref (torch)"
 )
 
 
-class Wf6Af16LinearBenchmark(base.GenericBenchmark):
-    DEFAULT_SHAPES = _WF6AF16_SHAPES
+class CudaWf6Af16LinearBenchmark(base.GenericBenchmark):
+    DEFAULT_SHAPES = _CUDA_WF6AF16_SHAPES
 
     def set_shapes(self, shape_file=None):
-        self.shapes = list(_WF6AF16_SHAPES)
+        self.shapes = list(_CUDA_WF6AF16_SHAPES)
 
     def set_more_shapes(self):
         return []
 
 
-def wf6af16_input_fn(shape, dtype, device):
+def cuda_wf6af16_input_fn(shape, dtype, device):
     tokens, in_channels, out_channels = shape
     gen = torch.Generator().manual_seed(0)
     codes = torch.randint(0, 64, (out_channels, in_channels), generator=gen).to(
@@ -221,12 +221,12 @@ def wf6af16_input_fn(shape, dtype, device):
 
     weights_2bit, weights_4bit = _pack_weights_fp6(codes.to(device))
 
-    if _deepspeed_wf6af16 is not None:
+    if _deepspeed_cuda_wf6af16 is not None:
         # DeepSpeed's packer wants the fake-quantized fp16 weights on CPU; the
         # table values are exact in fp16, so the repack is lossless.
         table = _fp6_e3m2_table()
         fake_fp16 = table[codes.long()].to(torch.float16)
-        ds_w2, ds_w4 = _deepspeed_wf6af16.preprocess_weight(fake_fp16)
+        ds_w2, ds_w4 = _deepspeed_cuda_wf6af16.preprocess_weight(fake_fp16)
         ds_w2 = ds_w2.to(device)
         ds_w4 = ds_w4.to(device)
     else:
@@ -244,9 +244,9 @@ def wf6af16_input_fn(shape, dtype, device):
 
 def torch_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
     """Baseline, chosen by platform. See the module docstring."""
-    if _deepspeed_wf6af16 is not None:
-        return _deepspeed_wf6af16(hidden, ds_w2, ds_w4, scales)
-    return wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
+    if _deepspeed_cuda_wf6af16 is not None:
+        return _deepspeed_cuda_wf6af16(hidden, ds_w2, ds_w4, scales)
+    return cuda_wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
 
 
 def train_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
@@ -256,7 +256,7 @@ def train_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
     output = torch.empty(
         (tokens, out_channels), dtype=torch.float16, device=hidden.device
     )
-    return flag_train.deepspeed.wf6af16_linear(
+    return flag_train.deepspeed.cuda_wf6af16_linear(
         output,
         hidden,
         weights_2bit,
@@ -268,16 +268,16 @@ def train_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
     )
 
 
-@pytest.mark.wf6af16_linear
-def test_wf6af16_linear_perf():
-    bench = Wf6Af16LinearBenchmark(
-        input_fn=wf6af16_input_fn,
-        op_name="wf6af16_linear",
+@pytest.mark.cuda_wf6af16_linear
+def test_cuda_wf6af16_linear_perf():
+    bench = CudaWf6Af16LinearBenchmark(
+        input_fn=cuda_wf6af16_input_fn,
+        op_name="cuda_wf6af16_linear",
         torch_op=torch_op,
         dtypes=[torch.float16],
         # The local ratio is a real comparison when the baseline is DeepSpeed's
         # kernel, so --base-data's cross-hardware figure does not apply.
-        native_baseline=_deepspeed_wf6af16 is not None,
+        native_baseline=_deepspeed_cuda_wf6af16 is not None,
     )
     bench.set_train(train_op)
     bench.run()

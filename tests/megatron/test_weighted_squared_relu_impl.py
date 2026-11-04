@@ -292,7 +292,7 @@ def _check(x, weights, clamp_scale):
     return y
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu(shape, dtype):
@@ -302,7 +302,7 @@ def test_weighted_squared_relu(shape, dtype):
     _check(x, weights, None)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_clamped_squared_relu(shape, dtype):
@@ -311,7 +311,7 @@ def test_clamped_squared_relu(shape, dtype):
     _check(x, None, _CLAMP_SCALE)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_clamped_squared_relu(shape, dtype):
@@ -321,7 +321,7 @@ def test_weighted_clamped_squared_relu(shape, dtype):
     _check(x, weights, _CLAMP_SCALE)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("weights_dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_weight_dtype(dtype, weights_dtype):
@@ -333,7 +333,7 @@ def test_weighted_squared_relu_weight_dtype(dtype, weights_dtype):
     _check(x, weights, None)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_values(dtype):
     """Negative, zero, tiny, and clamp-saturating inputs with varied weights."""
@@ -360,7 +360,7 @@ def test_weighted_squared_relu_values(dtype):
     _check(x, weights, _CLAMP_SCALE)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_noncontiguous(dtype):
     utils.init_seed(7)
@@ -380,7 +380,7 @@ def test_weighted_squared_relu_noncontiguous(dtype):
     _check(transposed, transposed_weights, _CLAMP_SCALE)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_empty(dtype):
     for shape in ((0, 8), (2, 0, 8)):
@@ -393,7 +393,7 @@ def test_weighted_squared_relu_empty(dtype):
         _check(x, None, _CLAMP_SCALE)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_does_not_modify_inputs(dtype):
     utils.init_seed(9)
@@ -406,14 +406,14 @@ def test_weighted_squared_relu_does_not_modify_inputs(dtype):
     assert torch.equal(weights, weights_before)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 def test_weighted_squared_relu_rejects_no_weights_and_no_clamp():
     x = torch.randn((16, 64), dtype=torch.bfloat16, device=flag_train.device)
     with pytest.raises(AssertionError):
         flag_train.megatron.weighted_squared_relu_impl(x, None, None)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 def test_weighted_squared_relu_rejects_bad_weights_shape():
     x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
     for shape in ((16,), (16, 2), (1, 1)):
@@ -422,7 +422,7 @@ def test_weighted_squared_relu_rejects_bad_weights_shape():
             flag_train.megatron.weighted_squared_relu_impl(x, weights)
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 def test_weighted_squared_relu_rejects_bad_input():
     weights = torch.rand((16, 1), dtype=torch.float32, device=flag_train.device)
     with pytest.raises(ValueError, match="tensor"):
@@ -436,7 +436,7 @@ def test_weighted_squared_relu_rejects_bad_input():
         )
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.skipif(
     megatron_weighted_squared_relu_impl is None,
     reason="Megatron-LM is not installed",
@@ -496,7 +496,7 @@ _COMPOSITION_VARIANTS = [
 ]
 
 
-@pytest.mark.weighted_squared_relu
+@pytest.mark.weighted_squared_relu_impl
 @pytest.mark.skipif(
     megatron_weighted_squared_relu_impl is None,
     reason="the torch composition is only cross-checked where Megatron runs",

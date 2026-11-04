@@ -15,7 +15,7 @@
 
 Two oracles, because they fail differently:
 
-* ``wf6af16_ref`` -- a plain-torch composition of the same contract (unpack
+* ``cuda_wf6af16_ref`` -- a plain-torch composition of the same contract (unpack
   the codes, dequantize through the FP6-E3M2 value table, matmul in fp32). It
   is the primary check and runs on any device, so the operator is testable
   off NVIDIA.
@@ -27,7 +27,7 @@ Two oracles, because they fail differently:
   will not load there the module raises rather than losing the check quietly.
   On other backends it is an additional check that is skipped.
 
-Checking both is not redundant: ``wf6af16_ref`` is the same arithmetic written
+Checking both is not redundant: ``cuda_wf6af16_ref`` is the same arithmetic written
 from the same reading of the kernel, so a shared misreading of the contract
 would survive it. DeepSpeed's operator is the only oracle that can disagree
 with that reading. Note the packed byte layouts differ (DeepSpeed interleaves
@@ -145,7 +145,7 @@ def unpack_weights_fp6(weights_2bit, weights_4bit):
     return ((top2 << 4) | low4).to(torch.uint8)
 
 
-def wf6af16_ref(hidden_states, weights_2bit, weights_4bit, scales):
+def cuda_wf6af16_ref(hidden_states, weights_2bit, weights_4bit, scales):
     """Reference for the operator, composed from plain torch ops.
 
     Mirrors the kernel's arithmetic: FP6 values are exact in fp16, the scale
@@ -185,14 +185,14 @@ _DEEPSPEED_HYGON_MSG = (
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
 
-def _load_deepspeed_wf6af16():
+def _load_deepspeed_cuda_wf6af16():
     """``(op, version)`` for DeepSpeed's cuda_wf6af16_linear, or ``(None, None)``.
 
     ``InferenceCoreBuilder`` JIT-compiles the CUDA source shipped inside the
     ``deepspeed`` package, then reuses the build cached under
     ``torch_extensions``. The returned callable takes
     ``(hidden_states, codes, scales)`` and returns the fp16 output, matching
-    ``wf6af16_ref``'s signature so tests can swap oracles freely.
+    ``cuda_wf6af16_ref``'s signature so tests can swap oracles freely.
     """
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
         return None, None
@@ -218,7 +218,7 @@ def _load_deepspeed_wf6af16():
             f"_DEEPSPEED_BASELINE_VENDORS."
         ) from exc
 
-    def deepspeed_wf6af16(hidden_states, weights_2bit, weights_4bit, scales):
+    def deepspeed_cuda_wf6af16(hidden_states, weights_2bit, weights_4bit, scales):
         out_channels = scales.shape[0]
         tokens, in_channels = hidden_states.shape
 
@@ -251,25 +251,25 @@ def _load_deepspeed_wf6af16():
         )
         return output
 
-    return deepspeed_wf6af16, deepspeed.__version__
+    return deepspeed_cuda_wf6af16, deepspeed.__version__
 
 
 # Resolved once, at module import time.
-_deepspeed_wf6af16, _DEEPSPEED_VERSION = _load_deepspeed_wf6af16()
+_deepspeed_cuda_wf6af16, _DEEPSPEED_VERSION = _load_deepspeed_cuda_wf6af16()
 
 # The torch reference is always available, so only the DeepSpeed checks skip.
 if (
-    _deepspeed_wf6af16 is None
+    _deepspeed_cuda_wf6af16 is None
     and flag_train.vendor_name == "nvidia"
     and torch.cuda.get_device_capability() != (8, 0)
 ):
     _ORACLE_SKIP_REASON = _DEEPSPEED_AMPERE_ONLY_MSG
-elif _deepspeed_wf6af16 is None and flag_train.vendor_name == "hygon":
+elif _deepspeed_cuda_wf6af16 is None and flag_train.vendor_name == "hygon":
     _ORACLE_SKIP_REASON = _DEEPSPEED_HYGON_MSG
 else:
     _ORACLE_SKIP_REASON = _DEEPSPEED_UNAVAILABLE_MSG
 requires_deepspeed_reference = pytest.mark.skipif(
-    _deepspeed_wf6af16 is None, reason=_ORACLE_SKIP_REASON
+    _deepspeed_cuda_wf6af16 is None, reason=_ORACLE_SKIP_REASON
 )
 
 
@@ -295,7 +295,7 @@ def _run_train(hidden, weights_2bit, weights_4bit, scales, split_k=None):
     output = torch.empty(
         (tokens, out_channels), dtype=torch.float16, device=hidden.device
     )
-    return flag_train.deepspeed.wf6af16_linear(
+    return flag_train.deepspeed.cuda_wf6af16_linear(
         output,
         hidden,
         weights_2bit,
@@ -324,15 +324,15 @@ _SHAPES = [
 ]
 
 
-@pytest.mark.wf6af16_linear
+@pytest.mark.cuda_wf6af16_linear
 @pytest.mark.parametrize("shape", _SHAPES)
-def test_wf6af16_linear(shape):
+def test_cuda_wf6af16_linear(shape):
     """The Triton kernel must match the torch reference on unaligned shapes."""
     tokens, in_channels, out_channels = shape
     hidden, weights_2bit, weights_4bit, scales = _make_case(*shape)
 
     train_out = _run_train(hidden, weights_2bit, weights_4bit, scales)
-    ref_out = wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
+    ref_out = cuda_wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
 
     # atol scales with the reduction length, as in any fp16 GEMM comparison.
     utils.train_assert_close(
@@ -343,14 +343,14 @@ def test_wf6af16_linear(shape):
     )
 
 
-@pytest.mark.wf6af16_linear
+@pytest.mark.cuda_wf6af16_linear
 @pytest.mark.parametrize("split_k", [1, 2, 4, 8])
-def test_wf6af16_linear_split_k(split_k):
+def test_cuda_wf6af16_linear_split_k(split_k):
     """Split-K partials plus the reduction must agree with the single-pass run."""
     hidden, weights_2bit, weights_4bit, scales = _make_case(7, 512, 256)
 
     train_out = _run_train(hidden, weights_2bit, weights_4bit, scales, split_k=split_k)
-    ref_out = wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
+    ref_out = cuda_wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
 
     utils.train_assert_close(
         utils.to_reference(train_out),
@@ -360,13 +360,13 @@ def test_wf6af16_linear_split_k(split_k):
     )
 
 
-@pytest.mark.wf6af16_linear
-def test_wf6af16_linear_split_k_misaligned_falls_back():
+@pytest.mark.cuda_wf6af16_linear
+def test_cuda_wf6af16_linear_split_k_misaligned_falls_back():
     """An explicit split_k whose slices would start mid-byte falls back to 1."""
     hidden, weights_2bit, weights_4bit, scales = _make_case(7, 512, 256)
 
     train_out = _run_train(hidden, weights_2bit, weights_4bit, scales, split_k=3)
-    ref_out = wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
+    ref_out = cuda_wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
 
     utils.train_assert_close(
         utils.to_reference(train_out),
@@ -376,28 +376,28 @@ def test_wf6af16_linear_split_k_misaligned_falls_back():
     )
 
 
-@pytest.mark.wf6af16_linear
-def test_wf6af16_linear_rejects_bad_inputs():
+@pytest.mark.cuda_wf6af16_linear
+def test_cuda_wf6af16_linear_rejects_bad_inputs():
     """Wrong dtypes and non-contiguous tensors are rejected, not miscomputed."""
     hidden, weights_2bit, weights_4bit, scales = _make_case(7, 512, 256)
     output = torch.empty((7, 256), dtype=torch.float16, device=hidden.device)
 
     with pytest.raises(AssertionError):
-        flag_train.deepspeed.wf6af16_linear(
+        flag_train.deepspeed.cuda_wf6af16_linear(
             output, hidden.float(), weights_2bit, weights_4bit, scales, 256, 7, 512
         )
 
     noncontig = torch.randn(512, 7, dtype=torch.float16, device=hidden.device).t()
     with pytest.raises(AssertionError):
-        flag_train.deepspeed.wf6af16_linear(
+        flag_train.deepspeed.cuda_wf6af16_linear(
             output, noncontig, weights_2bit, weights_4bit, scales, 256, 7, 512
         )
 
 
 def _active_gemm():
     """The bare GEMM kernel and the config list of the registered backend."""
-    module = sys.modules[flag_train.deepspeed.wf6af16_linear.__module__]
-    autotuner = module.wf6af16_linear_kernel.fn  # LibEntry -> Autotuner
+    module = sys.modules[flag_train.deepspeed.cuda_wf6af16_linear.__module__]
+    autotuner = module.cuda_wf6af16_linear_kernel.fn  # LibEntry -> Autotuner
     return autotuner.fn, autotuner.configs
 
 
@@ -453,8 +453,8 @@ def _run_config(bare, config, hidden, w2, w4, scales, split_k, wide_load):
         **meta,
     )
     reduce_kernel = sys.modules[
-        "flag_train.deepspeed.wf6af16_linear"
-    ].wf6af16_split_k_reduce_kernel
+        "flag_train.deepspeed.cuda_wf6af16_linear"
+    ].cuda_wf6af16_split_k_reduce_kernel
     total = tokens * out_channels
     reduce_kernel[(triton.cdiv(total, 1024),)](
         workspace, output, total, split_k, BLOCK_SIZE=1024
@@ -462,8 +462,8 @@ def _run_config(bare, config, hidden, w2, w4, scales, split_k, wide_load):
     return output
 
 
-@pytest.mark.wf6af16_linear
-def test_wf6af16_linear_all_configs():
+@pytest.mark.cuda_wf6af16_linear
+def test_cuda_wf6af16_linear_all_configs():
     """Every config in the active autotune space must compute correctly.
 
     Autotune scores speed, not correctness: a config that miscompiles on a
@@ -487,7 +487,7 @@ def test_wf6af16_linear_all_configs():
         (7, 512, 256, 4),
     ]:
         hidden, w2, w4, scales = _make_case(tokens, in_channels, out_channels)
-        ref_out = wf6af16_ref(hidden, w2, w4, scales)
+        ref_out = cuda_wf6af16_ref(hidden, w2, w4, scales)
         for config in configs:
             for wide_load in wide_values:
                 out = _run_config(
@@ -508,7 +508,7 @@ def test_wf6af16_linear_all_configs():
                     ) from e
 
 
-@pytest.mark.wf6af16_linear
+@pytest.mark.cuda_wf6af16_linear
 @requires_deepspeed_reference
 @pytest.mark.parametrize("tokens", [1, 7, 64, 65, 200])
 def test_matches_deepspeed_oracle(tokens):
@@ -521,7 +521,7 @@ def test_matches_deepspeed_oracle(tokens):
     hidden, weights_2bit, weights_4bit, scales = _make_case(tokens, 512, 256)
 
     train_out = _run_train(hidden, weights_2bit, weights_4bit, scales)
-    ds_out = _deepspeed_wf6af16(hidden, weights_2bit, weights_4bit, scales)
+    ds_out = _deepspeed_cuda_wf6af16(hidden, weights_2bit, weights_4bit, scales)
 
     utils.train_assert_close(
         utils.to_reference(train_out),

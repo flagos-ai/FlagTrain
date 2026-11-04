@@ -10,10 +10,10 @@ import `flag_train` 或 `benchmark`**；shape、dtype 和输入构造复制在�
 
 按基线实现所属的库分组：
 
-| 目录 | 算子 |
-|---|---|
-| `deepspeed/` | `lamb`、`lion`、`mixed_gemm`、`mixed_moe_gemm`、`wf6af16_linear`、`packbits`、`unpackbits`、`blocked_flash`、`evoformer_attn` |
-| `megatron/` | `quick_gelu`、`weighted_squared_relu_impl` |
+| 目录 |
+|---|
+| `deepspeed/`
+| `megatron/`
 
 每个文件需要与上游仓库的同名文件逐字节一致。新增或修改基线时以本仓库为准，并将文件
 原样同步到对应后端子目录。

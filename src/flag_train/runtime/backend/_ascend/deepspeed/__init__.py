@@ -20,17 +20,17 @@ which is what ``SpecOpRegistrar`` registers.
 """
 
 from .blocked_flash import blocked_flash
+from .cuda_wf6af16_linear import cuda_wf6af16_linear
 from .evoformer_attn import evoformer_attn
 from .mixed_moe_gemm import mixed_moe_gemm
 from .packbits import packbits
 from .unpackbits import unpackbits
-from .wf6af16_linear import wf6af16_linear
 
 __all__ = [
     "blocked_flash",
+    "cuda_wf6af16_linear",
     "evoformer_attn",
     "mixed_moe_gemm",
     "packbits",
     "unpackbits",
-    "wf6af16_linear",
 ]

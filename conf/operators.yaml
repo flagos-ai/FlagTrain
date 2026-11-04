@@ -42,6 +42,21 @@ ops:
   source: deepspeed.inference.v2.kernels.ragged_ops
   stages:
   - beta: '0.0.0'
+- id: cuda_wf6af16_linear
+  description: Linear layer with FP6-E3M2 weights and FP16 activations.
+  for:
+  - cuda_wf6af16_linear
+  labels:
+  - deepspeed
+  - quantization
+  - linear
+  from:
+  - deepspeed
+  kind:
+  - Quantization
+  source: deepspeed.ops.op_builder.InferenceCoreBuilder
+  stages:
+  - beta: '0.0.0'
 - id: evoformer_attn
   description: Evoformer attention forward kernel (the backward pass is not ported).
   for:
@@ -69,6 +84,54 @@ ops:
   kind:
   - Activation
   source: megatron.core.activations
+  stages:
+  - beta: '0.0.0'
+- id: fused_gated_norm
+  description: 'Fused RMSNorm over the trailing dim plus SiLU gating, with an optional
+    zero-centered weight offset. Forward only; the normalised activation is materialised
+    before the fp32 gating multiply, as upstream does.'
+  for:
+  - fused_gated_norm
+  labels:
+  - megatron
+  - normalization
+  - activation
+  from:
+  - megatron
+  kind:
+  - Normalization
+  source: megatron.core.fusions.fused_gated_norm
+  stages:
+  - beta: '0.0.0'
+- id: fused_h_aggregate_backward
+  description: Gradients of fused_h_aggregate_forward with respect to x and h_pre, the
+    backward of the mHC h_aggregate stage.
+  for:
+  - _torch_h_aggregate_bwd
+  labels:
+  - megatron
+  - tensor
+  from:
+  - megatron
+  kind:
+  - Tensor
+  source: megatron.core.fusions.fused_mhc_kernels
+  stages:
+  - beta: '0.0.0'
+- id: fused_h_aggregate_forward
+  description: 'Collapses the n mHC residual streams into one: out[s, b, c] = sum_i
+    h_pre[s, b, i] * x[s, b, i, c].'
+  for:
+  - native_h_aggregate
+  - FusedHAggregate
+  labels:
+  - megatron
+  - tensor
+  from:
+  - megatron
+  kind:
+  - Tensor
+  source: megatron.core.fusions.fused_mhc_kernels
   stages:
   - beta: '0.0.0'
 - id: fused_indices_to_multihot
@@ -216,7 +279,6 @@ ops:
   stages:
   - beta: '0.0.0'
 - id: multi_tensor_lion
-  file: lion
   description: Fused Lion optimizer update over multiple parameter tensors.
   for:
   - multi_tensor_lion
@@ -257,6 +319,38 @@ ops:
   source: megatron.core.activations
   stages:
   - beta: '0.0.0'
+- id: scaled_masked_softmax_cuda_backward
+  description: 'Gradient of the scaled masked softmax with respect to the scores:
+    scale * y * (dy - sum(dy * y)) over the key axis.'
+  for:
+  - ScaledMaskedSoftmax
+  labels:
+  - megatron
+  - attention
+  - softmax
+  from:
+  - megatron
+  kind:
+  - Attention
+  source: megatron.core.fusions.fused_softmax
+  stages:
+  - beta: '0.0.0'
+- id: scaled_masked_softmax_cuda_forward
+  description: 'Scaled softmax over the key axis with a per-query bool mask: masked
+    keys are dropped and a fully masked row comes out as zeros.'
+  for:
+  - ScaledMaskedSoftmax
+  labels:
+  - megatron
+  - attention
+  - softmax
+  from:
+  - megatron
+  kind:
+  - Attention
+  source: megatron.core.fusions.fused_softmax
+  stages:
+  - beta: '0.0.0'
 - id: scaled_upper_triang_masked_softmax_forward
   description: Scaled softmax with Megatron's upper-triangular causal mask; masked entries are zero.
   for:
@@ -285,18 +379,18 @@ ops:
   - Tensor
   stages:
   - beta: '0.0.0'
-- id: wf6af16_linear
-  description: Linear layer with FP6-E3M2 weights and FP16 activations.
+- id: weighted_squared_relu_impl
+  description: Squared-ReLU activation with optional per-token weights and an optional
+    tanh soft clamp. Forward only.
   for:
-  - cuda_wf6af16_linear
+  - weighted_squared_relu_impl
   labels:
-  - deepspeed
-  - quantization
-  - linear
+  - megatron
+  - activation
   from:
-  - deepspeed
+  - megatron
   kind:
-  - Quantization
-  source: deepspeed.ops.op_builder.InferenceCoreBuilder
+  - Activation
+  source: megatron.core.fusions.fused_weighted_squared_relu
   stages:
   - beta: '0.0.0'

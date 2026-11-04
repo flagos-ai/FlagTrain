@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NVIDIA baseline for wf6af16_linear.
+"""NVIDIA baseline for cuda_wf6af16_linear.
 
 Self-contained module; depends only on torch and deepspeed, and does not import
 ``flag_train`` or ``benchmark``. ``native()`` returns DeepSpeed's
@@ -21,17 +21,17 @@ Ampere) it raises instead of collecting a baseline or falling back to a torch
 reference.
 
 The input construction and FP6 packing are copied from
-``FlagTrain/benchmark/deepspeed/test_wf6af16_linear.py``. DeepSpeed is loaded
+``FlagTrain/benchmark/deepspeed/test_cuda_wf6af16_linear.py``. DeepSpeed is loaded
 lazily on the first call, so ops discovery does not trigger its JIT.
 """
 
 import torch
 
-OP_NAME = "wf6af16_linear"
+OP_NAME = "cuda_wf6af16_linear"
 DTYPES = [torch.float16]
 IS_INPLACE = False
 
-# benchmark/deepspeed/test_wf6af16_linear.py::_WF6AF16_SHAPES
+# benchmark/deepspeed/test_cuda_wf6af16_linear.py::_CUDA_WF6AF16_SHAPES
 _SHAPES = [
     (1, 4096, 4096),
     (4, 4096, 4096),
@@ -77,17 +77,17 @@ def _pack_weights_fp6(codes):
     return weights_2bit.contiguous(), weights_4bit.contiguous()
 
 
-def _load_deepspeed_wf6af16():
+def _load_deepspeed_cuda_wf6af16():
     """DeepSpeed's cuda_wf6af16_linear; raise when it cannot run here."""
     try:
         capability = torch.cuda.get_device_capability()
     except Exception as exc:
         raise RuntimeError(
-            "wf6af16_linear baseline requires an NVIDIA GPU: " f"{exc!r}"
+            "cuda_wf6af16_linear baseline requires an NVIDIA GPU: " f"{exc!r}"
         ) from exc
     if capability != (8, 0):
         raise RuntimeError(
-            "wf6af16_linear baseline requires DeepSpeed's cuda_wf6af16_linear, "
+            "cuda_wf6af16_linear baseline requires DeepSpeed's cuda_wf6af16_linear, "
             f"whose kernel hard-codes compute capability 8.0; this device is "
             f"{capability}."
         )
@@ -99,12 +99,12 @@ def _load_deepspeed_wf6af16():
         inf_module.create_handle()
     except Exception as exc:
         raise RuntimeError(
-            "wf6af16_linear baseline requires DeepSpeed's cuda_wf6af16_linear, "
+            "cuda_wf6af16_linear baseline requires DeepSpeed's cuda_wf6af16_linear, "
             f"which could not be loaded: {exc!r}. Install deepspeed and ensure "
             "its InferenceCore CUDA extension builds on this machine."
         ) from exc
 
-    def deepspeed_wf6af16(hidden_states, weights_2bit, weights_4bit, scales):
+    def deepspeed_cuda_wf6af16(hidden_states, weights_2bit, weights_4bit, scales):
         out_channels = scales.shape[0]
         tokens, in_channels = hidden_states.shape
         output = torch.empty(
@@ -129,29 +129,29 @@ def _load_deepspeed_wf6af16():
         )
         return output
 
-    deepspeed_wf6af16.preprocess_weight = inf_module.preprocess_weight
-    return deepspeed_wf6af16
+    deepspeed_cuda_wf6af16.preprocess_weight = inf_module.preprocess_weight
+    return deepspeed_cuda_wf6af16
 
 
 _DEEPSPEED_WF6 = None
 
 
-def _deepspeed_wf6af16():
+def _deepspeed_cuda_wf6af16():
     global _DEEPSPEED_WF6
     if _DEEPSPEED_WF6 is None:
-        _DEEPSPEED_WF6 = _load_deepspeed_wf6af16()
+        _DEEPSPEED_WF6 = _load_deepspeed_cuda_wf6af16()
     return _DEEPSPEED_WF6
 
 
 def torch_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
     """DeepSpeed W6A16 linear; raises when it cannot be loaded."""
-    return _deepspeed_wf6af16()(hidden, ds_w2, ds_w4, scales)
+    return _deepspeed_cuda_wf6af16()(hidden, ds_w2, ds_w4, scales)
 
 
 def native():
     # Load eagerly so an unavailable DeepSpeed fails here instead of being
     # discovered mid-collection (and silently skipped).
-    _deepspeed_wf6af16()
+    _deepspeed_cuda_wf6af16()
     return torch_op
 
 
@@ -170,7 +170,7 @@ def build_inputs(binding, dtype, device):
 
     weights_2bit, weights_4bit = _pack_weights_fp6(codes.to(device))
 
-    baseline = _deepspeed_wf6af16()
+    baseline = _deepspeed_cuda_wf6af16()
     table = _fp6_e3m2_table()
     fake_fp16 = table[codes.long()].to(torch.float16)
     ds_w2, ds_w4 = baseline.preprocess_weight(fake_fp16)
