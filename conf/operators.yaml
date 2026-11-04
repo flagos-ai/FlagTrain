@@ -266,6 +266,20 @@ ops:
   source: deepspeed.ops.op_builder.FusedLambBuilder
   stages:
   - beta: '0.0.0'
+- id: loco_quantized_reduction
+  description: Dequantize per-device int4/int8 chunks, reduce elementwise, and requantize with a new per-group scale.
+  for:
+  - quantized_reduction
+  labels:
+  - deepspeed
+  - quantization
+  from:
+  - deepspeed
+  kind:
+  - Quantization
+  source: deepspeed.ops.op_builder.QuantizerBuilder
+  stages:
+  - beta: '0.0.0'
 - id: mixed_gemm
   description: Mixed-precision GEMM with weight-only integer quantization.
   for:
