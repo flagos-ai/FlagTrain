@@ -19,9 +19,8 @@ from .scaled_masked_softmax_cuda_forward import scaled_masked_softmax_cuda_forwa
 from .scaled_upper_triang_masked_softmax_forward import (
     scaled_upper_triang_masked_softmax_forward,
 )
-from .weighted_squared_relu_impl import weighted_squared_relu_impl
-
 from .tanh_soft_clamp import tanh_soft_clamp
+from .weighted_squared_relu_impl import weighted_squared_relu_impl
 
 __all__ = [
     "bias_swiglu_impl",
@@ -43,7 +42,6 @@ __all__ = [
     "scaled_upper_triang_masked_softmax_forward",
     "weighted_squared_relu_impl",
     "tanh_soft_clamp",
-
 ]
 
 # The vendor-operator registration for these names runs in flag_train/__init__.py

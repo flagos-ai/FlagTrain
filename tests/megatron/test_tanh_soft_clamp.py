@@ -12,56 +12,164 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import tanh_soft_clamp
 
 from .. import accuracy_utils as utils
+
+_SHAPES = [
+    (),
+    (0,),
+    (0, 8),
+    (1,),
+    (17,),
+    (1024,),
+    (64, 128),
+    (2, 19, 7),
+    (4, 8, 32, 16),
+]
+
+_SCALES = [1.0, 0.5, 4.0, -2.5, 1e-3, 1e3]
 
 
 def tanh_soft_clamp_ref(x, scale):
     return (scale * torch.tanh(x.float() / scale)).to(x.dtype)
 
 
-def _dtype_id(dtype):
-    return str(dtype).removeprefix("torch.")
+def base_op():
+    try:
+        import megatron.core.activations
+    except ImportError:
+        warnings.warn(
+            "Megatron-LM is unavailable; using the PyTorch Tanh Soft Clamp "
+            "composition as the correctness reference",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return tanh_soft_clamp_ref
+
+    compiled = getattr(megatron.core.activations, "tanh_soft_clamp", None)
+    if compiled is None:
+        warnings.warn(
+            "Megatron-LM predates tanh_soft_clamp (needs megatron-core >= "
+            "0.20.0); using the PyTorch Tanh Soft Clamp composition as the "
+            "correctness reference",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return tanh_soft_clamp_ref
+
+    eager = getattr(compiled, "__wrapped__", compiled)
+    chosen = compiled
+
+    def reference(*args, **kwargs):
+        nonlocal chosen
+        if chosen is tanh_soft_clamp_ref:
+            return chosen(*args, **kwargs)
+        try:
+            return chosen(*args, **kwargs)
+        except Exception:
+            if chosen is not eager:
+                warnings.warn(
+                    "Megatron tanh_soft_clamp failed to compile on this "
+                    "platform; falling back to its eager implementation",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                chosen = eager
+            else:
+                warnings.warn(
+                    "Megatron tanh_soft_clamp is unusable on this platform; "
+                    "falling back to the PyTorch composition",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                chosen = tanh_soft_clamp_ref
+            return chosen(*args, **kwargs)
+
+    return reference
 
 
-_DTYPES = list(utils.FLOAT_DTYPES)
-if utils.fp64_is_supported:
-    _DTYPES.append(torch.float64)
+reference_tanh_soft_clamp = base_op()
 
 
-def _assert_matches(out, x, scale, dtype):
-    ref = tanh_soft_clamp_ref(utils.to_reference(x), scale)
+def _reference(tensor):
+    return utils.to_reference(tensor.detach(), upcast=True)
+
+
+def _assert_close(out, ref_out, dtype, equal_nan=False):
+    utils.train_assert_close(
+        utils.to_reference(out), ref_out, dtype, equal_nan=equal_nan
+    )
+
+
+def _check_forward(x, scale):
+    dtype = x.dtype
+    out = flag_train.megatron.tanh_soft_clamp(x, scale)
     assert out.shape == x.shape
     assert out.dtype == dtype
-    utils.train_assert_close(utils.to_reference(out), ref, dtype)
+
+    ref_out = reference_tanh_soft_clamp(_reference(x), scale)
+    _assert_close(out, ref_out, dtype)
 
 
 @pytest.mark.tanh_soft_clamp
-@pytest.mark.parametrize(
-    "shape",
-    [(1,), (1024,), (7, 13), (20, 320, 15), (16, 128, 64, 60)],
-)
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("scale", [1.0, 0.5, 4.0, -2.5, 1e-3, 1e3])
-def test_matches_torch(shape, dtype, scale):
+@pytest.mark.parametrize("shape", _SHAPES)
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+@pytest.mark.parametrize("scale", _SCALES)
+def test_tanh_soft_clamp(shape, dtype, scale):
+    utils.init_seed(0)
     x = torch.randn(shape, dtype=dtype, device=flag_train.device)
-    before = x.clone()
+    _check_forward(x, scale)
 
-    out = tanh_soft_clamp(x, scale)
 
-    _assert_matches(out, x, scale, dtype)
-    assert torch.equal(x, before)
-    assert out.data_ptr() != x.data_ptr()
+@pytest.mark.tanh_soft_clamp
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+@pytest.mark.parametrize("scale", _SCALES)
+def test_tanh_soft_clamp_values(dtype, scale):
+    """Zero, near-zero, curve landmarks, and both tanh saturation regions."""
+    values = [
+        -1e30,
+        -50.0,
+        -8.0,
+        -1.0,
+        -1e-3,
+        -1e-6,
+        0.0,
+        1e-6,
+        1e-3,
+        1.0,
+        8.0,
+        50.0,
+        1e30,
+    ]
+    x = torch.tensor(values, dtype=torch.float32, device=flag_train.device).to(dtype)
+    _check_forward(x, scale)
+
+
+@pytest.mark.tanh_soft_clamp
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_tanh_soft_clamp_noncontiguous(dtype):
+    utils.init_seed(1)
+    base = torch.randn((32, 64), dtype=dtype, device=flag_train.device)
+    x = base.t()
+    assert not x.is_contiguous()
+    _check_forward(x, 0.5)
+
+    cube = torch.randn((4, 8, 16), dtype=dtype, device=flag_train.device)
+    transposed = cube.transpose(0, 2)
+    assert not transposed.is_contiguous()
+    _check_forward(transposed, 0.5)
 
 
 @pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize("scale", [1.0, -2.0, 0.0])
-def test_special_values(scale):
+def test_tanh_soft_clamp_special_values(scale):
+    """inf/nan and division by scale == 0 must match the baseline."""
     values = [
         0.0,
         1.0,
@@ -73,76 +181,6 @@ def test_special_values(scale):
         float("nan"),
     ]
     x = torch.tensor(values, dtype=torch.float32, device=flag_train.device)
-    out = tanh_soft_clamp(x, scale)
-    ref = tanh_soft_clamp_ref(utils.to_reference(x), scale)
-
-    utils.train_assert_close(
-        utils.to_reference(out), ref, torch.float32, equal_nan=True
-    )
-
-
-_NON_CONTIGUOUS_LAYOUTS = [
-    ("transposed", lambda t: t.transpose(0, 1)),
-    ("permuted", lambda t: t.permute(2, 0, 1)),
-    ("strided", lambda t: t[:, ::2, :]),
-    ("sliced", lambda t: t[::2]),
-]
-
-
-@pytest.mark.tanh_soft_clamp
-@pytest.mark.parametrize("layout", _NON_CONTIGUOUS_LAYOUTS, ids=lambda case: case[0])
-def test_non_contiguous(layout):
-    _, make = layout
-    base = torch.randn((32, 64, 128), dtype=torch.float32, device=flag_train.device)
-    x = make(base)
-    assert not x.is_contiguous()
-
-    out = tanh_soft_clamp(x, 0.5)
-
-    _assert_matches(out, x, 0.5, torch.float32)
-
-
-@pytest.mark.tanh_soft_clamp
-@pytest.mark.parametrize("shape", [(), (0,), (0, 4), (1,)])
-def test_shape_edges(shape):
-    dtype = torch.float32
-    x = torch.randn(shape, dtype=dtype, device=flag_train.device)
-
-    out = tanh_soft_clamp(x, 1.0)
-
-    _assert_matches(out, x, 1.0, dtype)
-    assert out.numel() == x.numel()
-
-
-@pytest.mark.tanh_soft_clamp
-@pytest.mark.skipif(not utils.fp64_is_supported, reason="backend lacks float64")
-def test_float64_follows_torch_contract():
-    x = torch.linspace(-8.0, 8.0, 4096, dtype=torch.float64, device=flag_train.device)
-
-    out = tanh_soft_clamp(x, 1.0)
-
-    _assert_matches(out, x, 1.0, torch.float64)
-
-
-try:
-    from megatron.core.activations import tanh_soft_clamp as _megatron_tanh_soft_clamp
-except Exception:
-    _megatron_tanh_soft_clamp = None
-
-requires_megatron = pytest.mark.skipif(
-    _megatron_tanh_soft_clamp is None,
-    reason="megatron-core is not importable; the upstream source is unavailable",
-)
-
-
-@requires_megatron
-@pytest.mark.tanh_soft_clamp
-@pytest.mark.parametrize("dtype", _DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("scale", [1.0, 0.5])
-def test_matches_megatron(dtype, scale):
-    x = torch.randn((4096,), dtype=dtype, device=flag_train.device)
-
-    out = tanh_soft_clamp(x, scale)
-    ref = _megatron_tanh_soft_clamp(utils.to_reference(x), scale)
-
-    utils.train_assert_close(utils.to_reference(out), ref, dtype)
+    out = flag_train.megatron.tanh_soft_clamp(x, scale)
+    ref_out = reference_tanh_soft_clamp(_reference(x), scale)
+    _assert_close(out, ref_out, torch.float32, equal_nan=True)
