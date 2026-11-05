@@ -275,9 +275,6 @@ def test_cuda_wf6af16_linear_perf():
         op_name="cuda_wf6af16_linear",
         torch_op=torch_op,
         dtypes=[torch.float16],
-        # The local ratio is a real comparison when the baseline is DeepSpeed's
-        # kernel, so --base-data's cross-hardware figure does not apply.
-        native_baseline=_deepspeed_cuda_wf6af16 is not None,
     )
     bench.set_train(train_op)
     bench.run()

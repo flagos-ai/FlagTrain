@@ -13,24 +13,33 @@
 # limitations under the License.
 """Performance benchmark for the LAMB operator.
 
-The baseline follows ``_DEEPSPEED_BASELINE_VENDORS`` below:
+The baseline follows ``_DEEPSPEED_BASELINE_VENDORS`` below and mirrors the
+torch_op / ``--base-data`` matrix of FlagGems-vllm:
 
 * on a listed backend, DeepSpeed's ``fused_lamb`` **is** the baseline when it can be
-  built. If it cannot be loaded there the module warns and falls back to
-  ``lamb_ref`` so the benchmark still runs -- the reported baseline name then says
-  which one was actually measured, so it never answers a different question under
-  the DeepSpeed name;
+  built. It is a real on-machine reference, so the local speedup is reported, and
+  ``--base-data`` additionally produces ``compared_speedup`` when it has a record;
+* on a listed backend where ``fused_lamb`` cannot be loaded, ``torch_op`` stays
+  ``None``: the framework then measures Train latency only (``latency_base`` and
+  ``speedup`` are reported as N/A) and ``--base-data`` becomes the only available
+  comparison. Without ``--base-data`` the benchmark still passes; with it, a
+  matching record produces ``compared_speedup`` while a missing one fails the
+  benchmark -- there is no baseline at all in that case;
 * on any other backend the baseline is ``lamb_ref``, the plain-torch composition of
   the same contract, whether or not ``deepspeed`` is installed there. It is not a
   competitor, and the speedup there says how far the kernel is from *a* correct
   implementation rather than from the best one.
+
+``FLAG_TRAIN_ALLOW_TORCH_BASELINE=1`` turns the missing-baseline branch back into
+the old ``lamb_ref`` fallback for a development machine that cannot host the
+DeepSpeed baseline; the reason and the chosen baseline are printed.
 
 Both baselines take the same argument tuple as the operator, so unlike the
 blocked-flash benchmark there is nothing to pre-compute outside the timed region.
 """
 
 import math
-import warnings
+import os
 
 import pytest
 import torch
@@ -139,44 +148,86 @@ def lamb_ref(
 
 
 # Backends whose baseline is DeepSpeed. fused_lamb ships as a CUDA op builder, so
-# only a backend that can compile and execute one can host it. On these the
-# baseline is expected, not mandatory: if it fails to load we warn and fall back
-# to lamb_ref, and the reported baseline name records which one was measured.
+# only a backend that can compile and execute one can host it.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
+
+# Whether a missing DeepSpeed baseline may be replaced by lamb_ref. Default false:
+# on a backend whose baseline is DeepSpeed, a lamb_ref ratio answers a different
+# question under almost the same name. Set FLAG_TRAIN_ALLOW_TORCH_BASELINE=1 on a
+# development machine that cannot host the DeepSpeed baseline.
+_ALLOW_TORCH_BASELINE = os.environ.get(
+    "FLAG_TRAIN_ALLOW_TORCH_BASELINE", ""
+).strip().lower() in ("1", "true", "yes")
 
 
 def _load_deepspeed_lamb():
-    """DeepSpeed's fused_lamb, or ``None`` when it could not be loaded.
+    """``(op, reason)`` -- ``op`` is ``None`` when there is not a usable one.
 
     ``FusedLambBuilder`` JIT-compiles the CUDA source shipped inside the
     ``deepspeed`` package, then reuses the build cached under ``torch_extensions``.
-
-    On a backend in ``_DEEPSPEED_BASELINE_VENDORS`` a load failure is warned about
-    rather than raised: the benchmark still runs, with ``lamb_ref`` as the baseline.
+    A failure is reported, not raised: on a backend in
+    ``_DEEPSPEED_BASELINE_VENDORS`` it makes the vendor-native baseline missing,
+    which the module resolves below.
     """
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
-        return None
+        return None, None
 
     try:
         from deepspeed.ops.op_builder import FusedLambBuilder
 
-        return FusedLambBuilder().load().lamb
-    except Exception as exc:
-        warnings.warn(
-            f"{flag_train.vendor_name!r} is expected to use DeepSpeed's fused_lamb "
-            f"as its baseline, but it could not be loaded: {exc!r}. Falling back to "
-            f"lamb_ref; build deepspeed to enable the fused_lamb baseline.",
-            stacklevel=2,
-        )
-        return None
+        return FusedLambBuilder().load().lamb, None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"could not be loaded: {exc!r}"
 
 
 # Resolved once, so the first-use JIT compile is not counted in the measurement.
-_deepspeed_lamb = _load_deepspeed_lamb()
+_deepspeed_lamb, _DEEPSPEED_REASON = _load_deepspeed_lamb()
 
-_BASELINE = (
-    "deepspeed fused_lamb" if _deepspeed_lamb is not None else "lamb_ref (torch)"
-)
+# Whether this platform owes a DeepSpeed baseline that is not there. On such a
+# backend ``--base-data`` is the only comparison available.
+_BASELINE_REQUIRED = flag_train.vendor_name in _DEEPSPEED_BASELINE_VENDORS
+_DEEPSPEED_BASELINE_MISSING = _BASELINE_REQUIRED and _deepspeed_lamb is None
+
+if _deepspeed_lamb is not None:
+    _TORCH_BASELINE = _deepspeed_lamb
+    _BASELINE = "deepspeed fused_lamb"
+elif _DEEPSPEED_BASELINE_MISSING and not _ALLOW_TORCH_BASELINE:
+    # ``torch_op=None``: the framework measures Train latency only and reports
+    # latency_base/speedup as N/A. ``--base-data`` then supplies the comparison,
+    # and a baseline without a matching record fails -- there is nothing else.
+    _TORCH_BASELINE = None
+    _BASELINE = "none (vendor-native missing; --base-data is the only baseline)"
+    _MISSING_NOTE = (
+        f"{flag_train.vendor_name!r} is expected to use DeepSpeed's fused_lamb as "
+        f"its baseline, but it {_DEEPSPEED_REASON}.\n"
+        "This run has no on-machine baseline: latency_base and speedup are\n"
+        "reported as N/A, and the comparison comes from --base-data (a shape\n"
+        "without a baseline record fails the benchmark).\n"
+        "Set FLAG_TRAIN_ALLOW_TORCH_BASELINE=1 to measure against lamb_ref\n"
+        "instead; that ratio says how far the kernel is from *a* correct\n"
+        "implementation, not from the best one."
+    )
+    print("\n" + "!" * 78)
+    for _line in _MISSING_NOTE.splitlines():
+        print(f"!! {_line}".rstrip())
+    print("!" * 78)
+else:
+    # Any other backend, or an explicit opt-in on a listed one: the plain-torch
+    # composition of the same contract. Not a competitor.
+    _TORCH_BASELINE = lamb_ref
+    _BASELINE = "lamb_ref (torch)"
+    if _DEEPSPEED_BASELINE_MISSING:
+        print("\n" + "!" * 78)
+        for _line in (
+            f"{flag_train.vendor_name!r} is expected to use DeepSpeed's "
+            f"fused_lamb as its baseline, but it {_DEEPSPEED_REASON}.\n"
+            "FLAG_TRAIN_ALLOW_TORCH_BASELINE=1 is set, so this run measures "
+            "against the\nTORCH REFERENCE instead. It is NOT a competitor: every "
+            "ratio below says how\nfar the kernel is from *a* correct "
+            "implementation, not from the best one."
+        ).splitlines():
+            print(f"!! {_line}".rstrip())
+        print("!" * 78)
 
 
 class LambBenchmark(base.GenericBenchmark):
@@ -222,9 +273,19 @@ def _call(op, p, p_copy, m, v, g):
 
 
 def torch_op(p, p_copy, m, v, g):
-    """Baseline, chosen by platform. See the module docstring."""
-    baseline = _deepspeed_lamb if _deepspeed_lamb is not None else lamb_ref
-    return _call(baseline, p, p_copy, m, v, g)
+    """Baseline, chosen by platform. See the module docstring.
+
+    Only reached when ``_TORCH_BASELINE`` exists; ``benchmark/torch_op=None``
+    below is what tells the framework there is no on-machine baseline. Tools
+    that call this directly get a clear error instead of a call on ``None``.
+    """
+    if _TORCH_BASELINE is None:
+        raise RuntimeError(
+            "lamb has no vendor-native baseline on this backend: "
+            "DeepSpeed's fused_lamb is required here and could not be loaded. "
+            "Set FLAG_TRAIN_ALLOW_TORCH_BASELINE=1 to measure against lamb_ref."
+        )
+    return _call(_TORCH_BASELINE, p, p_copy, m, v, g)
 
 
 def train_op(p, p_copy, m, v, g):
@@ -239,12 +300,12 @@ def test_lamb_perf():
     bench = LambBenchmark(
         input_fn=lamb_input_fn,
         op_name="lamb",
-        torch_op=torch_op,
+        # None when this backend owes a DeepSpeed baseline that is not there:
+        # the framework then skips the baseline timing (N/A) and leaves the
+        # comparison to --base-data.
+        torch_op=torch_op if _TORCH_BASELINE is not None else None,
         # fused_lamb only supports float32 parameters/state.
         dtypes=[torch.float32],
-        # The local ratio is a real comparison when the baseline is DeepSpeed's
-        # fused_lamb, so --base-data's cross-hardware figure does not apply.
-        native_baseline=_deepspeed_lamb is not None,
     )
     bench.set_train(train_op)
     bench.run()

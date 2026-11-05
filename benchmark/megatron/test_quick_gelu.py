@@ -64,7 +64,7 @@ def _load_mcore_quick_gelu():
         return None
 
 
-# Resolved once, so the baseline is the same one ``native_baseline`` describes.
+# Resolved once, so every benchmark below measures the same baseline.
 _mcore_quick_gelu = _load_mcore_quick_gelu()
 
 
@@ -104,9 +104,6 @@ def _run(is_backward):
         torch_op=base_op(),
         dtypes=_dtypes(),
         is_backward=is_backward,
-        # Megatron's own activation is a real local baseline; the torch
-        # composition is not, and --base-data still applies to it.
-        native_baseline=_mcore_quick_gelu is not None,
     )
     bench.set_train(flag_train.megatron.quick_gelu)
     # On Ascend, enable parallel scheduling of all blocks to avoid excessive logical cores

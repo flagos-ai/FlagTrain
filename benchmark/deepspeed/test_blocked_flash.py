@@ -484,10 +484,6 @@ def test_blocked_flash_perf():
         # kernel's inner loop is dtype-parametric and the two can rank
         # differently against a baseline that has its own dtype-specific paths.
         dtypes=[torch.float16, torch.bfloat16],
-        # On the DeepSpeed tier the baseline is the upstream kernel itself, so
-        # --base-data's cross-hardware figure does not apply. The torch fallback
-        # is not a real baseline.
-        native_baseline=_deepspeed_blocked_flash is not None,
     )
     bench.set_train(train_op)
     bench.run()
