@@ -296,9 +296,7 @@ class DynamicOpOverride:
         # the first override as the "original": that would leak the alias and
         # make restore() put the override back instead of the real value.
         is_new = full_name not in self._originals
-        original = (
-            vars(module).get(target.attr_name, _MISSING) if is_new else _MISSING
-        )
+        original = vars(module).get(target.attr_name, _MISSING) if is_new else _MISSING
 
         setattr(module, target.attr_name, impl_func)
 
@@ -327,14 +325,12 @@ class DynamicOpOverride:
         overrides, originals, tracked, call_counts = snapshot
 
         for full_name in set(self._originals) | set(self._overrides):
-            unchanged_override = (
-                overrides.get(full_name, _MISSING)
-                is self._overrides.get(full_name, _MISSING)
-            )
-            unchanged_original = (
-                originals.get(full_name, _MISSING)
-                is self._originals.get(full_name, _MISSING)
-            )
+            unchanged_override = overrides.get(
+                full_name, _MISSING
+            ) is self._overrides.get(full_name, _MISSING)
+            unchanged_original = originals.get(
+                full_name, _MISSING
+            ) is self._originals.get(full_name, _MISSING)
             if unchanged_override and unchanged_original:
                 continue
 
@@ -354,9 +350,7 @@ class DynamicOpOverride:
                     elif attr_name in vars(module):
                         delattr(module, attr_name)
             except Exception as exc:
-                warnings.warn(
-                    f"Failed to roll back override for '{full_name}': {exc}"
-                )
+                warnings.warn(f"Failed to roll back override for '{full_name}': {exc}")
 
         self._overrides = overrides
         self._originals = originals
@@ -418,9 +412,7 @@ class DynamicOpOverride:
     def _restore_target(self, full_name: str) -> bool:
         """Restore a canonical ``module.attribute`` identity."""
         if full_name not in self._originals:
-            warnings.warn(
-                f"Operator '{full_name}' was not overridden by this registry"
-            )
+            warnings.warn(f"Operator '{full_name}' was not overridden by this registry")
             return False
 
         module_name, attr_name = full_name.rsplit(".", 1)

@@ -26,7 +26,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-
 from _flagtrain_override_host.cli_override import (
     apply_overrides_from_args,
     load_override_config,
@@ -91,9 +90,7 @@ def test_host_suite_import_preserves_existing_flag_train_modules():
     sys.modules["flag_train"] = sentinel_root
     sys.modules["flag_train.megatron"] = sentinel_child
     try:
-        runpy.run_path(
-            str(_HOST_DIR / "conftest.py"), run_name="_host_conftest_probe"
-        )
+        runpy.run_path(str(_HOST_DIR / "conftest.py"), run_name="_host_conftest_probe")
         runpy.run_path(
             str(_HOST_DIR / "test_dynamic_override.py"),
             run_name="_host_tests_probe",
@@ -123,9 +120,7 @@ def test_explicit_qualified_paths_register_call_and_restore(operator_tree, spec)
     assert registry.override(spec, candidate)
     assert operator_tree.package("megatron").fused_proj_rms_backward is candidate
     assert operator_tree.package("megatron").fused_proj_rms_backward() == "new"
-    assert registry.list_overrides() == [
-        "flag_train.megatron.fused_proj_rms_backward"
-    ]
+    assert registry.list_overrides() == ["flag_train.megatron.fused_proj_rms_backward"]
 
     assert registry.restore(spec)
     assert operator_tree.package("megatron").fused_proj_rms_backward is original
@@ -384,9 +379,7 @@ def test_cli_ambiguous_name_exits_with_alternatives(operator_tree, capsys):
     _add_export(operator_tree, "deepspeed", "shared_op", "deepspeed")
 
     with pytest.raises(SystemExit):
-        apply_overrides_from_args(
-            _args(override=["shared_op=/tmp/does-not-matter.py"])
-        )
+        apply_overrides_from_args(_args(override=["shared_op=/tmp/does-not-matter.py"]))
 
     stderr = capsys.readouterr().err
     assert "ambiguous" in stderr
@@ -445,9 +438,7 @@ def test_failed_cli_application_restores_preexisting_overrides_exactly(
     old_tracked = set(registry._tracked)
     old_counts = dict(registry._call_counts)
 
-    with pytest.raises(SystemExit), pytest.warns(
-        UserWarning, match="Failed to load"
-    ):
+    with pytest.raises(SystemExit), pytest.warns(UserWarning, match="Failed to load"):
         apply_overrides_from_args(
             _args(
                 override=[
@@ -532,9 +523,7 @@ def test_failed_later_config_candidate_rolls_back_earlier_config_entry(
     )
     registry = DynamicOpOverride()
 
-    with pytest.raises(SystemExit), pytest.warns(
-        UserWarning, match="Failed to load"
-    ):
+    with pytest.raises(SystemExit), pytest.warns(UserWarning, match="Failed to load"):
         apply_overrides_from_args(
             _args(override_config=str(config_path)), registry=registry
         )
