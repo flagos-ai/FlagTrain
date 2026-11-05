@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compare both Triton backends against dequantization plus per-expert PyTorch GEMMs."""
+"""Performance benchmark for the mixed_moe_gemm operator.
+
+There is no vendor-native baseline: DeepSpeed has no ``mixed_moe_gemm``, so the
+only local implementation of the same contract is a dequantization plus
+per-expert PyTorch GEMM loop. A torch composition is not a competitor and is
+not timed: ``torch_op`` is ``None``, the benchmark reports Train latency only,
+and ``--base-data`` is the only comparison. The same composition is still used
+as an untimed correctness check in the input builder.
+"""
 
 import math
 
@@ -42,8 +50,11 @@ class MixedMoEGEMMBenchmark(base.GenericBenchmark):
         return []
 
 
-def torch_op(output, x, weights, scales, biases, rows, num_bits, activation):
-    """Baseline includes unpacking, dequantization, bias, and activation.
+_BASELINE = "none (no on-machine baseline; --base-data is the only comparison)"
+
+
+def _reference(output, x, weights, scales, biases, rows, num_bits, activation):
+    """Untimed oracle: unpacking, dequantization, bias, and activation.
 
     Benchmark workloads allocate equally many tokens to every expert, so row
     boundaries are known from shapes; no device-to-host copies are timed.
@@ -96,7 +107,7 @@ def input_fn(shape, dtype, device, num_bits, activation):
     x = torch.randn((experts * tokens, k), dtype=dtype, device=device)
     output = torch.empty((experts * tokens, n), dtype=dtype, device=device)
     args = (output, x, weights, scales, biases, rows, num_bits, activation)
-    expected = torch_op(*args).clone()
+    expected = _reference(*args).clone()
     flag_train.deepspeed.mixed_moe_gemm(*args)
     tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-3
     torch.testing.assert_close(output, expected, rtol=tolerance, atol=tolerance)
@@ -115,10 +126,13 @@ def test_mixed_moe_gemm_perf(num_bits, activation):
     def make_inputs(shape, dtype, device):
         yield from input_fn(shape, dtype, device, num_bits, activation)
 
+    print(f"\nBaseline: {_BASELINE}")
     bench = MixedMoEGEMMBenchmark(
         input_fn=make_inputs,
         op_name="mixed_moe_gemm",
-        torch_op=torch_op,
+        # None: no vendor-native implementation exists, and a torch composition
+        # is not timed as a baseline, so --base-data supplies the comparison.
+        torch_op=None,
         dtypes=[torch.float16, torch.bfloat16],
     )
     bench.set_train(flag_train.deepspeed.mixed_moe_gemm)

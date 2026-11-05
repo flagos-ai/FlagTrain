@@ -19,13 +19,16 @@ The baseline is picked by what the platform can run, in two tiers:
   baseline. It is the kernel this port is a port *of*, which makes it the only
   baseline that answers "what did the port cost". The loader probes the compiled
   op; if it cannot be built (a runtime-only CUDA install has no ``nvcc``) the
-  loader warns and this run falls back to the next tier, and the printed
+  loader warns and this run has no on-machine baseline, and the printed
   ``_BASELINE`` line names what was actually timed;
-* everywhere else, ``blocked_flash_ref``, the plain-torch composition over the
-  same paged cache. It is not a competitor, and the speedup there says how far
-  the kernel is from *a* correct implementation rather than from the best one.
+* everywhere else there is no on-machine baseline. The tests'
+  ``blocked_flash_ref``, a plain-torch composition over the same paged cache,
+  stays their accuracy oracle and is not timed here: a ratio against a
+  composition says how far the kernel is from *a* correct implementation rather
+  than from the best one. ``torch_op`` is ``None``, so the framework reports
+  Train latency only and ``--base-data`` is the only comparison.
 
-``flash_attn`` is deliberately not a tier: the two baselines above share the
+``flash_attn`` is deliberately not a tier: the DeepSpeed baseline shares the
 operator's paged-KV contract, and a dense attention package would be handed a
 gathered KV buffer, so timing it answers how the kernel compares to a
 convert-then-attend path rather than what the paged kernel costs.
@@ -52,95 +55,18 @@ from flag_train.deepspeed.blocked_flash import (
 from .. import base
 
 # ---------------------------------------------------------------------------
-# Reference implementation
-#
-# The fallback baseline when DeepSpeed's kernel is unavailable: a plain-torch
-# composition of the same contract, reading the *same* atoms and the *same* paged
-# cache as the kernel.
-#
-# !! KEEP IN SYNC with tests/deepspeed/test_blocked_flash.py !!
-#
-# This is a second, byte-identical copy of the reference that file uses as its
-# primary oracle. The duplication is deliberate -- a reference belongs to the
-# tests that check against it, not to the operator package, so that a checked
-# implementation is never code the operator ships. The cost is that the two
-# copies can drift: change one and you must change the other, or this benchmark
-# will measure against a different contract than the tests accept.
-# ---------------------------------------------------------------------------
-
-
-def blocked_flash_ref(
-    out,
-    q,
-    k,
-    v,
-    attention_atoms,
-    kv_block_idx,
-    softmax_scale,
-    is_causal=True,
-):
-    """Reference for the ``blocked_flash`` operator, from plain torch ops.
-
-    Walks the atoms one at a time, gathers each atom's KV out of the paged cache
-    into a dense window, and runs the attention in torch.
-    """
-    head_size = k.size(-1)
-    n_heads_q = q.size(-1) // head_size
-    n_heads_kv = k.size(-2)
-    group = n_heads_q // n_heads_kv
-    device = q.device
-
-    for atom in attention_atoms.tolist():
-        block_offset, _, q_start, q_len, kv_blocks, total_extent, global_q_idx, _ = atom
-        if q_len == 0 or kv_blocks == 0:
-            continue
-
-        blocks = kv_block_idx[block_offset : block_offset + kv_blocks].long()
-        # Gather the atom's blocks, drop the padding past total_extent, and repeat
-        # each KV head for the query heads that share it.
-        k_atom = k[blocks].reshape(-1, n_heads_kv, head_size)[:total_extent]
-        v_atom = v[blocks].reshape(-1, n_heads_kv, head_size)[:total_extent]
-        k_atom = k_atom.repeat_interleave(group, dim=1).transpose(0, 1).float()
-        v_atom = v_atom.repeat_interleave(group, dim=1).transpose(0, 1).float()
-
-        q_atom = q[q_start : q_start + q_len].reshape(q_len, n_heads_q, head_size)
-        q_atom = q_atom.transpose(0, 1).float()
-
-        scores = torch.matmul(q_atom, k_atom.transpose(-1, -2)) * softmax_scale
-        if is_causal:
-            # The mask compares sequence positions, so a continuation's first query
-            # is offset by the history it was given rather than starting at zero.
-            q_pos = torch.arange(q_len, device=device) + global_q_idx
-            k_pos = torch.arange(total_extent, device=device)
-            scores = scores.masked_fill(
-                k_pos[None, None, :] > q_pos[None, :, None], float("-inf")
-            )
-
-        probs = torch.softmax(scores, dim=-1)
-        atom_out = torch.matmul(probs, v_atom).transpose(0, 1)
-        out[q_start : q_start + q_len] = atom_out.reshape(
-            q_len, n_heads_q * head_size
-        ).to(out.dtype)
-
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Atom-building convenience
 #
 # !! KEEP IN SYNC with tests/deepspeed/test_blocked_flash.py !!
 #
-# That file carries a second copy of this function. Like the reference above it
-# is scaffolding rather than operator API, so it lives with the tests that use it
-# rather than in the package -- ``flag_train.deepspeed``'s surface stays to the
-# names the reference implementation exposes. The cost is the usual one: change
-# this copy and you must change that one, or the tests will build their atoms a
-# different way than the tests accept.
+# That file carries a second copy of this function. It is scaffolding rather
+# than operator API, so it lives with the tests that use it rather than in the
+# package. The cost is the usual one: change this copy and you must change that
+# one, or the tests will build their atoms a different way than the tests accept.
 # ---------------------------------------------------------------------------
 
 # The atom layout's stride, in int32 slots. See ``blocked_flash.py``'s module
-# docstring for the field meanings; the reference above already unpacks the
-# eight slots positionally, so this is the same knowledge given a name.
+# docstring for the field meanings.
 _ATOM_SLOTS = 8
 
 
@@ -183,11 +109,12 @@ def build_blocked_flash_atoms(seq_params, q_block_size, kv_block_size, device):
 #   the baseline -- it is the operator being ported, and measuring anything else
 #   answers a different question. The loader probes the compiled op, so an
 #   environment that cannot build it (a runtime-only CUDA install has no
-#   ``nvcc``) warns and drops to the fallback rather than crashing at the first
-#   timed call;
-# * everywhere else the plain-torch composition over the same paged cache, which
-#   is not a competitor: the speedup says how far the kernel is from *a* correct
-#   implementation, not from the best one.
+#   ``nvcc``) warns and this run has no on-machine baseline rather than crashing
+#   at the first timed call;
+# * everywhere else there is no baseline: the plain-torch composition over the
+#   same paged cache is not a competitor, and timing it would report how far the
+#   kernel is from *a* correct implementation rather than from the best one, so
+#   ``torch_op`` is None and the comparison is ``--base-data``'s.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
 
@@ -238,8 +165,11 @@ if _deepspeed_blocked_flash is not None:
     _ORACLE = "deepspeed"
     _BASELINE = "deepspeed BlockedFlashAttn"
 else:
-    _ORACLE = "torch_ref"
-    _BASELINE = "blocked_flash_ref (torch, paged KV)"
+    _ORACLE = "none"
+    _BASELINE = "none (no on-machine baseline; --base-data is the only comparison)"
+
+# Only the DeepSpeed kernel may be timed; the torch composition is not a valid
+# baseline (see the module docstring).
 
 # (context_length, head_size, n_heads_q, n_heads_kv). Blocked attention needs
 # head_size <= 256 and a compute capability of 8.0 or better; the cache's block
@@ -337,9 +267,9 @@ def _deepspeed_geometry(head_size):
     Handed a cache built at another block size, the kernel walks it at the wrong
     pitch and reads the wrong tokens. Measured on an A100 at head_size 64, a
     64-token block moves this baseline's own output by 5.7 where the operator
-    under test differs from the reference by 2e-3 -- so the two are not computing
-    the same thing, and a ratio between them would be a ratio between two
-    different questions.
+    under test differs from the tests' reference by 2e-3 -- so the two are not
+    computing the same thing, and a ratio between them would be a ratio between
+    two different questions.
     """
     from deepspeed.inference.v2.kernels.ragged_ops.blocked_flash.blocked_flash import (
         get_kv_block_size,
@@ -417,7 +347,7 @@ def blocked_flash_input_fn(shape, dtype, device):
     )
 
 
-def torch_op(
+def _baseline(
     out,
     q,
     k,
@@ -428,20 +358,22 @@ def torch_op(
     deepspeed_pinned,
     q_block_size,
 ):
-    """Baseline, chosen by platform. See the module docstring.
+    """DeepSpeed's blocked-flash kernel. See the module docstring.
 
-    ``q_block_size`` is the operator under test's to use; a baseline works its own
-    geometry out, and the two tiers want different ones for the same head size.
-    It is taken and ignored rather than left out so that both ops are handed the
-    same tuple.
+    ``q_block_size`` is the operator under test's to use; the baseline works its
+    own geometry out, and the DeepSpeed kernel wants a different KV block size
+    for the same head size. It is taken and ignored rather than left out so that
+    both ops are handed the same tuple.
     """
-    if _deepspeed_blocked_flash is not None:
-        # Same paged tensors as the operator under test -- this baseline reads the
-        # cache the way ours does -- plus the atoms that carry host pointers.
-        return _deepspeed_kernel(k.size(-1), out.dtype)(
-            out, q, k, v, deepspeed_atoms, _SOFTMAX_SCALE
-        )
-    return blocked_flash_ref(out, q, k, v, atoms, kv_block_idx, _SOFTMAX_SCALE)
+    # Same paged tensors as the operator under test -- this baseline reads the
+    # cache the way ours does -- plus the atoms that carry host pointers.
+    return _deepspeed_kernel(k.size(-1), out.dtype)(
+        out, q, k, v, deepspeed_atoms, _SOFTMAX_SCALE
+    )
+
+
+# ``None`` is the benchmark harness's "no on-machine baseline" sentinel.
+torch_op = _baseline if _deepspeed_blocked_flash is not None else None
 
 
 def train_op(
@@ -479,6 +411,8 @@ def test_blocked_flash_perf():
     bench = BlockedFlashBenchmark(
         input_fn=blocked_flash_input_fn,
         op_name="blocked_flash",
+        # None when neither native kernel exists: a torch composition is not
+        # timed as a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
         # The blocked kernel supports fp16 and bf16; both are measured, since the
         # kernel's inner loop is dtype-parametric and the two can rank
@@ -497,7 +431,7 @@ def test_blocked_flash_perf():
 # Port of DeepSpeed's ``AtomBuilder`` (``ragged_ops/atom_builder``). Upstream it
 # is a *separate* operator -- its own directory, its own ``DSKernelBase``
 # subclass, its own ``test_atom_builder.py`` -- and it is kept out of the
-# operator module here for the same reason the reference above is: nothing but
+# operator module here for the same reason the tests' reference is: nothing but
 # the tests calls it. ``blocked_flash`` takes atoms as an argument and needs no
 # producer; the layer that would supply one (``DSDenseBlockedAttention``) is not
 # ported yet, so shipping one would be exporting a name no caller exercises.

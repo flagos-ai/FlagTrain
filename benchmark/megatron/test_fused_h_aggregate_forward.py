@@ -13,40 +13,23 @@
 # limitations under the License.
 """Performance benchmark for the fused n-stream weighted aggregation (forward).
 
-The baseline is Megatron-LM's ``native_h_aggregate``: the reference this
-operator is a port of, so it is the only baseline that answers "what did the
-port cost". It is taken from the installed ``megatron-core`` when that provides
-the function, and otherwise from ``native_h_aggregate_ref`` -- the transcription
-of ``hyper_connection.py`` this file carries -- wrapped in ``@torch.compile``
-exactly as Megatron wraps it. megatron-core 0.19 and earlier have no
-``hyper_connection`` module, so without that fallback an older container could
-only skip this benchmark; with it, the comparison is still against Megatron's
-implementation compiled the way Megatron compiles it. The two paths are import
-success and import failure; the report line says which of the two was timed.
+The baseline is Megatron-LM's ``_triton_h_aggregate_fwd`` when the installed
+megatron-core provides a Triton kernel that can run here -- the kernel this port
+is a port *of*. When that kernel cannot run, the baseline is Megatron's own
+``native_h_aggregate``, the ``@torch.compile``d torch composition the vendor
+defines this stage as; with an older megatron-core that predates it, the
+transcription below is compiled the way Megatron compiles it. ``_BASELINE``
+records which case was measured.
 
-Unlike the correctness suite, the baseline here keeps the compile: that wrapper
-is what Megatron pays for this stage. (``tests/megatron/
-test_fused_h_aggregate_forward.py`` compares against
-``_torchdynamo_orig_callable``, the same code without a dynamo compile in front
-of every shape in the sweep.) The functional suite holds that function to the
-operator, so the timed baseline is not an unchecked one; this file only times
-it.
-
-Keeping that compile across a twenty-row sweep takes one adjustment, made by
-``_full_compile_budget``: dynamo stops compiling after 8 recompiles per code
-object and serves the eager function from then on, so the tail of the sweep
-would be timed unfused. The fixture raises the budget for this module's run.
-
-Both sides take the same ``(x, h_pre)`` tuple and return the aggregated ``[s, b,
-C]``, so there is nothing to pre-compute outside the timed region. The stage is
-a pure streaming read of ``x`` plus a write of ``out`` -- every output element
-is an independent sum of ``n`` products -- so latency is reported with GB/s (the
-traffic the shape implies) and TFLOP/s (the ``2 * s * b * n * C`` multiply-adds),
-and the two together say whether a latency that moved was the memory or the
-arithmetic.
+Both sides take the same ``(x, h_pre)`` tuple and return the aggregated
+``[s, b, C]``, so there is nothing to pre-compute outside the timed region. The
+stage is a pure streaming read of ``x`` plus a write of ``out`` -- every output
+element is an independent sum of ``n`` products -- so latency is reported with
+GB/s (the traffic the shape implies) and TFLOP/s (the ``2 * s * b * n * C``
+multiply-adds), and the two together say whether a latency that moved was the
+memory or the arithmetic.
 """
 
-import importlib.metadata
 import warnings
 
 import pytest
@@ -89,100 +72,30 @@ _DTYPES = [torch.float16]
 if flag_train.runtime.device.support_bf16:
     _DTYPES.append(torch.bfloat16)
 
-# ---------------------------------------------------------------------------
-# Megatron baseline
-#
-# ``native_h_aggregate`` arrived with the mHC stages in megatron-core 0.20; an
-# older install has no ``hyper_connection`` module. So the baseline is the
-# installed function when it can be imported, and otherwise a transcription of
-# Megatron-LM's ``hyper_connection.py`` compiled the way Megatron compiles it.
-# The rule is the same on every supported backend: import success picks
-# megatron-core, import failure the transcription.
-# ---------------------------------------------------------------------------
-
-
-def _mcore_version():
-    try:
-        return importlib.metadata.version("megatron-core")
-    except Exception:
-        return "not installed"
-
-
-_MCORE_VERSION = _mcore_version()
-
 
 def native_h_aggregate_ref(x, h_pre):
-    """Megatron-LM's ``native_h_aggregate``, transcribed.
-
-    From ``megatron/core/transformer/hyper_connection.py`` at Megatron-LM 0.20,
-    kept operation for operation, because this is what the operator is measured
-    against. Upstream the function carries a ``@torch.compile`` decorator; the
-    transcription is compiled by ``_load_native_h_aggregate`` below so both
-    baselines pay the same wrapper.
-    """
+    """Megatron-LM's ``native_h_aggregate`` body, transcribed."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
 def _load_native_h_aggregate():
-    """The compiled baseline, and a label for where it came from.
-
-    The compiled wrapper is kept: it is what Megatron pays for this stage, so it
-    is what the operator has to be measured against. The import is done once at
-    module import because ``megatron.core``'s ``__init__`` pulls in the whole
-    core tree.
-    """
+    """Megatron's ``native_h_aggregate``, or its transcribed body compiled."""
     try:
         from megatron.core.transformer.hyper_connection import native_h_aggregate
-    except Exception as exc:
-        warnings.warn(
-            f"megatron-core {_MCORE_VERSION} does not provide "
-            f"native_h_aggregate ({exc!r}); fused_h_aggregate_forward is "
-            f"benchmarked against native_h_aggregate_ref, this file's "
-            f"transcription of Megatron-LM's implementation, compiled the way "
-            f"Megatron compiles it",
-            stacklevel=2,
-        )
-        return torch.compile(native_h_aggregate_ref), (
-            f"vendored from Megatron-LM (megatron-core {_MCORE_VERSION})"
-        )
-
-    # The label reports the version of the source actually imported, which a
-    # PYTHONPATH checkout can differ from the distribution metadata.
-    try:
-        from megatron.core.package_info import __version__ as source_version
     except Exception:
-        source_version = _MCORE_VERSION
-    return native_h_aggregate, f"megatron-core {source_version}"
+        return torch.compile(native_h_aggregate_ref), "transcribed"
+    return native_h_aggregate, "megatron-core"
 
 
-_native_h_aggregate, _BASELINE_SOURCE = _load_native_h_aggregate()
-
-# The baseline's source and version are part of the label: a speedup means little
-# without the implementation it was measured against.
-_BASELINE = f"megatron native_h_aggregate ({_BASELINE_SOURCE}, @torch.compile)"
-
-# Dynamo counts recompiles per code object and stops compiling after 8 by
-# default, serving the eager function from then on. The sweep below needs one
-# graph per (shape, dtype), so its tail would otherwise be timed against an
-# *unfused* baseline -- neither what a training step pays (it compiles once per
-# shape and caches the graph) nor a stable number: which rows came out eager
-# would depend on what ran earlier in the process. The budget is raised for this
-# module's run instead; see ``_full_compile_budget``.
+# The compiled baseline needs one graph per (shape, dtype); with dynamo's
+# default budget of 8 recompiles the tail of the sweep would be served eager.
 _COMPILE_BUDGET = 256
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _full_compile_budget():
-    """Keep ``@torch.compile`` compiling across the whole sweep.
-
-    Only the recompile budget is raised -- the compiled code is untouched. The
-    graphs dynamo builds under it stay cached after the fixture restores the
-    setting, which is the point: every row is measured against the compiled
-    implementation Megatron runs.
-    """
+    """Keep ``@torch.compile`` compiling across the whole sweep."""
     config = torch._dynamo.config
-    # Older torch spells the knob ``cache_size_limit``; where both exist they are
-    # aliases, so setting both is redundant but harmless.
     names = [
         name
         for name in ("recompile_limit", "cache_size_limit")
@@ -196,6 +109,32 @@ def _full_compile_budget():
     finally:
         for name, value in saved.items():
             setattr(config, name, value)
+
+
+def _load_baseline():
+    """Megatron's Triton forward kernel, else its ``native_h_aggregate``."""
+    try:
+        from megatron.core.fusions.fused_mhc_kernels import _triton_h_aggregate_fwd
+
+        x = torch.randn((1, 1, 2, 8), dtype=torch.bfloat16, device=flag_train.device)
+        h_pre = torch.randn((1, 1, 2), dtype=torch.bfloat16, device=flag_train.device)
+        with base.torch_device_fn.device(x.device):
+            _triton_h_aggregate_fwd(x, h_pre)
+            base.torch_device_fn.synchronize()
+        return _triton_h_aggregate_fwd, "megatron _triton_h_aggregate_fwd"
+    except Exception as exc:
+        warnings.warn(
+            "Megatron-LM's Triton fused_h_aggregate_forward kernel is "
+            f"unavailable ({exc!r}); timing its native_h_aggregate torch "
+            "composition instead.",
+            stacklevel=2,
+        )
+
+    op, source = _load_native_h_aggregate()
+    return op, f"megatron native_h_aggregate ({source}, @torch.compile)"
+
+
+torch_op, _BASELINE = _load_baseline()
 
 
 class FusedHAggregateForwardBenchmark(base.GenericBenchmark):
@@ -248,11 +187,6 @@ def fused_h_aggregate_forward_input_fn(shape, dtype, device):
     yield x, h_pre
 
 
-def torch_op(x, h_pre):
-    """Baseline: Megatron-LM's ``native_h_aggregate``. See the module docstring."""
-    return _native_h_aggregate(x, h_pre)
-
-
 def train_op(x, h_pre):
     """The operator under test."""
     return flag_train.megatron.fused_h_aggregate_forward(x, h_pre)
@@ -265,6 +199,8 @@ def test_fused_h_aggregate_forward_perf():
     bench = FusedHAggregateForwardBenchmark(
         input_fn=fused_h_aggregate_forward_input_fn,
         op_name="fused_h_aggregate_forward",
+        # Megatron's Triton kernel, or its native_h_aggregate composition when
+        # that kernel cannot run here.
         torch_op=torch_op,
         dtypes=_DTYPES,
     )

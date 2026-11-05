@@ -52,14 +52,16 @@ _EXTENSION = "scaled_upper_triang_masked_softmax_cuda"
 
 
 # ``megatron-core``'s pip wheel ships the class but not the Apex extension its
-# forward imports, so probe the extension and fall back to the torch composition.
+# forward imports, so probe the extension. A missing kernel leaves the run with
+# no on-machine baseline rather than a torch composition.
 def _load_megatron_apply():
     try:
         from megatron.core.fusions.fused_softmax import ScaledUpperTriangMaskedSoftmax
     except Exception as exc:
         warnings.warn(
             "Megatron-LM's ScaledUpperTriangMaskedSoftmax could not be imported "
-            f"({exc!r}); measuring scaled_upper_triang_masked_softmax_ref.",
+            f"({exc!r}). This run has no on-machine baseline; a torch "
+            "composition is not timed, so --base-data is the only comparison.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -70,8 +72,9 @@ def _load_megatron_apply():
     ):
         warnings.warn(
             "Megatron-LM's ScaledUpperTriangMaskedSoftmax needs the Apex CUDA "
-            f"extension {_EXTENSION!r}, which is not installed; measuring "
-            "scaled_upper_triang_masked_softmax_ref.",
+            f"extension {_EXTENSION!r}, which is not installed. This run has no "
+            "on-machine baseline; a torch composition is not timed, so "
+            "--base-data is the only comparison.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -80,28 +83,14 @@ def _load_megatron_apply():
 
 
 # Resolved once, so the first-use import is not counted in the measurement.
-_megatron_apply = _load_megatron_apply()
+# ``None`` is the benchmark harness's "no on-machine baseline" sentinel; the
+# harness checks ``torch_op is not None`` before timing anything.
+torch_op = _load_megatron_apply()
 _BASELINE = (
     "megatron-core ScaledUpperTriangMaskedSoftmax"
-    if _megatron_apply is not None
-    else "scaled_upper_triang_masked_softmax_ref (torch)"
+    if torch_op is not None
+    else "none (no on-machine baseline; --base-data is the only comparison)"
 )
-
-
-def scaled_upper_triang_masked_softmax_ref(x, scale):
-    scores = x.to(torch.float32) * scale
-    rows = torch.arange(x.shape[-2], device=x.device).unsqueeze(-1)
-    cols = torch.arange(x.shape[-1], device=x.device).unsqueeze(0)
-    masked = cols > rows
-    scores = scores.masked_fill(masked, float("-inf"))
-    probs = torch.softmax(scores, dim=-1)
-    return probs.masked_fill(masked, 0.0).to(x.dtype)
-
-
-def torch_op(x, scale):
-    if _megatron_apply is None:
-        return scaled_upper_triang_masked_softmax_ref(x, scale)
-    return _megatron_apply(x, scale)
 
 
 class _ScaledUpperTriangMaskedSoftmaxBenchmark(base.GenericBenchmark):
@@ -121,6 +110,8 @@ def test_scaled_upper_triang_masked_softmax_forward():
     bench = _ScaledUpperTriangMaskedSoftmaxBenchmark(
         input_fn=scaled_upper_triang_masked_softmax_input_fn,
         op_name="scaled_upper_triang_masked_softmax_forward",
+        # None when the Apex extension is unavailable: a torch composition is
+        # not timed as a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
         dtypes=_DTYPES,
     )

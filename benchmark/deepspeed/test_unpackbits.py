@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Performance benchmark for unpackbits.
+
+There is no on-machine baseline: DeepSpeed's ``unpack_bits`` was XPU-only and
+was deleted upstream (8ae0509ef), and torch has no unpackbits. A composition of
+torch primitives is not a competitor, so it is not timed: ``torch_op`` is
+``None``, the benchmark reports Train latency only, and ``--base-data`` is the
+only comparison.
+"""
+
 import pytest
 import torch
 
@@ -35,21 +44,7 @@ _UNPACKBITS_SHAPES = [
     (32000, 8),
 ]
 
-_SHIFTS = (7, 6, 5, 4, 3, 2, 1, 0)
-
-
-# DeepSpeed's unpackbits was XPU-only and deleted upstream (8ae0509ef), and torch
-# has no unpackbits, so the baseline is assembled from primitives.
-def unpackbits_ref(packed, dim=-1, count=None, dtype=torch.float32):
-    """PyTorch reference for unpackbits."""
-    x = packed.movedim(dim, -1)
-    n_bytes = x.shape[-1]
-    n_out = n_bytes * 8 if count is None else count
-
-    shifts = torch.tensor(_SHIFTS, dtype=torch.uint8, device=x.device)
-    bits = (x.unsqueeze(-1).expand(*x.shape, len(_SHIFTS)) >> shifts) & 1
-    values = bits.reshape(*x.shape[:-1], n_bytes * 8).to(dtype) * 2 - 1
-    return values[..., :n_out].movedim(-1, dim)
+_BASELINE = "none (no on-machine baseline; --base-data is the only comparison)"
 
 
 class _UnpackbitsBenchmark(base.GenericBenchmark):
@@ -69,10 +64,13 @@ def unpackbits_input_fn(shape, dtype, device):
 
 @pytest.mark.unpackbits
 def test_unpackbits_perf():
+    print(f"\nBaseline: {_BASELINE}")
     bench = _UnpackbitsBenchmark(
         input_fn=unpackbits_input_fn,
         op_name="unpackbits",
-        torch_op=unpackbits_ref,
+        # None: DeepSpeed's operator is gone and a torch composition is not
+        # timed as a baseline, so --base-data supplies the comparison.
+        torch_op=None,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.set_train(flag_train.deepspeed.unpackbits)

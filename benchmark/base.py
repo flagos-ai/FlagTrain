@@ -686,11 +686,11 @@ class Benchmark:
         if factor:
             speedup /= factor
         metric.compared_speedup = speedup
-        print(
-            f"[vs Base] {self.op_name} shape={metric.shape_detail} "
-            f"base={base_ms:.6f}ms train={metric.latency:.6f}ms "
-            f"factor={factor} vs_base={speedup:.3f}"
-        )
+        # print(
+        #    f"[vs Base] {self.op_name} shape={metric.shape_detail} "
+        #    f"base={base_ms:.6f}ms train={metric.latency:.6f}ms "
+        #    f"factor={factor} vs_base={speedup:.3f}"
+        # )
 
     def _measure_input(self, input, case_id=None):
         metric = BenchmarkMetrics(case_id=case_id)
