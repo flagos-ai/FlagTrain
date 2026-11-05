@@ -600,10 +600,9 @@ class Benchmark:
         cases = self._collect_cases()
         available_ids = [case.case_id for case in cases]
         if reference_mode_enabled():
-            reference_execution().selection_empty = (
-                case_ids is not None
-                and not set(case_ids).intersection(available_ids)
-            )
+            reference_execution().selection_empty = case_ids is not None and not set(
+                case_ids
+            ).intersection(available_ids)
 
         select_all = case_ids is None
         selected = set(case_ids or [])

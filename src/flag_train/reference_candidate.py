@@ -319,9 +319,7 @@ class _ReferenceCandidatePlugin:
         state = getattr(item, "_reference_execution", None)
         if state is None:
             return
-        record = self.records.setdefault(
-            item.nodeid, {"status": "NOT_RUN", "calls": 0}
-        )
+        record = self.records.setdefault(item.nodeid, {"status": "NOT_RUN", "calls": 0})
         correctness = self._is_correctness(item)
 
         if (
@@ -348,11 +346,7 @@ class _ReferenceCandidatePlugin:
             record["status"] = "FAILED"
         elif report.skipped and record["status"] != "FAILED":
             record["status"] = "SKIP"
-        elif (
-            call.when == "call"
-            and report.passed
-            and record["status"] != "FAILED"
-        ):
+        elif call.when == "call" and report.passed and record["status"] != "FAILED":
             record.update(
                 status=(
                     "NOT_SELECTED"
@@ -374,12 +368,10 @@ class _ReferenceCandidatePlugin:
         yield
         records = list(self.records.values())
         supported = any(
-            record["status"] == "PASSED" and record["calls"] > 0
-            for record in records
+            record["status"] == "PASSED" and record["calls"] > 0 for record in records
         )
         complete = all(
-            record["status"] in {"PASSED", "SKIP", "NOT_SELECTED"}
-            for record in records
+            record["status"] in {"PASSED", "SKIP", "NOT_SELECTED"} for record in records
         )
         if (
             self.collection_failed or not supported or not complete

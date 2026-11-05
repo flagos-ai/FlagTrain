@@ -451,14 +451,10 @@ def test_plugin_benchmark_node_needs_completed_candidate_timing(tmp_path):
     (suite / "conftest.py").write_text(SYNTHETIC_CONFTEST)
     benchmarks = suite / "benchmark"
     benchmarks.mkdir()
-    (benchmarks / "test_synth.py").write_text(
-        textwrap.dedent(
-            """
+    (benchmarks / "test_synth.py").write_text(textwrap.dedent("""
             def test_nothing_measured():
                 pass
-            """
-        )
-    )
+            """))
     result = _run_pytest(
         suite, "-p", "no:cacheprovider", "-q", "--tb=short", "--ref-as-candidate"
     )
@@ -472,9 +468,7 @@ def test_plugin_benchmark_node_with_no_selected_cases_is_not_false_success(tmp_p
     (suite / "conftest.py").write_text(SYNTHETIC_CONFTEST)
     benchmarks = suite / "benchmark"
     benchmarks.mkdir()
-    (benchmarks / "test_synth.py").write_text(
-        textwrap.dedent(
-            """
+    (benchmarks / "test_synth.py").write_text(textwrap.dedent("""
             import refcandidate_synth as refc
 
             def reference(value):
@@ -490,9 +484,7 @@ def test_plugin_benchmark_node_with_no_selected_cases_is_not_false_success(tmp_p
 
             def test_no_selected_case():
                 refc.reference_execution().selection_empty = True
-            """
-        )
-    )
+            """))
     result = _run_pytest(
         suite, "-p", "no:cacheprovider", "-q", "--tb=short", "--ref-as-candidate"
     )
@@ -540,9 +532,7 @@ def test_configure_rejects_conflicting_options(option, flag):
             registered.append(name)
 
     options = SimpleNamespace(ref_as_candidate=True, **{option: "1"})
-    config = SimpleNamespace(
-        option=options, pluginmanager=PluginManager()
-    )
+    config = SimpleNamespace(option=options, pluginmanager=PluginManager())
     with pytest.raises(pytest.UsageError, match=flag):
         refc.configure_reference_candidate(config)
     assert registered == []
@@ -872,9 +862,7 @@ def test_benchmark_reference_is_validated_before_baseline(
         bench = _make_bench(env, reference, metrics=metrics)
         env.Config.skip_native = skip_native
         with env.refc.reference_test_mode(True, "benchmark.node") as state:
-            with pytest.raises(
-                pytest.fail.Exception, match="No predefined reference"
-            ):
+            with pytest.raises(pytest.fail.Exception, match="No predefined reference"):
                 bench._measure_input((1,))
         assert state.contract_errors
         assert "not callable" not in state.contract_errors[0]
