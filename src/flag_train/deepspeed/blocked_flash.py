@@ -105,6 +105,7 @@ def _kv_tile(
     IS_CAUSAL: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    TRANSPOSED: tl.constexpr = False,
 ):
     """One ``BLOCK_N``-wide KV tile, folded into the running softmax state.
 
@@ -115,13 +116,33 @@ def _kv_tile(
     exactly one place, which is why the difference is a ``constexpr`` here and
     not a second copy of the arithmetic.
 
+    ``TRANSPOSED`` reads both cache tiles column-major instead -- ``[BLOCK_D,
+    BLOCK_N]``, with the head dimension on the row axis -- which hands the QK dot
+    its key operand already in the orientation an MMA wants. The row-major load
+    has to be transposed in registers first, and Triton pays for that with a
+    layout conversion per tile; reading the same bytes the other way round avoids
+    it at the cost of a strided access pattern. Which of the two is cheaper is a
+    property of the tile, not of the operator: on a C550 it is worth 9-18%
+    (3.01 against 2.76 ms at 4096 tokens with 32/8 heads and head 128), and it is
+    off by default so that the backends which have not measured it pay nothing.
+
     Returns the updated ``(m_i, l_i, acc)``: Triton has no mutable state across
     calls, so the running max, the running denominator and the accumulator travel
     in and out explicitly.
     """
     n_mask = kv_pos < total_extent
 
-    if MASKED:
+    if TRANSPOSED:
+        k = tl.load(
+            k_ptr
+            + block_row_base
+            + hk * HEAD_SIZE
+            + offs_d[:, None]
+            + offs_n[None, :] * k_row_stride,
+            mask=d_mask[:, None] & n_mask[None, :] if MASKED else d_mask[:, None],
+            other=0.0,
+        )
+    elif MASKED:
         k = tl.load(
             k_ptr
             + block_row_base
@@ -142,7 +163,11 @@ def _kv_tile(
             other=0.0,
         )
 
-    qk = tl.dot(q, tl.trans(k)) * qk_scale
+    if TRANSPOSED:
+        qk = tl.dot(q, k) * qk_scale
+    else:
+        qk = tl.dot(q, tl.trans(k)) * qk_scale
+
     if MASKED:
         if IS_CAUSAL:
             # A query attends to every KV position up to and including its own.
@@ -153,7 +178,23 @@ def _kv_tile(
     alpha = tl.exp2(m_i - m_new)
     p = tl.exp2(qk - m_new[:, None])
 
-    if MASKED:
+    if TRANSPOSED:
+        # Read column-major like ``k``, then turn it round for the PV dot, whose
+        # row axis is the tile's. The transpose is on the *loaded* value, so the
+        # conversion is the same one the row-major load would have paid -- the win
+        # is that the access pattern lines up with the head dimension, which is
+        # the contiguous one.
+        v = tl.load(
+            v_ptr
+            + block_row_base
+            + hk * HEAD_SIZE
+            + offs_d[:, None]
+            + offs_n[None, :] * k_row_stride,
+            mask=d_mask[:, None] & n_mask[None, :] if MASKED else d_mask[:, None],
+            other=0.0,
+        )
+        v = tl.trans(v)
+    elif MASKED:
         v = tl.load(
             v_ptr
             + block_row_base
