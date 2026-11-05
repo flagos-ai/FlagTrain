@@ -13,15 +13,20 @@
 # limitations under the License.
 
 import warnings
+from enum import IntEnum
 
 import pytest
 import torch
 
 import flag_train
-from flag_train.deepspeed import loco_quantized_reduction
-from flag_train.deepspeed.loco_quantized_reduction import QuantizationType
 
 from .. import base, consts
+
+
+class QuantizationType(IntEnum):
+    Symmetric = 0
+    Asymmetric = 1
+
 
 SINGLE_PASS_SHAPES = [
     (1024, 4096, 8),
@@ -88,10 +93,10 @@ def _unpack(b, num_bits):
     if num_bits == 8:
         return b
 
-    x = b.to(torch.int16)
-    hi = x >> 4
-    lo = ((x & 0xF) ^ 8) - 8
-    return torch.stack([hi, lo], dim=-1).reshape(*b.shape[:-1], b.shape[-1] * 2)
+    x = b.to(torch.int32)
+    return torch.stack([x >> 4, (x << 28) >> 28], dim=-1).reshape(
+        *b.shape[:-1], b.shape[-1] * 2
+    )
 
 
 def _pack(e, num_bits):
@@ -144,7 +149,7 @@ def torch_reduction(
 def train_reduction(
     data, scales, in_groups, out_groups, num_bits, quant_type, devices_per_node
 ):
-    return loco_quantized_reduction(
+    return flag_train.deepspeed.loco_quantized_reduction(
         data, scales, in_groups, out_groups, num_bits, quant_type, devices_per_node
     )
 
@@ -212,12 +217,13 @@ class LocoQrBenchmark(base.GenericBenchmark):
         return []
 
     def record_shapes(self, *args, **kwargs):
-        data, scales, in_groups, out_groups, num_bits, _qt, num_tensors = args
+        data, scales, in_groups, out_groups, num_bits, qt, num_tensors = args
         bpg = data.numel() // num_tensors // out_groups
         path = "1pass" if bpg <= 8192 else "2pass"
+        sym = "sym" if int(qt) == int(QuantizationType.Symmetric) else "asym"
         return (
             f"out_groups={out_groups} bpg={bpg} nt={num_tensors} "
-            f"bits={num_bits} {path}"
+            f"bits={num_bits} {sym} {path}"
         )
 
     def get_gbps(self, args, latency):

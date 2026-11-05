@@ -12,20 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import logging
 import os
+from enum import IntEnum
 
 import pytest
 import torch
 
 import flag_train
-from flag_train.deepspeed import loco_quantized_reduction
-from flag_train.deepspeed.loco_quantized_reduction import QuantizationType
 
 from .. import accuracy_utils as utils
 
 logger = logging.getLogger(__name__)
+
+
+class QuantizationType(IntEnum):
+    Symmetric = 0
+    Asymmetric = 1
+
 
 SEED = 0
 
@@ -137,7 +141,7 @@ def _ds_call(data, scales, in_groups, out_groups, num_bits, symmetric, num_tenso
 
 
 def _ours_call(data, scales, in_groups, out_groups, num_bits, symmetric, num_tensors):
-    return loco_quantized_reduction(
+    return flag_train.deepspeed.loco_quantized_reduction(
         data,
         scales,
         in_groups,
@@ -389,29 +393,6 @@ def test_loco_quantized_reduction_hand_asym_multi_tensor():
 
 
 @pytest.mark.loco_quantized_reduction
-def test_loco_quantized_reduction_multipass_equals_singlepass():
-    lqr = importlib.import_module("flag_train.deepspeed.loco_quantized_reduction")
-
-    out_groups, bpg, num_tensors = 512, 8192, 8
-    data, scales, in_groups = _inputs(out_groups, bpg, num_tensors, 4, True)
-
-    single, s1 = _ours_call(data, scales, in_groups, out_groups, 4, True, num_tensors)
-
-    old = lqr._BLOCK_MAX
-    try:
-        lqr._BLOCK_MAX = 4096
-        multi, s2 = _ours_call(
-            data, scales, in_groups, out_groups, 4, True, num_tensors
-        )
-    finally:
-        lqr._BLOCK_MAX = old
-
-    assert multi.shape == single.shape
-    utils.train_assert_equal(utils.to_reference(multi), utils.to_reference(single))
-    utils.train_assert_equal(utils.to_reference(s2), utils.to_reference(s1))
-
-
-@pytest.mark.loco_quantized_reduction
 @pytest.mark.parametrize("num_bits", BITS)
 @pytest.mark.parametrize("case", MULTIPASS_CASES)
 def test_loco_quantized_reduction_multipass_matches_reference(case, num_bits):
@@ -645,7 +626,7 @@ def test_loco_quantized_reduction_nd_input(shape, out_groups, num_tensors):
         torch.rand((in_groups,), dtype=torch.float32, device=flag_train.device) + 1e-3
     )
 
-    out, out_st = loco_quantized_reduction(
+    out, out_st = flag_train.deepspeed.loco_quantized_reduction(
         data,
         scales,
         in_groups,
@@ -724,7 +705,7 @@ def test_loco_quantized_reduction_rejects_bad_args(kind, exc, match):
         kwargs["devices_per_node"] = 0
 
     with pytest.raises(exc, match=match):
-        loco_quantized_reduction(data, scales, **kwargs)
+        flag_train.deepspeed.loco_quantized_reduction(data, scales, **kwargs)
 
 
 @pytest.mark.loco_quantized_reduction
@@ -762,7 +743,7 @@ def test_loco_quantized_reduction_rejects_unaligned_last_dim():
     )
 
     with pytest.raises(ValueError, match="last dim"):
-        loco_quantized_reduction(
+        flag_train.deepspeed.loco_quantized_reduction(
             data,
             scales,
             in_groups,
@@ -779,13 +760,19 @@ def test_loco_quantized_reduction_accepts_upstream_enum():
     out_groups, bpg, num_tensors = 1024, 4096, 8
     data, scales, in_groups = _inputs(out_groups, bpg, num_tensors, 4, True)
 
-    a, _ = loco_quantized_reduction(
-        data, scales, in_groups, out_groups, 4, QuantizationType.Symmetric, num_tensors
+    a, _ = flag_train.deepspeed.loco_quantized_reduction(
+        data,
+        scales,
+        in_groups,
+        out_groups,
+        4,
+        QuantizationType.Symmetric,
+        num_tensors,
     )
-    b, _ = loco_quantized_reduction(
+    b, _ = flag_train.deepspeed.loco_quantized_reduction(
         data, scales, in_groups, out_groups, 4, "symmetric", num_tensors
     )
-    c, _ = loco_quantized_reduction(
+    c, _ = flag_train.deepspeed.loco_quantized_reduction(
         data,
         scales,
         in_groups,

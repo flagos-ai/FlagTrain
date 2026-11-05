@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 from enum import IntEnum
 from typing import List
 
@@ -23,32 +22,10 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 
-__all__ = ["QuantizationType", "loco_quantized_reduction", "quantized_reduction"]
-
 
 class QuantizationType(IntEnum):
     Symmetric = 0
     Asymmetric = 1
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    value = int(value)
-    if value < 1:
-        raise ValueError(f"{name} must be >= 1, got {value}")
-    return value
-
-
-def _env_int_zero_ok(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    value = int(value)
-    if value < 0:
-        raise ValueError(f"{name} must be >= 0, got {value}")
-    return value
 
 
 _VENDOR = str(getattr(runtime_device, "vendor_name", "") or "").lower()
@@ -69,58 +46,16 @@ def _device_warp_cap() -> int:
     return 32 if _IS_CUDA_REF else 8
 
 
-_BLOCK_MAX = _env_int_zero_ok("FLAG_TRAIN_LQR_BLOCK_MAX", 0)
-_BLOCK_MAX_I4 = _env_int("FLAG_TRAIN_LQR_BLOCK_MAX_I4", 8192)
-_BLOCK_MAX_I8 = _env_int("FLAG_TRAIN_LQR_BLOCK_MAX_I8", 8192)
-_BLOCK_MIN = _env_int("FLAG_TRAIN_LQR_BLOCK_MIN", 64)
+_BLOCK_MAX = 0
+_BLOCK_MAX_I4 = 8192
+_BLOCK_MAX_I8 = 8192
+_BLOCK_MIN = 64
 
-_UB_BUDGET = _env_int("FLAG_TRAIN_LQR_UB_BUDGET", 128 * 1024)
-_STATIC_BLOCK = _env_int("FLAG_TRAIN_LQR_STATIC_BLOCK", 4096)
-_WARPS_DIV = _env_int("FLAG_TRAIN_LQR_WARPS_DIV", 256)
-_MAX_WARPS = _env_int("FLAG_TRAIN_LQR_MAX_WARPS", _device_warp_cap())
-_NUM_STAGES = _env_int("FLAG_TRAIN_LQR_NUM_STAGES", 3 if _IS_CUDA_REF else 1)
-
-_UNPACK_IDS = {"int8": 0, "int16": 1, "int32": 2, "float": 3}
-_unpack_name = os.environ.get("FLAG_TRAIN_LQR_UNPACK", "int16").strip().lower()
-if _unpack_name not in _UNPACK_IDS:
-    raise ValueError(
-        f"FLAG_TRAIN_LQR_UNPACK must be one of {sorted(_UNPACK_IDS)}, "
-        f"got {_unpack_name!r}"
-    )
-_UNPACK = _UNPACK_IDS[_unpack_name]
-
-_STATS_MODE = os.environ.get("FLAG_TRAIN_LQR_STATS", "auto").strip().lower()
-if _STATS_MODE not in ("auto", "ew", "lean"):
-    raise ValueError(
-        "FLAG_TRAIN_LQR_STATS must be auto, ew or lean, " f"got {_STATS_MODE!r}"
-    )
-
-_GPP = _env_int("FLAG_TRAIN_LQR_GPP", 1)
-_GPP_MIN_WAVES = _env_int("FLAG_TRAIN_LQR_GPP_MIN_WAVES", 1)
-_AIV_CORES = _env_int("FLAG_TRAIN_LQR_AIV_CORES", 40)
-_GPP_MAX_TRAFFIC = _env_int("FLAG_TRAIN_LQR_GPP_MAX_TRAFFIC", 48 * 1024)
-
-_STAGE = _env_int_zero_ok("FLAG_TRAIN_LQR_STAGE", 0)
-if _STAGE not in (0, 1, 2):
-    raise ValueError(f"FLAG_TRAIN_LQR_STAGE must be 0, 1 or 2, got {_STAGE}")
-
-for _name, _value in (
-    ("FLAG_TRAIN_LQR_BLOCK_MAX", _BLOCK_MAX),
-    ("FLAG_TRAIN_LQR_BLOCK_MAX_I4", _BLOCK_MAX_I4),
-    ("FLAG_TRAIN_LQR_BLOCK_MAX_I8", _BLOCK_MAX_I8),
-    ("FLAG_TRAIN_LQR_BLOCK_MIN", _BLOCK_MIN),
-):
-    if _value == 0:
-        continue
-    if _value & (_value - 1):
-        raise ValueError(f"{_name} must be a power of two, got {_value}")
-if _BLOCK_MAX and _BLOCK_MAX < _BLOCK_MIN:
-    raise ValueError(
-        f"FLAG_TRAIN_LQR_BLOCK_MAX({_BLOCK_MAX}) < "
-        f"FLAG_TRAIN_LQR_BLOCK_MIN({_BLOCK_MIN})"
-    )
-if _BLOCK_MIN > min(_BLOCK_MAX_I4, _BLOCK_MAX_I8):
-    raise ValueError(f"FLAG_TRAIN_LQR_BLOCK_MIN({_BLOCK_MIN}) exceeds a block cap")
+_UB_BUDGET = 128 * 1024
+_STATIC_BLOCK = 4096
+_WARPS_DIV = 256
+_MAX_WARPS = _device_warp_cap()
+_NUM_STAGES = 1
 
 
 def _block_cap(num_bits: int) -> int:
@@ -148,16 +83,14 @@ def _fits_ub(block: int, units: int) -> bool:
 def _pick_tile(bytes_per_group: int, num_bits: int, symmetric: bool):
     cap = _block_cap(num_bits)
     cand = min(cap, max(_BLOCK_MIN, triton.next_power_of_2(bytes_per_group)))
-    allow_ew = _STATS_MODE in ("auto", "ew") or num_bits == 8
-    allow_lean = symmetric and num_bits == 4 and _STATS_MODE in ("auto", "lean")
+    allow_lean = symmetric and num_bits == 4
 
     while cand > _BLOCK_MIN:
         masked = _will_mask(bytes_per_group, cand)
-        if allow_ew and _fits_ub(cand, _ub_units(num_bits, 0, masked, False)):
+        if _fits_ub(cand, _ub_units(num_bits, 0, masked, False)):
             return cand, False
-        single_pass = cand >= bytes_per_group
         if (
-            single_pass
+            cand >= bytes_per_group
             and allow_lean
             and _fits_ub(cand, _ub_units(num_bits, 0, masked, True))
         ):
@@ -186,19 +119,6 @@ def _pick_warps(block: int) -> int:
     return 1 << (warps.bit_length() - 1)
 
 
-def _pick_gpp(out_groups: int, block: int, group_traffic: int) -> int:
-    gpp = _GPP
-    if gpp <= 1 or out_groups % gpp:
-        return 1
-    if out_groups // gpp < _GPP_MIN_WAVES * _AIV_CORES:
-        return 1
-    if _IS_ASCEND and block > _STATIC_BLOCK:
-        return 1
-    if group_traffic > _GPP_MAX_TRAFFIC:
-        return 1
-    return gpp
-
-
 @triton.jit
 def _dr_slice(
     in_ptr,
@@ -213,7 +133,6 @@ def _dr_slice(
     SYMMETRIC: tl.constexpr,
     MASKED: tl.constexpr,
     ALIGNED: tl.constexpr,
-    UNPACK: tl.constexpr,
     acc_hi,
     acc_lo,
 ):
@@ -227,15 +146,8 @@ def _dr_slice(
 
     if NUM_BITS == 8:
         vh = b8.to(tl.float32)
-    elif UNPACK == 0:
-        vh = (b8 >> 4).to(tl.float32)
-    elif UNPACK == 1:
-        vh = (b8.to(tl.int16) >> 4).to(tl.float32)
-    elif UNPACK == 2:
-        vh = (b8.to(tl.int32) >> 4).to(tl.float32)
     else:
-        f = b8.to(tl.float32)
-        vh = tl.floor(f * 0.0625)
+        vh = (b8.to(tl.int16) >> 4).to(tl.float32)
 
     if SYMMETRIC:
         s = tl.load(step_ptr + j * gpit + g)
@@ -246,18 +158,8 @@ def _dr_slice(
     if NUM_BITS == 8:
         return hi, hi
 
-    if UNPACK == 0:
-        vl = (((b8 & 0xF) ^ 8) - 8).to(tl.float32)
-    elif UNPACK == 1:
-        b = b8.to(tl.int16)
-        vl = (((b & 0xF) ^ 8) - 8).to(tl.float32)
-    elif UNPACK == 2:
-        b = b8.to(tl.int32)
-        vl = (((b & 0xF) ^ 8) - 8).to(tl.float32)
-    else:
-        lo_u = f - vh * 16.0
-        vl = tl.where(lo_u >= 8.0, lo_u - 16.0, lo_u)
-
+    b = b8.to(tl.int16)
+    vl = (((b & 0xF) ^ 8) - 8).to(tl.float32)
     lo = acc_lo + vl * s
     return hi, lo
 
@@ -277,7 +179,6 @@ def _accumulate(
     SYMMETRIC: tl.constexpr,
     MASKED: tl.constexpr,
     ALIGNED: tl.constexpr,
-    UNPACK: tl.constexpr,
     CHUNK: tl.constexpr,
 ):
     acc_hi = tl.zeros((CHUNK,), dtype=tl.float32)
@@ -301,7 +202,6 @@ def _accumulate(
                 SYMMETRIC,
                 MASKED,
                 ALIGNED,
-                UNPACK,
                 acc_hi,
                 acc_lo,
             )
@@ -320,7 +220,6 @@ def _accumulate(
                 SYMMETRIC,
                 MASKED,
                 ALIGNED,
-                UNPACK,
                 acc_hi,
                 acc_lo,
             )
@@ -450,17 +349,8 @@ def _requant_store(
     SYMMETRIC: tl.constexpr,
     MASKED: tl.constexpr,
     ALIGNED: tl.constexpr,
-    STAGE: tl.constexpr,
 ):
     QMAX = (1 << (NUM_BITS - 1)) - 1
-
-    if STAGE > 0:
-        out_v = acc_hi.to(tl.int8)
-        if MASKED:
-            tl.store(out_ptr + in_byte, out_v, mask=bmask)
-        else:
-            tl.store(out_ptr + in_byte, out_v)
-        return
 
     if SYMMETRIC:
         qf = (acc_hi * qscale + 12582912.0) - 12582912.0
@@ -502,10 +392,7 @@ def _dequant_reduce_kernel(
     BLOCK: tl.constexpr,
     MASKED: tl.constexpr,
     ALIGNED: tl.constexpr,
-    UNPACK: tl.constexpr,
     LEAN_STATS: tl.constexpr,
-    STAGE: tl.constexpr,
-    GPP: tl.constexpr,
     I64: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -513,68 +400,56 @@ def _dequant_reduce_kernel(
     bmask = kb < BYTES_PER_GROUP
 
     if I64:
+        gg = pid.to(tl.int64)
         epit = EPIT.to(tl.int64)
         gpit = GPIT.to(tl.int64)
+        in_byte = gg * BYTES_PER_GROUP.to(tl.int64) + kb
     else:
+        gg = pid
         epit = EPIT
         gpit = GPIT
+        in_byte = pid * BYTES_PER_GROUP + kb
 
-    for gi in range(GPP):
-        g = pid * GPP + gi
-        if I64:
-            gg = g.to(tl.int64)
-            in_byte = gg * BYTES_PER_GROUP.to(tl.int64) + kb
-        else:
-            gg = g
-            in_byte = g * BYTES_PER_GROUP + kb
-
-        acc_hi, acc_lo = _accumulate(
-            in_ptr,
-            in_step_ptr,
-            in_byte,
-            gg,
-            bmask,
-            epit,
-            gpit,
-            num_tensors,
-            NUM_TENSORS,
-            NUM_BITS,
-            SYMMETRIC,
-            MASKED,
-            ALIGNED,
-            UNPACK,
-            BLOCK,
-        )
-        off_sum = _offset_sum(
-            in_step_ptr, gg, gpit, num_tensors, NUM_TENSORS, not SYMMETRIC
-        )
-
-        if STAGE == 2:
-            qscale, off_q = 1.0, 0.0
-            _store_params(out_step_ptr, gg, 1.0, 0.0, SYMMETRIC)
-        else:
-            stat, mn = _group_stats(
-                acc_hi, acc_lo, bmask, NUM_BITS, SYMMETRIC, MASKED, LEAN_STATS
-            )
-            qscale, step, off_q = _quant_params(stat, mn, NUM_BITS, SYMMETRIC)
-            if SYMMETRIC:
-                _store_params(out_step_ptr, gg, step, 0.0, SYMMETRIC)
-            else:
-                _store_params(out_step_ptr, gg, step, off_q + off_sum, SYMMETRIC)
-        _requant_store(
-            out_ptr,
-            in_byte,
-            bmask,
-            acc_hi,
-            acc_lo,
-            qscale,
-            off_q,
-            NUM_BITS,
-            SYMMETRIC,
-            MASKED,
-            ALIGNED,
-            STAGE,
-        )
+    acc_hi, acc_lo = _accumulate(
+        in_ptr,
+        in_step_ptr,
+        in_byte,
+        gg,
+        bmask,
+        epit,
+        gpit,
+        num_tensors,
+        NUM_TENSORS,
+        NUM_BITS,
+        SYMMETRIC,
+        MASKED,
+        ALIGNED,
+        BLOCK,
+    )
+    off_sum = _offset_sum(
+        in_step_ptr, gg, gpit, num_tensors, NUM_TENSORS, not SYMMETRIC
+    )
+    stat, mn = _group_stats(
+        acc_hi, acc_lo, bmask, NUM_BITS, SYMMETRIC, MASKED, LEAN_STATS
+    )
+    qscale, step, off_q = _quant_params(stat, mn, NUM_BITS, SYMMETRIC)
+    if SYMMETRIC:
+        _store_params(out_step_ptr, gg, step, 0.0, SYMMETRIC)
+    else:
+        _store_params(out_step_ptr, gg, step, off_q + off_sum, SYMMETRIC)
+    _requant_store(
+        out_ptr,
+        in_byte,
+        bmask,
+        acc_hi,
+        acc_lo,
+        qscale,
+        off_q,
+        NUM_BITS,
+        SYMMETRIC,
+        MASKED,
+        ALIGNED,
+    )
 
 
 @libentry()
@@ -595,126 +470,110 @@ def _dequant_reduce_multipass_kernel(
     CHUNK: tl.constexpr,
     MASKED: tl.constexpr,
     ALIGNED: tl.constexpr,
-    UNPACK: tl.constexpr,
     LEAN_STATS: tl.constexpr,
-    STAGE: tl.constexpr,
-    GPP: tl.constexpr,
     I64: tl.constexpr,
 ):
     pid = tl.program_id(0)
     kc = tl.arange(0, CHUNK)
 
     if I64:
+        gg = pid.to(tl.int64)
         epit = EPIT.to(tl.int64)
         gpit = GPIT.to(tl.int64)
     else:
+        gg = pid
         epit = EPIT
         gpit = GPIT
 
-    for gi in range(GPP):
-        g = pid * GPP + gi
+    if SYMMETRIC:
+        stat = tl.zeros((1,), dtype=tl.float32)
+    else:
+        stat = tl.full((1,), float("-inf"), dtype=tl.float32)
+    mn = tl.full((1,), float("inf"), dtype=tl.float32)
+    off_sum = _offset_sum(
+        in_step_ptr, gg, gpit, num_tensors, NUM_TENSORS, not SYMMETRIC
+    )
+
+    for c in range(num_chunks):
         if I64:
-            gg = g.to(tl.int64)
+            off = c.to(tl.int64) * CHUNK + kc
+            in_byte = gg * BYTES_PER_GROUP.to(tl.int64) + off
         else:
-            gg = g
-
-        if SYMMETRIC:
-            stat = tl.zeros((1,), dtype=tl.float32)
-        else:
-            stat = tl.full((1,), float("-inf"), dtype=tl.float32)
-        mn = tl.full((1,), float("inf"), dtype=tl.float32)
-        off_sum = _offset_sum(
-            in_step_ptr, gg, gpit, num_tensors, NUM_TENSORS, not SYMMETRIC
+            off = c * CHUNK + kc
+            in_byte = gg * BYTES_PER_GROUP + off
+        cmask = off < BYTES_PER_GROUP
+        acc_hi, acc_lo = _accumulate(
+            in_ptr,
+            in_step_ptr,
+            in_byte,
+            gg,
+            cmask,
+            epit,
+            gpit,
+            num_tensors,
+            NUM_TENSORS,
+            NUM_BITS,
+            SYMMETRIC,
+            MASKED,
+            ALIGNED,
+            CHUNK,
         )
+        chunk_stat, chunk_mn = _group_stats(
+            acc_hi,
+            acc_lo,
+            cmask,
+            NUM_BITS,
+            SYMMETRIC,
+            MASKED,
+            LEAN_STATS,
+        )
+        stat = tl.maximum(stat, chunk_stat)
+        if not SYMMETRIC:
+            mn = tl.minimum(mn, chunk_mn)
 
-        for c in range(num_chunks):
-            if I64:
-                off = c.to(tl.int64) * CHUNK + kc
-                in_byte = gg * BYTES_PER_GROUP.to(tl.int64) + off
-            else:
-                off = c * CHUNK + kc
-                in_byte = g * BYTES_PER_GROUP + off
-            cmask = off < BYTES_PER_GROUP
-            acc_hi, acc_lo = _accumulate(
-                in_ptr,
-                in_step_ptr,
-                in_byte,
-                gg,
-                cmask,
-                epit,
-                gpit,
-                num_tensors,
-                NUM_TENSORS,
-                NUM_BITS,
-                SYMMETRIC,
-                MASKED,
-                ALIGNED,
-                UNPACK,
-                CHUNK,
-            )
-            if STAGE != 2:
-                chunk_stat, chunk_mn = _group_stats(
-                    acc_hi,
-                    acc_lo,
-                    cmask,
-                    NUM_BITS,
-                    SYMMETRIC,
-                    MASKED,
-                    LEAN_STATS,
-                )
-                stat = tl.maximum(stat, chunk_stat)
-                if not SYMMETRIC:
-                    mn = tl.minimum(mn, chunk_mn)
+    qscale, step, off_q = _quant_params(stat, mn, NUM_BITS, SYMMETRIC)
+    if SYMMETRIC:
+        _store_params(out_step_ptr, gg, step, 0.0, SYMMETRIC)
+    else:
+        _store_params(out_step_ptr, gg, step, off_q + off_sum, SYMMETRIC)
 
-        if STAGE == 2:
-            qscale, off_q = 1.0, 0.0
-            _store_params(out_step_ptr, gg, 1.0, 0.0, SYMMETRIC)
+    for c in range(num_chunks):
+        if I64:
+            off = c.to(tl.int64) * CHUNK + kc
+            in_byte = gg * BYTES_PER_GROUP.to(tl.int64) + off
         else:
-            qscale, step, off_q = _quant_params(stat, mn, NUM_BITS, SYMMETRIC)
-            if SYMMETRIC:
-                _store_params(out_step_ptr, gg, step, 0.0, SYMMETRIC)
-            else:
-                _store_params(out_step_ptr, gg, step, off_q + off_sum, SYMMETRIC)
-
-        for c in range(num_chunks):
-            if I64:
-                off = c.to(tl.int64) * CHUNK + kc
-                in_byte = gg * BYTES_PER_GROUP.to(tl.int64) + off
-            else:
-                off = c * CHUNK + kc
-                in_byte = g * BYTES_PER_GROUP + off
-            cmask = off < BYTES_PER_GROUP
-            acc_hi, acc_lo = _accumulate(
-                in_ptr,
-                in_step_ptr,
-                in_byte,
-                gg,
-                cmask,
-                epit,
-                gpit,
-                num_tensors,
-                NUM_TENSORS,
-                NUM_BITS,
-                SYMMETRIC,
-                MASKED,
-                ALIGNED,
-                UNPACK,
-                CHUNK,
-            )
-            _requant_store(
-                out_ptr,
-                in_byte,
-                cmask,
-                acc_hi,
-                acc_lo,
-                qscale,
-                off_q,
-                NUM_BITS,
-                SYMMETRIC,
-                MASKED,
-                ALIGNED,
-                STAGE,
-            )
+            off = c * CHUNK + kc
+            in_byte = gg * BYTES_PER_GROUP + off
+        cmask = off < BYTES_PER_GROUP
+        acc_hi, acc_lo = _accumulate(
+            in_ptr,
+            in_step_ptr,
+            in_byte,
+            gg,
+            cmask,
+            epit,
+            gpit,
+            num_tensors,
+            NUM_TENSORS,
+            NUM_BITS,
+            SYMMETRIC,
+            MASKED,
+            ALIGNED,
+            CHUNK,
+        )
+        _requant_store(
+            out_ptr,
+            in_byte,
+            cmask,
+            acc_hi,
+            acc_lo,
+            qscale,
+            off_q,
+            NUM_BITS,
+            SYMMETRIC,
+            MASKED,
+            ALIGNED,
+        )
 
 
 def _normalize_quant_type(quant_type) -> QuantizationType:
@@ -846,15 +705,12 @@ def loco_quantized_reduction(
     )
 
     num_warps = _pick_warps(block)
-    group_traffic = elems_per_out_group * (num_tensors + 1)
-    gpp = _pick_gpp(out_groups, block, group_traffic)
-    grid = out_groups // gpp
 
     with torch_device_fn.device(input_vals.device):
         if block >= elems_per_out_group:
             masked = block != elems_per_out_group
             aligned = (not masked) and elems_per_out_group % 16 == 0
-            _dequant_reduce_kernel[(grid,)](
+            _dequant_reduce_kernel[(out_groups,)](
                 out,
                 out_st,
                 input_vals,
@@ -869,10 +725,7 @@ def loco_quantized_reduction(
                 BLOCK=block,
                 MASKED=masked,
                 ALIGNED=aligned,
-                UNPACK=_UNPACK,
                 LEAN_STATS=lean_stats,
-                STAGE=_STAGE,
-                GPP=gpp,
                 I64=use_i64,
                 num_warps=num_warps,
                 num_stages=_NUM_STAGES,
@@ -881,7 +734,7 @@ def loco_quantized_reduction(
             num_chunks = triton.cdiv(elems_per_out_group, block)
             masked = (elems_per_out_group % block) != 0
             aligned = (not masked) and elems_per_out_group % 16 == 0
-            _dequant_reduce_multipass_kernel[(grid,)](
+            _dequant_reduce_multipass_kernel[(out_groups,)](
                 out,
                 out_st,
                 input_vals,
@@ -897,16 +750,10 @@ def loco_quantized_reduction(
                 CHUNK=block,
                 MASKED=masked,
                 ALIGNED=aligned,
-                UNPACK=_UNPACK,
                 LEAN_STATS=lean_stats,
-                STAGE=_STAGE,
-                GPP=gpp,
                 I64=use_i64,
                 num_warps=num_warps,
                 num_stages=_NUM_STAGES,
             )
 
     return [out, out_st]
-
-
-quantized_reduction = loco_quantized_reduction
