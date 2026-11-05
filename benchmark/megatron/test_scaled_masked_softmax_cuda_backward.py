@@ -16,9 +16,9 @@
 The baseline is Megatron-LM's ``ScaledMaskedSoftmax.backward``, the operator
 this port is a port *of*. When ``megatron.core.fusions.fused_softmax`` cannot
 supply it, its one-line method body is vendored below and run against the same
-Apex CUDA extension. When that extension is unavailable, the benchmark warns
-and falls back to ``masked_backward_ref``, the closed form
-``scale * y * (dy - sum(dy * y))``. ``_BASELINE`` records which one was
+Apex CUDA extension. When that extension is unavailable there is no on-machine
+baseline: a torch composition is not timed, ``torch_op`` is ``None``, and
+``--base-data`` is the only comparison. ``_BASELINE`` records which case was
 measured.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
@@ -63,14 +63,6 @@ if flag_train.runtime.device.support_bf16:
     _DTYPES.append(torch.bfloat16)
 
 
-def masked_backward_ref(output_grads, softmax_results, scale):
-    """Closed form ``scale * y * (dy - sum(dy * y))``; the fallback baseline."""
-    dy = output_grads.to(torch.float32)
-    y = softmax_results.to(torch.float32)
-    dot = (dy * y).sum(dim=-1, keepdim=True)
-    return (scale * y * (dy - dot)).to(output_grads.dtype)
-
-
 def _megatron_version():
     for distribution in ("megatron-core", "megatron"):
         try:
@@ -106,16 +98,22 @@ def _vendored_backward(output_grads, softmax_results, scale):
 
 
 def _load_megatron_baseline():
-    """Megatron's backward, or ``None`` when this install cannot provide one."""
+    """Harness-ready Megatron backward, and the label for ``_BASELINE``.
+
+    ``torch_op`` is ``None`` when this install cannot provide one; the label then
+    says so. When the class cannot be imported, its one-line body is vendored
+    against the same Apex extension.
+    """
     if importlib.util.find_spec(_EXTENSION) is None:
         warnings.warn(
             f"Megatron-LM's fused masked softmax backward needs the Apex "
-            f"'{_EXTENSION}' extension, which is not installed. Falling back to "
-            f"masked_backward_ref (torch).",
+            f"'{_EXTENSION}' extension, which is not installed. This run has no "
+            f"on-machine baseline; a torch composition is not timed, so "
+            f"--base-data is the only comparison.",
             RuntimeWarning,
             stacklevel=2,
         )
-        return None
+        return None, "none (no on-machine baseline; --base-data is the only comparison)"
     version = _megatron_version()
     try:
         from megatron.core.fusions.fused_softmax import ScaledMaskedSoftmax
@@ -127,29 +125,26 @@ def _load_megatron_baseline():
             RuntimeWarning,
             stacklevel=2,
         )
-        return "vendored"
-    return ScaledMaskedSoftmax
+        vendored = True
+        label = (
+            "Megatron-LM ScaledMaskedSoftmax.backward (vendored body, "
+            f"megatron-core {version or 'absent'})"
+        )
+    else:
+        vendored = False
+        label = f"megatron-core {version} ScaledMaskedSoftmax"
+
+    def torch_op(output_grads, softmax_results, scale):
+        if vendored:
+            return _vendored_backward(output_grads, softmax_results, scale)[0]
+        ctx = _SavedForBackward(softmax_results, scale)
+        return ScaledMaskedSoftmax.backward(ctx, output_grads)[0]
+
+    return torch_op, label
 
 
-_MEGATRON = _load_megatron_baseline()
-if _MEGATRON is None:
-    _BASELINE = "masked_backward_ref (torch)"
-elif _MEGATRON == "vendored":
-    _BASELINE = (
-        "Megatron-LM ScaledMaskedSoftmax.backward (vendored body, "
-        f"megatron-core {_megatron_version() or 'absent'})"
-    )
-else:
-    _BASELINE = f"megatron-core {_megatron_version()} ScaledMaskedSoftmax"
-
-
-def _baseline_backward(output_grads, softmax_results, scale):
-    if _MEGATRON is None:
-        return masked_backward_ref(output_grads, softmax_results, scale)
-    if _MEGATRON == "vendored":
-        return _vendored_backward(output_grads, softmax_results, scale)[0]
-    ctx = _SavedForBackward(softmax_results, scale)
-    return _MEGATRON.backward(ctx, output_grads)[0]
+# Resolved once, so the first-use import is not counted in the measurement.
+torch_op, _BASELINE = _load_megatron_baseline()
 
 
 class ScaledMaskedSoftmaxBackwardBenchmark(base.GenericBenchmark):
@@ -181,11 +176,6 @@ def masked_backward_input_fn(shape, dtype, device):
     yield torch.randn(shape, dtype=dtype, device=device), y, _SCALE
 
 
-def torch_op(output_grads, softmax_results, scale):
-    """Baseline, chosen at import time. See the module docstring."""
-    return _baseline_backward(output_grads, softmax_results, scale)
-
-
 def train_op(output_grads, softmax_results, scale):
     """The operator under test."""
     return flag_train.megatron.scaled_masked_softmax_cuda_backward(
@@ -199,6 +189,8 @@ def test_scaled_masked_softmax_cuda_backward_perf():
     bench = ScaledMaskedSoftmaxBackwardBenchmark(
         input_fn=masked_backward_input_fn,
         op_name="scaled_masked_softmax_cuda_backward",
+        # None when the Apex extension is unavailable: a torch composition is
+        # not timed as a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
         dtypes=_DTYPES,
     )

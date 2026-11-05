@@ -13,12 +13,14 @@
 # limitations under the License.
 """Performance benchmark for Megatron Fast GELU.
 
-The preferred baseline is Megatron-LM's official
-``megatron.core.activations.fast_gelu`` interface. If Megatron-LM is not
-installed, the benchmark logs a warning and falls back to the equivalent
-PyTorch composition. Timing, warmup and synchronization come from
-``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode).
-``--level core`` runs the small, medium and large shapes below;
+The baseline is Megatron-LM's ``megatron.core.activations.fast_gelu``, the
+vendor implementation this operator ports. Megatron defines it as the torch
+composition ``0.5 * x * (1 + tanh(0.7978845608 * x * (1 + 0.044715 * x**2)))``
+wrapped in ``jit_fuser`` (``torch.compile``); the composition is the vendor's
+own implementation, so it is a valid on-machine baseline. When Megatron-LM is
+not installed, that exact composition is timed instead. Timing, warmup and
+synchronization come from ``benchmark/base.py`` (``triton.testing.do_bench`` in
+kernel mode). ``--level core`` runs the small, medium and large shapes below;
 ``--level comprehensive`` adds the extra shapes.
 """
 
@@ -42,28 +44,29 @@ _CORE_SHAPES = [
     (8, 4096, 11008),
 ]
 
-
 def fast_gelu_ref(x):
+    """Megatron-LM's ``fast_gelu`` body; timed when Megatron is unavailable."""
     return 0.5 * x * (1 + torch.tanh(0.7978845608 * x * (1 + 0.044715 * x**2)))
 
 
-def base_op():
+def _load_mcore_fast_gelu():
+    """Megatron's ``fast_gelu``, or the composition it is defined as."""
     try:
         import megatron.core.activations
     except ImportError:
         warnings.warn(
-            "Megatron-LM is unavailable; using the PyTorch Fast GELU "
-            "composition as the benchmark baseline",
+            "Megatron-LM is unavailable; timing its torch composition as the "
+            "benchmark baseline",
             RuntimeWarning,
             stacklevel=2,
         )
-        return fast_gelu_ref
+        return fast_gelu_ref, "torch composition of megatron-core fast_gelu"
 
     compiled = megatron.core.activations.fast_gelu
     eager = getattr(compiled, "__wrapped__", compiled)
     chosen = compiled
 
-    def reference(*args, **kwargs):
+    def torch_op(*args, **kwargs):
         nonlocal chosen
         if chosen is eager:
             return eager(*args, **kwargs)
@@ -79,7 +82,10 @@ def base_op():
             chosen = eager
             return eager(*args, **kwargs)
 
-    return reference
+    return torch_op, "megatron-core fast_gelu (@jit_fuser)"
+
+
+torch_op, _BASELINE = _load_mcore_fast_gelu()
 
 
 def _dtypes():
@@ -108,10 +114,11 @@ def fast_gelu_input_fn(shape, dtype, device):
 
 
 def _run():
+    print(f"\nBaseline: {_BASELINE}")
     bench = FastGeluBenchmark(
         input_fn=fast_gelu_input_fn,
         op_name="fast_gelu",
-        torch_op=base_op(),
+        torch_op=torch_op,
         dtypes=_dtypes(),
     )
     bench.set_train(flag_train.megatron.fast_gelu)

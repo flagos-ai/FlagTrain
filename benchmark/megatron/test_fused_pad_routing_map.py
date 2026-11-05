@@ -17,25 +17,26 @@ The baseline is picked by what the platform can run, following the same rule
 ``benchmark/deepspeed/test_blocked_flash.py`` picks DeepSpeed's kernel by:
 
 * on a backend in ``_NV_BASELINE_VENDORS``, Megatron-LM's own
-  ``fused_pad_routing_map`` **is** the baseline. It is the kernel this port is a
-  port *of*, which makes it the only baseline that answers "what did the port
-  cost", and it is *required*: if the installed package cannot provide it the
-  module raises rather than timing something else and reporting it under that
-  name;
-* on any other backend the baseline is ``pad_routing_map_ref``, the plain-torch
-  transcription of Megatron's ``moe_utils.pad_routing_map``. It is not a
-  competitor, and the speedup there says how far the kernel is from *a* correct
-  implementation rather than from the best one.
+  ``fused_pad_routing_map`` **is** the baseline when it can be loaded. It is the
+  kernel this port is a port *of*, which makes it the only baseline that
+  answers "what did the port cost"; a load failure is reported rather than
+  hidden behind another measurement;
+* on any other backend, or when the kernel cannot be loaded, there is no
+  on-machine baseline. A plain-torch transcription of Megatron's
+  ``moe_utils.pad_routing_map`` is not a competitor and is not timed: a ratio
+  against it says how far the kernel is from *a* correct implementation rather
+  than from the best one. ``torch_op`` is ``None``, so the framework reports
+  Train latency only and ``--base-data`` is the only comparison.
 
 The same kernel is held to the torch composition by the functional suite
 (``tests/megatron/test_fused_pad_routing_map.py``) on every NVIDIA run, so the
 timed baseline is not an unchecked one. That check is not repeated here: it
 belongs to the tests, and this file only times the kernel.
 
-Both baselines take the same ``(routing_map, pad_multiple)`` tuple, so there is
-nothing to pre-compute outside the timed region. The input is a boolean top-k map
--- the operator's real input in Megatron's MoE dispatcher -- and both sides return
-int32 ``[num_tokens, num_experts]``.
+The baseline takes the same ``(routing_map, pad_multiple)`` tuple as the
+operator, so there is nothing to pre-compute outside the timed region. The input
+is a boolean top-k map -- the operator's real input in Megatron's MoE dispatcher
+-- and both sides return int32 ``[num_tokens, num_experts]``.
 
 The shapes are deployments rather than bare tensor sizes: each row of
 ``_PAD_ROUTING_MAP_CONFIGS`` is a real model's expert count and top-k, the token
@@ -46,6 +47,7 @@ crosses the kernel's tile boundary.
 """
 
 import importlib.metadata
+import warnings
 
 import pytest
 import torch
@@ -78,40 +80,6 @@ _PAD_ROUTING_MAP_CONFIGS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Reference implementation
-#
-# Megatron's ``megatron.core.transformer.moe.moe_utils.pad_routing_map``,
-# transcribed, then cast to int32 to match the operator's output dtype.
-#
-# !! KEEP IN SYNC with tests/megatron/test_fused_pad_routing_map.py !!
-#
-# This is a second, byte-identical copy of the reference that file uses as its
-# primary oracle. The duplication is deliberate -- a reference belongs to the
-# tests that check against it, not to the operator package, so that a checked
-# implementation is never code the operator ships. The cost is that the two
-# copies can drift: change one and you must change the other, or this benchmark
-# will measure against a different contract than the tests accept.
-# ---------------------------------------------------------------------------
-
-
-def pad_routing_map_ref(routing_map, pad_multiple):
-    """Reference for ``fused_pad_routing_map``, composed from torch ops."""
-    if routing_map.shape[0] == 0:
-        return routing_map
-
-    work = routing_map.clone().transpose(0, 1)  # [num_experts, num_tokens]
-
-    num_ones = work.sum(dim=1)
-    num_to_pad = (-num_ones) % pad_multiple
-
-    is_zero = work == 0
-    zero_ranks = torch.cumsum(is_zero.int(), dim=1)
-    work[zero_ranks <= num_to_pad.unsqueeze(1)] = 1
-
-    return work.transpose(0, 1).int()
-
-
-# ---------------------------------------------------------------------------
 # Baseline, by platform
 #
 # * on a backend in ``_NV_BASELINE_VENDORS`` Megatron-LM's kernel **is** the
@@ -120,7 +88,8 @@ def pad_routing_map_ref(routing_map, pad_multiple):
 #   baseline is reported instead of silently measuring something else. The
 #   functional suite holds that kernel to the torch composition; this file only
 #   times it;
-# * elsewhere the plain-torch composition, which is not a competitor.
+# * elsewhere there is no baseline: the plain-torch composition is not a
+#   competitor, so ``torch_op`` is None and ``--base-data`` is the comparison.
 # ---------------------------------------------------------------------------
 _NV_BASELINE_VENDORS = {"nvidia"}
 
@@ -142,24 +111,30 @@ def _load_mcore_pad_routing_map():
 
         return fused_pad_routing_map
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use Megatron-LM's fused_pad_routing_map "
-            f"as its baseline, but megatron-core could not provide it: {exc!r}. "
-            f"Install megatron-core for this platform, or drop the backend from "
-            f"_NV_BASELINE_VENDORS."
-        ) from exc
+        warnings.warn(
+            f"{flag_train.vendor_name!r} is expected to use Megatron-LM's "
+            f"fused_pad_routing_map as its baseline, but megatron-core could "
+            f"not provide it: {exc!r}. This run has no on-machine baseline; a "
+            f"torch transcription is not timed, so --base-data is the only "
+            f"comparison.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
 
 
-# Resolved once, at module import time.
-_mcore_pad_routing_map = _load_mcore_pad_routing_map()
+# Resolved once, at module import time. ``None`` is the benchmark harness's
+# "no on-machine baseline" sentinel; the harness checks ``torch_op is not None``
+# before timing anything.
+torch_op = _load_mcore_pad_routing_map()
 
 # The baseline's version, recorded in the report line: a speedup means little
 # without the version of the kernel it was measured against.
 _BASELINE = (
     "megatron fused_pad_routing_map "
     f"(megatron-core {importlib.metadata.version('megatron-core')})"
-    if _mcore_pad_routing_map is not None
-    else "pad_routing_map_ref (torch)"
+    if torch_op is not None
+    else "none (no on-machine baseline; --base-data is the only comparison)"
 )
 
 
@@ -210,12 +185,6 @@ def pad_routing_map_input_fn(shape, dtype, device):
     yield _make_routing_map(num_tokens, num_experts, top_k, device), pad_multiple
 
 
-def torch_op(routing_map, pad_multiple):
-    """Baseline, chosen by platform. See the module docstring."""
-    baseline = _mcore_pad_routing_map or pad_routing_map_ref
-    return baseline(routing_map, pad_multiple)
-
-
 def train_op(routing_map, pad_multiple):
     """The operator under test."""
     return fused_pad_routing_map(routing_map, pad_multiple)
@@ -228,6 +197,8 @@ def test_fused_pad_routing_map_perf():
     bench = PadRoutingMapBenchmark(
         input_fn=pad_routing_map_input_fn,
         op_name="fused_pad_routing_map",
+        # None off the vendored backends: a torch composition is not timed as
+        # a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
         # The dispatcher's map is boolean, so that is the contract measured here.
         dtypes=[torch.bool],

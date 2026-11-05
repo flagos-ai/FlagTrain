@@ -12,17 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import warnings
 
 import pytest
 import torch
-from megatron.core.config import set_experimental_flag
-from megatron.core.fusions import fused_indices_converter
 
 import flag_train
 
 from .. import base, consts
 
-set_experimental_flag(True)
+
+def _load_megatron_baseline():
+    """Megatron's Triton kernel, or ``None`` when it cannot run here."""
+    try:
+        from megatron.core.config import set_experimental_flag
+        from megatron.core.fusions import fused_indices_converter
+
+        set_experimental_flag(True)
+        return fused_indices_converter.fused_indices_to_multihot
+    except Exception as exc:
+        warnings.warn(
+            "Megatron-LM's fused_indices_to_multihot Triton kernel is "
+            f"unavailable ({exc!r}). This run has no on-machine baseline: a "
+            "torch composition is not timed, so --base-data is the only "
+            "comparison.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+
+
+# ``None`` is the benchmark harness's "no on-machine baseline" sentinel; the
+# harness checks ``torch_op is not None`` before timing anything.
+torch_op = _load_megatron_baseline()
+
+_BASELINE = (
+    "megatron fused_indices_to_multihot (Triton)"
+    if torch_op is not None
+    else "none (no on-machine baseline; --base-data is the only comparison)"
+)
 
 _SHAPES = [
     (4096, 2, 8),
@@ -63,10 +91,14 @@ def fused_indices_to_multihot_input_fn(shape, dtype, device):
 
 @pytest.mark.fused_indices_to_multihot
 def test_fused_indices_to_multihot():
+    print(f"\nBaseline: {_BASELINE}")
     bench = _FusedIndicesToMultihotBenchmark(
         input_fn=fused_indices_to_multihot_input_fn,
         op_name="fused_indices_to_multihot",
-        torch_op=fused_indices_converter.fused_indices_to_multihot,
+        # Megatron's IndicesToMultihot is a Triton kernel, not a torch
+        # composition, so it is a real on-machine baseline when it loads; a
+        # torch composition is never timed as one.
+        torch_op=torch_op,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.set_train(flag_train.megatron.fused_indices_to_multihot)

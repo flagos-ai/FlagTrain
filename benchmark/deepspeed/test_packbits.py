@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Performance benchmark for packbits.
+
+There is no on-machine baseline: DeepSpeed's ``pack_bits`` was XPU-only and was
+deleted upstream (8ae0509ef), and torch has no packbits. A composition of torch
+primitives is not a competitor, so it is not timed: ``torch_op`` is ``None``,
+the benchmark reports Train latency only, and ``--base-data`` is the only
+comparison.
+"""
+
 import pytest
 import torch
 
@@ -35,34 +44,7 @@ _PACKBITS_SHAPES = [
     (32000, 8),
 ]
 
-_WEIGHTS = (128, 64, 32, 16, 8, 4, 2, 1)
-
-
-# No executable oracle to call: DeepSpeed's pack_bits was XPU-only and deleted upstream
-# (8ae0509ef), and torch has no packbits, so the baseline is assembled from primitives.
-def ref_packbits(x, dim=-1):
-    """PyTorch reference for packbits."""
-    x = x.movedim(dim, -1)
-    n = x.shape[-1]
-    if x.numel() == 0:
-        packed_len = (n + 7) // 8
-        empty = x.new_empty(*x.shape[:-1], packed_len, dtype=torch.uint8)
-        return empty.movedim(-1, dim)
-
-    bits = (~torch.signbit(x)).to(torch.uint8)
-    # On NPU ``torch.signbit`` calls -0.0 non-negative (CANN 9.0.0), where the CPU says
-    # otherwise; its bit is back in reach as 1/-0.0 = -inf against 1/+0.0 = +inf.
-    if flag_train.vendor_name == "ascend":
-        negative_zero = (x == 0) & (torch.reciprocal(x) < 0)
-        bits = torch.where(negative_zero, 0, bits)
-    if n % 8:
-        pad = [0] * (2 * x.ndim)
-        pad[1] = 8 - n % 8
-        bits = torch.nn.functional.pad(bits, pad)
-
-    weights = torch.tensor(_WEIGHTS, dtype=torch.uint8, device=x.device)
-    packed = (bits.reshape(*x.shape[:-1], -1, 8) * weights).sum(-1, dtype=torch.uint8)
-    return packed.movedim(-1, dim)
+_BASELINE = "none (no on-machine baseline; --base-data is the only comparison)"
 
 
 class _PackbitsBenchmark(base.GenericBenchmark):
@@ -78,10 +60,13 @@ def packbits_input_fn(shape, dtype, device):
 
 @pytest.mark.packbits
 def test_packbits_perf():
+    print(f"\nBaseline: {_BASELINE}")
     bench = _PackbitsBenchmark(
         input_fn=packbits_input_fn,
         op_name="packbits",
-        torch_op=ref_packbits,
+        # None: DeepSpeed's operator is gone and a torch composition is not
+        # timed as a baseline, so --base-data supplies the comparison.
+        torch_op=None,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.set_train(flag_train.deepspeed.packbits)

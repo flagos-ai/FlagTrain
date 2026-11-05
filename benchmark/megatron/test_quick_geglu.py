@@ -13,10 +13,15 @@
 # limitations under the License.
 """Performance benchmark for Megatron Quick GEGLU.
 
-The preferred baseline is Megatron-LM's official
-``megatron.core.fusions.fused_bias_geglu.quick_geglu`` interface. If
-Megatron-LM is not installed, the benchmark logs a warning and falls back to
-the equivalent PyTorch composition. Timing, warmup and synchronization come
+The baseline is Megatron-LM's
+``megatron.core.fusions.fused_bias_geglu.quick_geglu``, the vendor
+implementation this operator ports. Megatron defines it as a torch composition
+(``quick_gelu(y_1) * (y_2 + linear_offset)``) wrapped in ``jit_fuser``
+(``torch.compile``); the composition is the vendor's own implementation, so it
+is a valid on-machine baseline. When Megatron-LM is not installed, that exact
+composition is timed instead. The module-wide fixture raises Dynamo's recompile
+limit above this suite's case count so the compiled baseline does not silently
+fall back to eager halfway through. Timing, warmup and synchronization come
 from ``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode).
 """
 
@@ -61,25 +66,27 @@ def _full_compile_budget():
 
 
 def quick_geglu_ref(y, linear_offset=0.0):
+    """Megatron-LM's ``quick_geglu`` body; timed when Megatron is unavailable."""
     y_1, y_2 = torch.chunk(y, 2, dim=-1)
     return y_1 * torch.sigmoid(1.702 * y_1) * (y_2 + linear_offset)
 
 
-def base_op():
+def _load_mcore_quick_geglu():
+    """Megatron's ``quick_geglu``, or the composition it is defined as."""
     try:
         from megatron.core.fusions.fused_bias_geglu import quick_geglu
     except ImportError:
         warnings.warn(
-            "Megatron-LM is unavailable; using the PyTorch Quick GEGLU "
-            "composition as the correctness reference",
+            "Megatron-LM is unavailable; timing its torch composition as the "
+            "benchmark baseline",
             RuntimeWarning,
             stacklevel=2,
         )
-        return quick_geglu_ref
+        return quick_geglu_ref, "torch composition of megatron-core quick_geglu"
 
     chosen = quick_geglu
 
-    def reference(*args, **kwargs):
+    def torch_op(*args, **kwargs):
         nonlocal chosen
         if chosen is quick_geglu_ref:
             return chosen(*args, **kwargs)
@@ -88,14 +95,17 @@ def base_op():
         except Exception:
             warnings.warn(
                 "Megatron quick_geglu failed to compile on this platform; "
-                "falling back to the PyTorch Quick GEGLU composition",
+                "falling back to its torch composition",
                 RuntimeWarning,
                 stacklevel=2,
             )
             chosen = quick_geglu_ref
             return chosen(*args, **kwargs)
 
-    return reference
+    return torch_op, "megatron-core quick_geglu (@jit_fuser)"
+
+
+torch_op, _BASELINE = _load_mcore_quick_geglu()
 
 
 def _dtypes():
@@ -124,10 +134,12 @@ def quick_geglu_input_fn(shape, dtype, device):
 
 
 def _run():
+    print(f"\nBaseline: {_BASELINE}")
+
     bench = QuickGegluBenchmark(
         input_fn=quick_geglu_input_fn,
         op_name="quick_geglu",
-        torch_op=base_op(),
+        torch_op=torch_op,
         dtypes=_dtypes(),
     )
     bench.set_train(flag_train.megatron.quick_geglu)

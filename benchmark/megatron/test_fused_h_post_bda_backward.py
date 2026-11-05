@@ -11,7 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Benchmark fused_h_post_bda_backward against Megatron's Triton kernel."""
+"""Performance benchmark for the fused mHC H_post BDA backward operator.
+
+The baseline is Megatron-LM's ``_triton_h_post_bda_bwd`` when the installed
+megatron-core provides a kernel that can run here -- the kernel this port is a
+port *of*. When that kernel cannot run, the baseline is Megatron's own
+``_torch_h_post_bda_bwd`` torch composition, compiled the way Megatron compiles
+it (eager if ``torch.compile`` fails on this platform). ``_BASELINE`` records
+which one was measured.
+
+Both take the same ``(grad_output, h_res, original_residual, h_post, x, bias)``
+tuple, so there is nothing to pre-compute outside the timed region. The operator
+*is* the backward pass -- it returns the gradients -- so ``is_backward`` stays
+``False`` and the timed call is the operator itself. The functional suite
+(``tests/megatron/test_fused_h_post_bda_backward.py``) holds it to the torch
+composition.
+"""
 
 import warnings
 
@@ -46,6 +61,7 @@ _COMPREHENSIVE_SHAPES = [
 
 
 def _eager_backward(grad_output, h_res, original_residual, h_post, x, bias=None):
+    """Megatron-LM's ``_torch_h_post_bda_bwd`` body, transcribed."""
     s, b, n, channels = original_residual.shape
     sb = s * b
     go = grad_output.reshape(sb, n, channels)
@@ -75,8 +91,32 @@ def _eager_backward(grad_output, h_res, original_residual, h_post, x, bias=None)
 
 _torch_backward = torch.compile(_eager_backward)
 
+# The compiled baseline needs one graph per (shape, dtype); with dynamo's
+# default budget of 8 recompiles the tail of the sweep would be served eager.
+_COMPILE_BUDGET = 256
 
-def _select_baseline():
+
+@pytest.fixture(scope="module", autouse=True)
+def _full_compile_budget():
+    """Keep ``@torch.compile`` compiling across the whole sweep."""
+    config = torch._dynamo.config
+    names = [
+        name
+        for name in ("recompile_limit", "cache_size_limit")
+        if hasattr(config, name)
+    ]
+    saved = {name: getattr(config, name) for name in names}
+    for name in names:
+        setattr(config, name, max(saved[name], _COMPILE_BUDGET))
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(config, name, value)
+
+
+def _load_baseline():
+    """Megatron's Triton backward kernel, else its torch composition."""
     try:
         from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_bwd
 
@@ -86,28 +126,36 @@ def _select_baseline():
         with base.torch_device_fn.device(inputs[0].device):
             _triton_h_post_bda_bwd(*inputs)
             base.torch_device_fn.synchronize()
+        return _triton_h_post_bda_bwd, "megatron _triton_h_post_bda_bwd"
     except Exception as exc:
         warnings.warn(
-            "Megatron Triton fused_h_post_bda_backward baseline is unavailable "
-            f"({exc!r}); falling back to the Megatron-native torch.compile baseline.",
+            "Megatron-LM's Triton fused_h_post_bda_backward kernel is "
+            f"unavailable ({exc!r}); timing its _torch_h_post_bda_bwd "
+            "composition instead.",
             stacklevel=2,
         )
-        try:
-            inputs = next(
-                backward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
-            )
-            with base.torch_device_fn.device(inputs[0].device):
-                _torch_backward(*inputs)
-                base.torch_device_fn.synchronize()
-        except Exception as compile_exc:
-            warnings.warn(
-                "torch.compile baseline is unavailable "
-                f"({compile_exc!r}); falling back to eager execution.",
-                stacklevel=2,
-            )
-            return _eager_backward, "Megatron-native torch eager (fallback)"
-        return _torch_backward, "Megatron-native torch.compile (fallback)"
-    return _triton_h_post_bda_bwd, "megatron _triton_h_post_bda_bwd"
+
+    try:
+        inputs = next(
+            backward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
+        )
+        with base.torch_device_fn.device(inputs[0].device):
+            _torch_backward(*inputs)
+            base.torch_device_fn.synchronize()
+        return (
+            _torch_backward,
+            "megatron _torch_h_post_bda_bwd composition (@torch.compile)",
+        )
+    except Exception as compile_exc:
+        warnings.warn(
+            f"torch.compile baseline is unavailable ({compile_exc!r}); "
+            "falling back to eager execution.",
+            stacklevel=2,
+        )
+        return (
+            _eager_backward,
+            "megatron _torch_h_post_bda_bwd composition (eager)",
+        )
 
 
 def _make_inputs(shape, dtype, device):
@@ -125,7 +173,7 @@ def backward_input_fn(shape, dtype, device):
     yield _make_inputs(shape, dtype, device)
 
 
-_baseline_backward, _BASELINE = _select_baseline()
+torch_op, _BASELINE = _load_baseline()
 
 
 class FusedHPostBDABackwardBenchmark(base.GenericBenchmark):
@@ -144,17 +192,15 @@ class FusedHPostBDABackwardBenchmark(base.GenericBenchmark):
         return list(_COMPREHENSIVE_SHAPES)
 
 
-def torch_backward(grad_output, h_res, original_residual, h_post, x, bias=None):
-    return _baseline_backward(grad_output, h_res, original_residual, h_post, x, bias)
-
-
 @pytest.mark.fused_h_post_bda_backward
 def test_fused_h_post_bda_backward_perf():
     print(f"\nBaseline: {_BASELINE}")
     bench = FusedHPostBDABackwardBenchmark(
         input_fn=backward_input_fn,
         op_name="fused_h_post_bda_backward",
-        torch_op=torch_backward,
+        # Megatron's Triton kernel, or its _torch_h_post_bda_bwd composition
+        # when that kernel cannot run here.
+        torch_op=torch_op,
         dtypes=_DTYPES,
         is_backward=False,
     )
