@@ -16,8 +16,9 @@
 The baseline follows ``_DEEPSPEED_BASELINE_VENDORS`` below:
 
 * on a listed backend, DeepSpeed's ``multi_tensor_lion`` **is** the baseline.
-  If it cannot be built there the module raises rather than falling back --
-  measuring the torch reference and reporting it under the same name would
+  If it cannot be built there the loader warns and the baseline falls back to
+  ``multi_tensor_lion_ref``, which ``_BASELINE`` reports by its own name --
+  timing the torch reference while calling it the DeepSpeed baseline would
   answer a different question;
 * on any other backend the baseline is ``multi_tensor_lion_ref``, the plain-torch
   composition of the same contract, whether or not ``deepspeed`` is installed
@@ -31,6 +32,8 @@ is the single fused kernel launch. DeepSpeed's op rebuilds its host-side
 pointer arrays on every call; that asymmetry is the optimization being
 measured, not a benchmark artifact.
 """
+
+import warnings
 
 import pytest
 import torch
@@ -96,9 +99,9 @@ def multi_tensor_lion_ref(
 
 # Backends whose baseline is DeepSpeed. multi_tensor_lion ships as a CUDA op
 # builder, so only a backend that can compile and execute one can host it. On
-# these the baseline is not optional -- if it will not load, timing the torch
-# reference and reporting it under the DeepSpeed baseline's name would answer
-# another question.
+# these the baseline is expected: if it will not load, the loader warns and the
+# baseline falls back to multi_tensor_lion_ref, which _BASELINE reports by its
+# own name rather than as the DeepSpeed op.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
 
 
@@ -117,11 +120,14 @@ def _load_deepspeed_multi_tensor_lion():
 
         return FusedLionBuilder().load().multi_tensor_lion
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use DeepSpeed's multi_tensor_lion "
-            f"as its baseline, but it could not be loaded: {exc!r}. Build "
-            f"deepspeed, or drop the backend from _DEEPSPEED_BASELINE_VENDORS."
-        ) from exc
+        warnings.warn(
+            f"{flag_train.vendor_name!r} is expected to use DeepSpeed's "
+            f"multi_tensor_lion as its baseline, but it could not be loaded: "
+            f"{exc!r}. Falling back to the torch reference; build deepspeed "
+            f"to enable the fused baseline.",
+            stacklevel=2,
+        )
+        return None
 
 
 # Resolved once, so the first-use JIT compile is not counted in the measurement.
