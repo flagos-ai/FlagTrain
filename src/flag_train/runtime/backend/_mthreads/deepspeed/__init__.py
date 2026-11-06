@@ -18,10 +18,11 @@ module here as the generic one it replaces -- ``deepspeed/lamb.py`` beside
 ``flag_train/deepspeed/lamb.py`` -- so which generic module an override belongs to
 is readable from the path.
 
-Empty on purpose: no ``flag_train.deepspeed`` operator has a MUSA kernel of its
-own yet -- hence the empty ``__all__``. To specialise one, define it under this
-package, re-export it here (``from .lamb import lamb``) and list it in ``__all__``,
+To specialise an operator, define it under this package, re-export it here
+(``from .mixed_moe_gemm import mixed_moe_gemm``) and list it in ``__all__``,
 which is what ``SpecOpRegistrar`` registers.
 """
 
-__all__ = []
+from .mixed_moe_gemm import mixed_moe_gemm
+
+__all__ = ["mixed_moe_gemm"]
