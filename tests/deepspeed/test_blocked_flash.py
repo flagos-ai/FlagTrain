@@ -227,9 +227,9 @@ _KV_BLOCK_SIZE = 64
 # !! KEEP IN SYNC with benchmark/deepspeed/test_blocked_flash.py !!
 #
 # That file carries a second, byte-identical copy, used as the baseline when
-# `flash_attn` is absent. The duplication is deliberate -- a reference belongs to
-# the tests that check against it, not to the operator package, so that a checked
-# implementation is never code the operator ships. The cost is that the two
+# DeepSpeed's kernel is unavailable. The duplication is deliberate -- a reference
+# belongs to the tests that check against it, not to the operator package, so that
+# a checked implementation is never code the operator ships. The cost is that the two
 # copies can drift: change one and you must change the other, or the benchmark
 # will quietly measure against a different contract than the tests accept.
 # ---------------------------------------------------------------------------
@@ -625,8 +625,9 @@ def _run_case(
         _assert_close(out, dense, dtype, rtol, atol)
 
     # The reference implementation's own kernel, on the same inputs -- the oracle
-    # this port is answerable to. Checked whenever it loaded, which on the
-    # backends that require it is always.
+    # this port is answerable to. Checked whenever it loaded; on a backend that
+    # requires it that is the expected case, but an environment that cannot build
+    # the op drops this comparison (with a warning) rather than failing here.
     #
     # Two cases it cannot express, and they are different in kind:
     #

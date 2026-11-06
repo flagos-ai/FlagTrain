@@ -17,13 +17,13 @@ The generic implementation is ``flag_train.deepspeed.blocked_flash`` and is what
 every backend without an override runs. What is kept here is the part of that
 operator's tuning that only pays on MetaX's parts.
 
-Six things differ from the generic kernel and launcher:
+Seven things differ from the generic kernel and launcher:
 
 * a flat 1-D grid with the head index varying fastest and the atoms numbered
   widest-first, worth 1.3-2x on its own (see the kernel's comment);
 * the query tile is cut down to ``BLOCK_M`` rows and the grid given an axis for
   the tiles, rather than one program carrying the whole atom. This is the
-  largest single win of the six -- 5x on every shape measured; the query tile is
+  largest single win of the seven -- 5x on every shape measured; the query tile is
   a dot operand and so competes for shared memory with the KV tiles, and a
   128-row tile at head 128 leaves no room to pipeline anything. See
   ``_BLOCK_M_MAX``;
@@ -484,23 +484,25 @@ def _block_n_for(block_d, kv_block_size):
     cliff (27.1 ms on the same prompt), which is the other half of why the query
     tile is capped in the first place.
 
-    The tile is also held to the cache block size. It must never exceed it: the
-    inner loop masks a lane by ``kv_pos < total_extent``, which says nothing about
-    the block boundary, so a tile wider than the block would load rows belonging
-    to the *next* physical block and attend to KV the query was never given. The
-    generic launcher's ``next_power_of_2`` does not hold that line for a block
-    size that is not a power of two -- 48 rounds up to 64 -- so this takes the
-    largest power of two *below* the block size instead.
+    The tile is also held to the cache block size, and must not merely be no
+    wider than it: it must *divide* it. The inner loop walks a block in
+    ``range(0, KV_BLOCK_SIZE, BLOCK_N)`` steps, and the mask says nothing about
+    the block boundary, so a last step that overruns the block loads rows
+    belonging to the *next* physical block -- and then that next block's own
+    visit counts those rows a second time. Taking the largest power of two
+    *below* the block size does not divide a block size like 48 or 96, which is
+    why this takes the largest power of two that *divides* it instead.
     """
     cap = (
         _BLOCK_N_CAP_WIDE_HEAD if block_d > _NARROW_HEAD_D else _BLOCK_N_CAP_NARROW_HEAD
     )
-    block_n = min(cap, 1 << (int(kv_block_size).bit_length() - 1))
+    # The largest power of two dividing ``kv_block_size`` (its lowest set bit).
+    block_n = min(cap, int(kv_block_size) & -int(kv_block_size))
     if block_n < _MIN_BLOCK_N:
         raise ValueError(
-            "blocked flash walks a cache block in KV tiles of at least %d rows, "
-            "so the key cache's block size must be at least that; this one is %d"
-            % (_MIN_BLOCK_N, kv_block_size)
+            "blocked flash walks a cache block in power-of-two KV tiles of at "
+            "least %d rows, so the key cache's block size must be divisible by "
+            "such a tile; this one is %d" % (_MIN_BLOCK_N, kv_block_size)
         )
     return block_n
 

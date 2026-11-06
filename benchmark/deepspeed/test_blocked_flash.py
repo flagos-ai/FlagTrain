@@ -17,9 +17,10 @@ The baseline is picked by what the platform can run, in two tiers:
 
 * on a backend that runs DeepSpeed's own blocked-flash kernel, that kernel is the
   baseline. It is the kernel this port is a port *of*, which makes it the only
-  baseline that answers "what did the port cost", and it is *required*: if it
-  cannot be loaded the module raises rather than timing something else and
-  reporting it under that name;
+  baseline that answers "what did the port cost". The loader probes the compiled
+  op; if it cannot be built (a runtime-only CUDA install has no ``nvcc``) the
+  loader warns and this run falls back to the next tier, and the printed
+  ``_BASELINE`` line names what was actually timed;
 * everywhere else, ``blocked_flash_ref``, the plain-torch composition over the
   same paged cache. It is not a competitor, and the speedup there says how far
   the kernel is from *a* correct implementation rather than from the best one.
