@@ -396,6 +396,20 @@ ops:
   source: megatron.core.fusions.fused_softmax
   stages:
   - beta: '0.0.0'
+- id: tanh_soft_clamp
+  description: 'Tanh Soft Clamp activation: scale * tanh(x / scale), computed in fp32.'
+  for:
+  - tanh_soft_clamp
+  labels:
+  - megatron
+  - activation
+  from:
+  - megatron
+  kind:
+  - Activation
+  source: megatron.core.activations
+  stages:
+  - beta: '0.0.0'
 - id: unpackbits
   description: Unpacks uint8 bit-fields into floating-point values along a dimension.
   for:
