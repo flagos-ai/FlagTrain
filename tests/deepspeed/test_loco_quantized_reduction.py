@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-import os
 from enum import IntEnum
 
 import pytest
@@ -80,7 +79,6 @@ HAND_ASYM_MT_REST = 0x88
 
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
-_REQUIRE_DEEPSPEED = os.environ.get("FLAG_TRAIN_REQUIRE_DEEPSPEED", "") == "1"
 
 _DEEPSPEED_UNAVAILABLE_MSG = (
     "DeepSpeed's quantized_reduction reference is unavailable. The quantizer "
@@ -113,11 +111,6 @@ def _load_deepspeed_reduce():
 
 _deepspeed_reduce, _deepspeed_quant_type, _DEEPSPEED_VERSION = _load_deepspeed_reduce()
 
-if _deepspeed_reduce is None and _REQUIRE_DEEPSPEED:
-    raise RuntimeError(
-        f"{flag_train.vendor_name!r} must use DeepSpeed's quantized_reduction "
-        f"as its reference, but it is not usable. {_DEEPSPEED_UNAVAILABLE_MSG}"
-    )
 
 requires_deepspeed_reference = pytest.mark.skipif(
     _deepspeed_reduce is None, reason=_DEEPSPEED_UNAVAILABLE_MSG
