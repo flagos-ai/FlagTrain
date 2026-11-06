@@ -4,7 +4,6 @@ from .blocked_flash import blocked_flash
 from .cuda_wf6af16_linear import cuda_wf6af16_linear
 from .evoformer_attn import evoformer_attn
 from .lamb import lamb
-from .lion import multi_tensor_lion
 from .loco_quantized_reduction import loco_quantized_reduction
 from .mixed_gemm import mixed_gemm
 from .mixed_moe_gemm import mixed_moe_gemm
@@ -25,8 +24,6 @@ __all__ = [
     "multi_tensor_lion",
     "packbits",
     "unpackbits",
-    "wf6af16_linear",
-
 ]
 
 # The vendor-operator registration for these names runs in flag_train/__init__.py

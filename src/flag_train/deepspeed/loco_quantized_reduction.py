@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from enum import IntEnum
 from typing import List
 
@@ -21,6 +22,8 @@ import triton.language as tl
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
+
+logger = logging.getLogger(__name__)
 
 
 class QuantizationType(IntEnum):
@@ -607,6 +610,7 @@ def loco_quantized_reduction(
     quant_type=QuantizationType.Symmetric,
     devices_per_node: int = 1,
 ) -> List[torch.Tensor]:
+    logger.debug("TRAIN LOCO_QUANTIZED_REDUCTION")
     num_tensors = int(devices_per_node)
     if num_tensors < 1:
         raise ValueError(f"devices_per_node must be >= 1, got {num_tensors}")
