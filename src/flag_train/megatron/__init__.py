@@ -40,8 +40,8 @@ __all__ = [
     "scaled_masked_softmax_cuda_backward",
     "scaled_masked_softmax_cuda_forward",
     "scaled_upper_triang_masked_softmax_forward",
-    "weighted_squared_relu_impl",
     "tanh_soft_clamp",
+    "weighted_squared_relu_impl",
 ]
 
 # The vendor-operator registration for these names runs in flag_train/__init__.py

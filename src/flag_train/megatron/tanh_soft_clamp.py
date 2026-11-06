@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import replace
 
 import torch
@@ -22,6 +23,8 @@ from flag_train.runtime import device as runtime_device
 from flag_train.utils import pointwise_dynamic
 from flag_train.utils.codegen_config_utils import get_codegen_config
 from flag_train.utils.triton_lang_helper import tl_extra_shim
+
+logger = logging.getLogger(__name__)
 
 _CONFIG = get_codegen_config()
 if runtime_device.vendor_name == "ascend":
@@ -43,6 +46,7 @@ def _tanh_soft_clamp_kernel(x, scale):
 
 
 def tanh_soft_clamp(x: torch.Tensor, scale: float) -> torch.Tensor:
+    logger.debug("Tanh soft clamp")
     if not isinstance(x, torch.Tensor):
         raise TypeError(f"tanh_soft_clamp expects a tensor, got {type(x).__name__}")
     if not x.is_floating_point():
