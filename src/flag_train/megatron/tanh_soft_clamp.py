@@ -46,7 +46,7 @@ def _tanh_soft_clamp_kernel(x, scale):
 
 
 def tanh_soft_clamp(x: torch.Tensor, scale: float) -> torch.Tensor:
-    logger.debug("Tanh soft clamp")
+    logger.debug("TRAIN TANH_SOFT_CLAMP")
     if not isinstance(x, torch.Tensor):
         raise TypeError(f"tanh_soft_clamp expects a tensor, got {type(x).__name__}")
     if not x.is_floating_point():
