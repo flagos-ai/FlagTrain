@@ -242,7 +242,7 @@ def mixed_moe_gemm(
     operator; output must not overlap any input. This kernel allocates no
     intermediate tensors. It does not provide autograd.
     """
-    logger.debug("TRAIN MTHREADS MIXED_MOE_GEMM")
+    logger.debug("TRAIN_MTHREADS MIXED_MOE_GEMM")
     m, n, k, num_experts = _validate_inputs(
         output,
         hidden_states,
