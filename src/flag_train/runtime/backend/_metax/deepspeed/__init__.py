@@ -1,0 +1,33 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""MetaX ``deepspeed`` operators.
+
+A specialised operator goes in the same-named module here as the generic one it
+replaces -- ``deepspeed/blocked_flash.py`` beside
+``flag_train/deepspeed/blocked_flash.py`` -- and is listed in ``__all__`` below,
+which is what ``SpecOpRegistrar`` registers.
+
+``mixed_gemm`` is specialised here: this backend lowers bf16 through ``i16``, which the
+generic kernel's integer-to-bf16 conversion does not survive.
+"""
+
+from .blocked_flash import blocked_flash
+from .cuda_wf6af16_linear import cuda_wf6af16_linear
+from .mixed_gemm import mixed_gemm
+
+__all__ = [
+    "blocked_flash",
+    "cuda_wf6af16_linear",
+    "mixed_gemm",
+]

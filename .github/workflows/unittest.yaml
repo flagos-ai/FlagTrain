@@ -52,7 +52,9 @@
 #                                   in; nvidia has none (it builds its own)
 #   label_gated                     whether a `vendor/*` label is required
 #   prebuilt_env                    whether that image already ships torch and
-#                                   the triton stack (false only for thead)
+#                                   the triton stack (false for every backend
+#                                   today: each job installs backends.yaml's
+#                                   pins)
 #   enabled                         master switch per backend
 #
 # `unittest-required` is the always-running gate to require in branch

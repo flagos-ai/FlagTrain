@@ -1,0 +1,726 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""MetaX-tuned blocked flash attention.
+
+The generic implementation is ``flag_train.deepspeed.blocked_flash`` and is what
+every backend without an override runs. What is kept here is the part of that
+operator's tuning that only pays on MetaX's parts.
+
+Seven things differ from the generic kernel and launcher:
+
+* a flat 1-D grid with the head index varying fastest and the atoms numbered
+  widest-first, worth 1.3-2x on its own (see the kernel's comment);
+* the query tile is cut down to ``BLOCK_M`` rows and the grid given an axis for
+  the tiles, rather than one program carrying the whole atom. This is the
+  largest single win of the seven -- 5x on every shape measured; the query tile is
+  a dot operand and so competes for shared memory with the KV tiles, and a
+  128-row tile at head 128 leaves no room to pipeline anything. See
+  ``_BLOCK_M_MAX``;
+* a KV tile chosen by *head width* rather than by cache block size alone, and
+  only measured against the query tile above: the pair, not either alone, is
+  what decides whether the QK and PV dots land on one MMA layout. At
+  ``BLOCK_M`` of 64 and head 128, ``BLOCK_N`` of 32 is fastest and both
+  neighbours are worse -- 2.77 against 3.78 and 4.38 ms at 4096 tokens; at head
+  64 the best tile is 64, and it is 0.791 against 1.05 and 1.69 ms at 32 and 16.
+  See ``_block_n_for``;
+* both cache tiles read *column-major* rather than row-major (``_kv_tile``'s
+  ``TRANSPOSED``), which hands the QK dot its key operand in the orientation an
+  MMA wants instead of transposing it in registers. Worth 9-18% once the query
+  tile was capped -- see below for why that measurement moved;
+* a pipeline depth of one stage at the wide head, where each extra stage costs a
+  KV buffer out of the budget the query tile is competing for;
+* ``num_warps`` sized by *threads* rather than warps -- MetaX's warps are 64
+  threads against NVIDIA's 32, and the part caps a CTA at 512 threads, so the
+  count is also clamped to 8;
+* the KV tile settled against the device's shared-memory budget *before* the
+  launch, from the figure Triton reports for the tiling (``warmup`` compiles
+  without running), so the launch that follows is unconditional. No closed form
+  is used -- see ``_allocated_shared_memory`` for why one cannot be -- and when
+  even the narrowest tile does not fit the error names the exact requirement.
+
+The kernel *body* is the generic kernel's, unchanged -- the KV tile is the
+generic module's own ``_kv_tile``, imported rather than restated: only the
+program-to-work mapping and the launch scalars differ. That is deliberate -- the
+arithmetic is then identical to the implementation the numeric tests already
+cover, and this module is only responsible for the choices that are MetaX's.
+
+The column-major load is the one choice here whose measurement *reversed*.
+Against the atom-sized query tile it lost four of five shapes (2008 us against
+2394 us on a 4096-token head-64 case), which is what this module used to record;
+with a 64-row query tile it wins every shape. Both readings are of the same
+question -- which access pattern keeps the two dots on one layout -- and the
+query tile is part of the answer, which is why the two had to be measured
+together rather than one at a time.
+
+One thing Hygon's override does is deliberately *not* carried over: capping the
+KV tile at 32 unconditionally. That cap is exactly right at head 128, but at
+head 64 it is one tile too narrow and costs 1.3x (1.05 against 0.791 ms on the
+same prompt), so the cap stays a function of the head width.
+
+Everything shared is imported from the generic module so the two cannot drift:
+the atom-field constants (``_ATOM_*``, which are the kernel's view of the
+layout), ``_LOG2E``, and ``_check_launch_arguments`` -- the input checks are one
+implementation used by both, so a backend cannot accept something another
+rejects. Importing ``_check_launch_arguments`` rather than restating it is also
+what keeps the reference-launcher tests working: they monkeypatch the capability
+reader in the module it is defined in, and that has to be the generic module
+whichever backend dispatched here.
+
+Registration is by name. ``_metax/deepspeed/__init__.py`` re-exports this module's
+``blocked_flash`` straight from here, and ``SpecOpRegistrar`` writes it over the
+same-named generic function in ``flag_train.deepspeed`` when that package is
+imported -- the namespace the tests and the benchmark read the operator from.
+"""
+
+import functools
+import logging
+
+import triton
+import triton.language as tl
+
+from flag_train.deepspeed.blocked_flash import (
+    _ATOM_BLOCK_OFFSET,
+    _ATOM_GLOBAL_Q_IDX,
+    _ATOM_KV_BLOCKS,
+    _ATOM_Q_LEN,
+    _ATOM_Q_START,
+    _ATOM_STRIDE,
+    _ATOM_TOTAL_EXTENT,
+    _LOG2E,
+    _check_launch_arguments,
+    _kv_tile,
+)
+from flag_train.utils import libentry
+
+logger = logging.getLogger(__name__)
+
+# ``tl.dot`` requires N to be at least 16, and so does this launcher's narrowing
+# loop below: 16 is the narrowest KV tile that compiles, not merely the narrowest
+# that fits. Halving past it produces a compilation error rather than a resource
+# error, so the loop has to stop here rather than at 1.
+_MIN_BLOCK_N = 16
+
+# The widest query tile a program carries. This is not the atom width: the atom
+# is cut into tiles this wide and the grid gets an axis for them. See the
+# launcher for why 128 rows is too wide a dot operand on this part.
+_BLOCK_M_MAX = 64
+
+# The widest KV tile the tile-selection policy will ask for, before the device's
+# shared-memory budget narrows it further. See the module docstring for why the
+# threshold sits at a 64-wide head.
+_BLOCK_N_CAP_WIDE_HEAD = 32
+_BLOCK_N_CAP_NARROW_HEAD = 64
+_NARROW_HEAD_D = 64
+
+# Pipeline depth. Deeper is not better here: the KV walk's address for the next
+# tile comes from a scalar load of the block index, so the pipeliner can only
+# overlap so much, and each extra stage costs a KV buffer out of the same shared
+# budget the query tile is competing for. Measured on a C550 at 4096 tokens: at
+# head 128, one stage against three is 3.44 against 6.78 ms; at head 64 the three
+# depths are within 1% of each other.
+_NUM_STAGES_WIDE_HEAD = 1
+_NUM_STAGES_NARROW_HEAD = 3
+
+# 512 threads per CTA, in warps, at this part's 64-thread warps. Used to clamp
+# ``num_warps``; see the launcher.
+_MAX_THREADS_PER_CTA = 512
+
+
+@libentry()
+@triton.jit
+def _blocked_flash_fwd_kernel(
+    out_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    atoms_ptr,
+    block_idx_ptr,
+    qk_scale,
+    q_row_stride,
+    o_row_stride,
+    k_row_stride,
+    h_h_k_ratio,
+    n_heads_q,
+    n_q_tiles,
+    IS_CAUSAL: tl.constexpr,
+    KV_BLOCK_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Which (atom, head) pair this program runs is a scheduling decision, and it
+    # is worth more than the kernel's other knobs on this part: the programs are
+    # dispatched in linear-id order, so the order they are numbered in decides
+    # which of them run at the same time. Two effects, both order-only --
+    # permuting independent programs cannot change a result:
+    #
+    #   * heads vary fastest. The programs resident at any moment are then the
+    #     same atom on different heads, which read the same cache blocks; inside
+    #     a block the heads are contiguous, so memory sees one sequential stream
+    #     instead of ``n_heads_q`` scattered ones.
+    #   * atoms run from the widest to the narrowest. An atom's work grows with
+    #     its index -- under the causal single-sequence layout, with a 128-row
+    #     query tile against a 64-token cache block, atom *i* walks 2(i+1) cache
+    #     blocks -- so numbering them backwards hands the long programs to the
+    #     device first and leaves it the short ones to drain on. That ordering is
+    #     the one the benchmark's atoms are built in; for atoms from anywhere else
+    #     the reversal is an arbitrary permutation, which is why it is safe to
+    #     apply unconditionally.
+    #
+    # Measured against the generic 2-D ``(atoms, heads)`` grid in one process on
+    # a C550, with the atom-sized query tile this kernel used before it grew a
+    # tile axis, this ordering won every shape it was measured on: 2008 against
+    # 4094 us (4096 tokens, head 64), 10120 against 12683 us (4096, head 128),
+    # 1464 against 1996 us (1024, head 128, 32/8 heads). The 2-D grid cannot express
+    # either ordering -- its fast axis is the one with the shortest span -- and a
+    # ``(heads, atoms)`` grid would need ``num_atoms`` to fit in grid dimension
+    # 1, capping a batch at 65535 atoms. Flattening keeps the fast-varying axis
+    # under our control while leaving the grid bound at 2**31 programs, as the
+    # original ``(atoms, heads)`` grid had.
+    #
+    # A middle axis sits between the two: the atom's query rows are cut into
+    # ``BLOCK_M``-row tiles, because the query tile is not free either -- one
+    # program per atom has to span the widest atom, and a 128-row tile at head 128
+    # costs 3.7x what two 64-row tiles do. The tile is a dot operand and so is
+    # held in shared memory, which makes the shared budget, not the register one,
+    # what sets the width. Tiles vary slowest here, so the programs resident
+    # together are still one tile of one atom across its heads.
+    pid = tl.program_id(0)
+    hq = pid % n_heads_q
+    rest = pid // n_heads_q
+    tq = rest % n_q_tiles
+    atom = tl.num_programs(0) // (n_heads_q * n_q_tiles) - 1 - rest // n_q_tiles
+
+    # --- atom metadata -----------------------------------------------------
+    atom_base = atoms_ptr + atom * _ATOM_STRIDE
+    block_offset = tl.load(atom_base + _ATOM_BLOCK_OFFSET)
+    q_start = tl.load(atom_base + _ATOM_Q_START)
+    q_len = tl.load(atom_base + _ATOM_Q_LEN)
+    kv_blocks = tl.load(atom_base + _ATOM_KV_BLOCKS)
+    total_extent = tl.load(atom_base + _ATOM_TOTAL_EXTENT)
+    global_q_idx = tl.load(atom_base + _ATOM_GLOBAL_Q_IDX)
+
+    # Grouped-query attention: query heads are grouped in contiguous runs over one
+    # KV head, so dividing maps 32 query heads and 8 KV heads to runs of four
+    # (heads 0-3 read KV head 0, and so on). At h_h_k_ratio == 1 the division is
+    # the identity and this is plain multi-head attention.
+    hk = hq // h_h_k_ratio
+
+    # --- queries -----------------------------------------------------------
+    # This program's tile starts ``tq * BLOCK_M`` rows into the atom. A tile that
+    # starts past the atom's last row has nothing to do: the launcher sizes the
+    # grid by the widest atom, so the atoms that are narrower than that -- and
+    # the tail of the atom whose width is not a multiple of the tile -- leave
+    # this program with no rows at all.
+    m_start = tq * BLOCK_M
+    if m_start >= q_len:
+        return
+    offs_m = m_start + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    m_mask = offs_m < q_len
+    d_mask = offs_d < HEAD_SIZE
+
+    q_rows = q_start + offs_m
+    q_ptrs = q_ptr + q_rows[:, None] * q_row_stride + hq * HEAD_SIZE + offs_d[None, :]
+    # Kept in the input dtype so it matches ``k`` in the dot; the scale is applied
+    # to the fp32 scores instead, which is where it belongs numerically.
+    q = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0)
+
+    # A query token's position in the sequence, not in the tensor: a continuation
+    # starts at global_q_idx, which is what the causal mask compares against.
+    global_q_pos = global_q_idx + offs_m
+
+    m_i = tl.full((BLOCK_M,), float("-inf"), tl.float32)
+    l_i = tl.zeros((BLOCK_M,), tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+
+    # How many leading blocks neither mask can touch, so the loops below can walk
+    # them without them. A block covers KV positions
+    # ``[b * KV_BLOCK_SIZE, (b + 1) * KV_BLOCK_SIZE)``, and two things have to
+    # hold for the masks to be dead:
+    #
+    #   * the block is fully inside the atom's window -- ``kv_pos < total_extent``
+    #     cannot fire -- which is ``(b + 1) * KV_BLOCK_SIZE <= total_extent``;
+    #   * it sits entirely at or before this *tile's* first query row, so the
+    #     causal comparison cannot fire either. That row is
+    #     ``global_q_idx + m_start``, not ``global_q_idx``: a tile that starts
+    #     partway into the atom carries more history than the atom's first row,
+    #     and using the atom's row here would under-count the peel, not break it.
+    #
+    # Peeling is what makes the causal case cost what it should: on a 4096-token
+    # prompt 94% of the block visits have neither mask live, and the two masks
+    # together cost about 28% of the inner loop.
+    peeled = total_extent // KV_BLOCK_SIZE
+    if IS_CAUSAL:
+        peeled = tl.minimum(peeled, (global_q_idx + m_start + 1) // KV_BLOCK_SIZE)
+    peeled = tl.minimum(peeled, kv_blocks)
+
+    for b in range(0, peeled):
+        block = tl.load(block_idx_ptr + block_offset + b)
+        block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+
+        # A KV block holds kv_block_size tokens; walk it in BLOCK_N tiles so the
+        # tile does not have to know the cache's block size.
+        for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
+            offs_n = t0 + tl.arange(0, BLOCK_N)
+            m_i, l_i, acc = _kv_tile(
+                q,
+                k_ptr,
+                v_ptr,
+                block_row_base,
+                offs_n,
+                b * KV_BLOCK_SIZE + offs_n,
+                total_extent,
+                global_q_pos,
+                qk_scale,
+                m_i,
+                l_i,
+                acc,
+                k_row_stride,
+                hk,
+                offs_d,
+                d_mask,
+                MASKED=False,
+                IS_CAUSAL=IS_CAUSAL,
+                HEAD_SIZE=HEAD_SIZE,
+                BLOCK_N=BLOCK_N,
+                TRANSPOSED=True,
+            )
+
+    for b in range(peeled, kv_blocks):
+        block = tl.load(block_idx_ptr + block_offset + b)
+        block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
+            offs_n = t0 + tl.arange(0, BLOCK_N)
+            m_i, l_i, acc = _kv_tile(
+                q,
+                k_ptr,
+                v_ptr,
+                block_row_base,
+                offs_n,
+                b * KV_BLOCK_SIZE + offs_n,
+                total_extent,
+                global_q_pos,
+                qk_scale,
+                m_i,
+                l_i,
+                acc,
+                k_row_stride,
+                hk,
+                offs_d,
+                d_mask,
+                MASKED=True,
+                IS_CAUSAL=IS_CAUSAL,
+                HEAD_SIZE=HEAD_SIZE,
+                BLOCK_N=BLOCK_N,
+                TRANSPOSED=True,
+            )
+
+    # A row whose keys were all masked out has no contribution to renormalize.
+    l_i = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_i[:, None]
+
+    o_ptrs = out_ptr + q_rows[:, None] * o_row_stride + hq * HEAD_SIZE + offs_d[None, :]
+    tl.store(
+        o_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & d_mask[None, :]
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _device_properties(device_index):
+    """The device's property dict, or ``None`` if it cannot be read.
+
+    Cached. The call is cheap here -- about 2 us measured on a C550, against
+    kernels that run in tens of microseconds, and it is asked for once per
+    launch -- so this is not load-bearing the way it is on parts where the
+    property read is milliseconds. It is kept because the read is still on the
+    per-call path and device properties do not change under a running process,
+    so there is nothing to re-read and nothing to invalidate.
+    """
+    try:
+        from triton.runtime.driver import driver as triton_driver
+
+        return triton_driver.active.utils.get_device_properties(device_index)
+    except Exception:
+        return None
+
+
+def _warp_size(device_index):
+    """Threads per warp, or 32 when the device will not say.
+
+    A warp is not a fixed width across devices -- 32 on the NVIDIA parts this
+    operator was first tuned on, 64 here -- and the per-CTA sizing below is a
+    count of *threads*, so it has to know which. 32 is the value that sizing
+    already assumed before it could ask, so an unreadable device keeps that
+    behaviour rather than getting a new one.
+    """
+    props = _device_properties(device_index)
+    size = props.get("warpSize") if props else None
+    return int(size) if size else 32
+
+
+# The KV tile chosen for each (device, shape) request, so the selection runs once
+# per shape rather than once per call. This caches a *decision*, not a trial:
+# nothing here records a failure, because nothing fails -- the choice is made from
+# the allocator's own number before the launch is issued. Keyed by everything the
+# allocation can depend on, including ``KV_BLOCK_SIZE`` -- it is a constexpr loop
+# bound, and the pipeliner's buffer count is a function of it.
+_SELECTED_BLOCK_N = {}
+
+
+def _max_shared_memory(device_index):
+    """The device's shared-memory limit in bytes, or ``None`` if unreadable.
+
+    ``None`` means "cannot tell", and the caller then leaves the tiling alone
+    rather than guessing a limit it did not state -- the same rule the input
+    checks follow for a device that will not report a compute capability.
+    """
+    props = _device_properties(device_index)
+    limit = props.get("max_shared_mem") if props else None
+    return int(limit) if limit else None
+
+
+def _allocated_shared_memory(
+    out,
+    q,
+    k,
+    v,
+    attention_atoms,
+    kv_block_idx,
+    softmax_scale,
+    is_causal,
+    kv_block_size,
+    head_size,
+    h_h_k_ratio,
+    n_heads_q,
+    n_q_tiles,
+    num_warps,
+    num_stages,
+    block_m,
+    block_n,
+    block_d,
+):
+    """Shared memory Triton allocates for one tiling, in bytes, without launching.
+
+    ``warmup`` compiles and hands back the compiled kernel without running it,
+    which is the whole point: a tiling past the device's limit still *compiles* --
+    only the launch refuses it, inside ``CompiledKernel._init_handles``. So the
+    allocator's own figure is readable for a tiling that could never be launched,
+    and the selection below needs neither a failed launch nor a closed form.
+
+    A closed form is what this operator's other backends use, and it is not
+    available here: the allocation is the allocator's answer about buffer reuse,
+    which is a function of the layouts it picked for the two dots, and that is a
+    function of the compiler. Fitting one to this part gave an expression that
+    reproduces every narrow-head tiling exactly and *under*-states the wide-head
+    ones by 4-15 KB -- wrong in the direction that lets a doomed launch through,
+    which is the failure being replaced: an expression that is right until it is
+    not.
+
+    The figure is the one the launch itself is checked against, which is what
+    makes it usable as a pre-check: a 128-row tile at head 128 with ``BLOCK_N`` of
+    64 reports 81920 here and is refused with ``Required: 81920`` there.
+
+    The arguments are the launch's, because the kernel is compiled per signature
+    and the strides are part of it; they are not read.
+    """
+    compiled = _blocked_flash_fwd_kernel.warmup(
+        out,
+        q,
+        k,
+        v,
+        attention_atoms,
+        kv_block_idx,
+        softmax_scale,
+        q.stride(0),
+        out.stride(0),
+        k.stride(1),
+        h_h_k_ratio,
+        n_heads_q,
+        n_q_tiles,
+        grid=(1,),
+        IS_CAUSAL=is_causal,
+        KV_BLOCK_SIZE=kv_block_size,
+        HEAD_SIZE=head_size,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+    )
+    # ``warmup`` returns the same ``(kernel, hooks)`` pair a launch does.
+    compiled = compiled[0] if isinstance(compiled, tuple) else compiled
+    return compiled.metadata.shared
+
+
+def _block_n_for(block_d, kv_block_size):
+    """The KV tile this head size wants, before the device narrows it.
+
+    What this part charges for is the *pair* of tiles, not the KV one alone: the
+    QK and PV dots are assigned the same MMA layout until their operands get too
+    big for the machine's tiling, and past that point Triton inserts a
+    ``convert_layout`` between them inside the KV loop. With the 64-row query
+    tile the launcher uses, that point sits at head 128 between ``BLOCK_N`` 32 and
+    64 -- 2.77 against 3.78 and 4.38 ms on a 4096-token prompt with 32/8 heads
+    for 32, 64 and 16, and 0.238 against 0.333 and 0.352 ms at 1024 tokens -- so
+    32 is the wide-head cap. At head 64 the same cliff is past 64 (0.791 against
+    1.05 and 1.69 ms at 4096 tokens for 64, 32 and 16), so the narrow head keeps
+    the full tile.
+
+    The caps are only meaningful against the query tile they were measured with:
+    at ``BLOCK_M`` of 128 the pair ``BLOCK_N=32`` and head 128 is already past the
+    cliff (27.1 ms on the same prompt), which is the other half of why the query
+    tile is capped in the first place.
+
+    The tile is also held to the cache block size, and must not merely be no
+    wider than it: it must *divide* it. The inner loop walks a block in
+    ``range(0, KV_BLOCK_SIZE, BLOCK_N)`` steps, and the mask says nothing about
+    the block boundary, so a last step that overruns the block loads rows
+    belonging to the *next* physical block -- and then that next block's own
+    visit counts those rows a second time. Taking the largest power of two
+    *below* the block size does not divide a block size like 48 or 96, which is
+    why this takes the largest power of two that *divides* it instead.
+    """
+    cap = (
+        _BLOCK_N_CAP_WIDE_HEAD if block_d > _NARROW_HEAD_D else _BLOCK_N_CAP_NARROW_HEAD
+    )
+    # The largest power of two dividing ``kv_block_size`` (its lowest set bit).
+    block_n = min(cap, int(kv_block_size) & -int(kv_block_size))
+    if block_n < _MIN_BLOCK_N:
+        raise ValueError(
+            "blocked flash walks a cache block in power-of-two KV tiles of at "
+            "least %d rows, so the key cache's block size must be divisible by "
+            "such a tile; this one is %d" % (_MIN_BLOCK_N, kv_block_size)
+        )
+    return block_n
+
+
+def _select_block_n(block_n, allocated, limit, block_m, head_size):
+    """Narrow the KV tile until the device can hold the tiling, before launching.
+
+    ``allocated`` maps a KV tile to the bytes that tiling needs, and is asked
+    rather than assumed -- see ``_allocated_shared_memory``. The KV tile is the
+    only one of the three free to give here: ``BLOCK_D`` must span the whole head,
+    so shrinking it would silently drop head dimensions, and ``BLOCK_M`` has
+    already been brought down to the widest tile that measures well -- narrowing
+    it further trades a slower kernel for a smaller one, which is a decision for
+    the policy, not a rescue. Halving keeps it a power of two, which keeps it dividing
+    the cache block evenly, and the inner loop already walks a block in
+    ``BLOCK_N``-sized steps, so a narrower tile is the same arithmetic over more
+    passes.
+
+    Raises rather than returning a tile that cannot work, with the figures it
+    measured: the caller cannot fix an oversized query tile from here (only the
+    atom builder sizes it), so the diagnosis has to travel back to them.
+    """
+    while True:
+        needed = allocated(block_n)
+        if needed <= limit or block_n <= _MIN_BLOCK_N:
+            break
+        block_n //= 2
+    if needed > limit:
+        smaller = (
+            " %d rows is the next tile down." % (block_m // 2)
+            if block_m > _MIN_BLOCK_N
+            else " %d rows is already the narrowest query tile there is." % _MIN_BLOCK_N
+        )
+        raise RuntimeError(
+            "blocked flash needs %d bytes of shared memory for a %d-row query "
+            "tile at head_size %d, and the device has %d. That is already at the "
+            "narrowest KV tile that compiles (%d rows).%s Build the atoms with a "
+            "smaller q_block_size."
+            % (needed, block_m, head_size, limit, _MIN_BLOCK_N, smaller)
+        )
+    return block_n
+
+
+def blocked_flash(
+    out,
+    q,
+    k,
+    v,
+    attention_atoms,
+    kv_block_idx,
+    softmax_scale,
+    is_causal=True,
+    q_block_size=None,
+):
+    """Flash attention forward over the blocked KV-cache described by ``atoms``.
+
+    Args:
+        out (Tensor): output of shape ``[total_q, n_heads_q * head_size]``.
+        q (Tensor): queries of shape ``[total_q, n_heads_q * head_size]``.
+        k (Tensor): key cache of shape ``[n_blocks, block_size, n_heads_kv, head_size]``,
+            contiguous in the last dimension.
+        v (Tensor): value cache, same shape and layout as ``k``.
+        attention_atoms (Tensor): ``[num_atoms, 8]`` int32; see the generic
+            module's docstring for the field layout.
+        kv_block_idx (Tensor): int32 physical block indices, addressed by each
+            atom's ``block_offset`` field.
+        softmax_scale (float): scale applied to the query/key dot product.
+        is_causal (bool): mask each query against its position in the sequence.
+        q_block_size (int, optional): an upper bound on the atoms' ``q_len``,
+            normally the ``q_block_size`` the atoms were built with. Supplying it
+            avoids a device sync. ``None`` reads the maximum out of
+            ``attention_atoms``, which is always correct and is the default.
+            It is a **bound, not a hint**: an atom wider than it would have its
+            extra rows masked away, silently.
+
+    Returns:
+        Tensor: ``out``, updated in place.
+    """
+    logger.debug("TRAIN_METAX BLOCKED_FLASH")
+
+    # The query tiling is sized from the widest atom, so that maximum is what the
+    # sync below is for. Taking it off the device costs ~50 us, which at small
+    # shapes is several times the kernel it is sizing -- so a caller who already
+    # knows the bound hands it over and the sync never happens.
+    head_size = k.size(-1)
+    num_heads_q = q.size(-1) // head_size
+    num_heads_kv = k.size(-2)
+    num_atoms = attention_atoms.size(0)
+
+    _check_launch_arguments(q, k, v, head_size, num_heads_q, num_heads_kv)
+
+    # k is [n_blocks, block_size, n_heads_kv, head_size] with contiguous heads, so
+    # stride(0) / stride(1) is the cache's block size -- the same quantity the
+    # DeepSpeed launcher leaves implicit.
+    kv_block_size = k.stride(0) // k.stride(1)
+    if kv_block_size * k.stride(1) != k.stride(0):
+        raise ValueError("key cache must be contiguous across the block dimension")
+
+    if q_block_size is None:
+        # ``int()`` because the constants are constexpr for the kernel's benefit
+        # and torch will not index a tensor with one; ``item()`` is the sync.
+        q_len_max = (
+            int(attention_atoms[:, int(_ATOM_Q_LEN)].max().item()) if num_atoms else 0
+        )
+    else:
+        q_len_max = q_block_size
+
+    # The query tile is *capped*, not atom-sized: the widest atom's rows are cut
+    # into tiles this wide and the grid gets an axis for them. The query tile is a
+    # dot operand, so it lives in shared memory -- 128 rows of head 128 is 32 KB of
+    # the 64 KB this part has, which leaves nothing for the KV tiles to be
+    # pipelined into and lands the two dots on different MMA layouts besides. On a
+    # 4096-token prompt with 32/8 heads, and holding the KV tile at 16 so that only
+    # the query tile moves, 128 rows against 64 is 15.2 against 4.09 ms; with the
+    # wider KV tile the narrow query tile then affords, the whole change is 20.3
+    # against 2.77 ms. BLOCK_D is the whole head, padded up, and is the one of the
+    # two that cannot give: narrowing it would drop head dimensions, silently.
+    BLOCK_M = min(_BLOCK_M_MAX, max(triton.next_power_of_2(q_len_max), 16))
+    n_q_tiles = max(1, (q_len_max + BLOCK_M - 1) // BLOCK_M)
+    BLOCK_D = triton.next_power_of_2(head_size)
+    BLOCK_N = _block_n_for(BLOCK_D, kv_block_size)
+
+    device_index = q.device.index if q.device.index is not None else 0
+    element_size = q.element_size()
+
+    # Size the CTA to the accumulator. ``acc`` is BLOCK_M x BLOCK_D of fp32 and
+    # lives in registers for the whole KV walk, so the per-thread share of it is
+    # what decides whether the kernel spills -- and capping registers with
+    # ``maxnreg`` to buy occupancy is catastrophic here, which says the kernel
+    # needs the registers it asks for. The generic rule's ``// 2048`` is an
+    # A100 measurement -- 8 warps of 32 threads, holding the per-thread share
+    # near 64 -- so the constant has to scale with the warp width: this device's
+    # warps are 64 threads. Four warps is the floor. Unlike the generic rule this
+    # one is also clamped to the CTA limit: 512 threads here, i.e. 8 warps, and a
+    # wider ``BLOCK_M * BLOCK_D`` would ask for more and then fail to launch. At
+    # the tilings this operator actually uses -- 64x64 and 64x128 -- 4 warps and
+    # 8 measure within 2% of each other, so the rule is here for the shapes that
+    # are not on the benchmark, not for the ones that are.
+    warp_size = _warp_size(device_index)
+    num_warps = max(4, (BLOCK_M * BLOCK_D) // (64 * warp_size))
+    num_warps = min(num_warps, max(1, _MAX_THREADS_PER_CTA // warp_size))
+    num_stages = (
+        _NUM_STAGES_WIDE_HEAD if BLOCK_D > _NARROW_HEAD_D else _NUM_STAGES_NARROW_HEAD
+    )
+
+    # Shared memory is the limit that actually bites, and it is the allocator's
+    # answer rather than anything derivable from the source. So the KV tile is
+    # settled *before* the launch, from the figure Triton reports for the tiling
+    # (``_allocated_shared_memory``), which is what makes the launch below
+    # unconditional: by the time it is issued the tiling is known to fit, so there
+    # is no failure to catch and no second attempt to make. The device is read
+    # once per shape -- the answer is memoised -- rather than per call, and when it
+    # will not report a limit the tiling is left alone instead of being narrowed
+    # against a budget the device never stated.
+    key = (device_index, BLOCK_M, BLOCK_D, kv_block_size, element_size, BLOCK_N)
+    if key not in _SELECTED_BLOCK_N:
+        limit = _max_shared_memory(device_index)
+
+        def allocated(block_n):
+            return _allocated_shared_memory(
+                out,
+                q,
+                k,
+                v,
+                attention_atoms,
+                kv_block_idx,
+                softmax_scale,
+                is_causal,
+                kv_block_size,
+                head_size,
+                num_heads_q // num_heads_kv,
+                num_heads_q,
+                n_q_tiles,
+                num_warps,
+                num_stages,
+                BLOCK_M,
+                block_n,
+                BLOCK_D,
+            )
+
+        _SELECTED_BLOCK_N[key] = (
+            BLOCK_N
+            if limit is None
+            else _select_block_n(BLOCK_N, allocated, limit, BLOCK_M, head_size)
+        )
+    block_n = _SELECTED_BLOCK_N[key]
+
+    _blocked_flash_fwd_kernel[(num_atoms * num_heads_q * n_q_tiles,)](
+        out,
+        q,
+        k,
+        v,
+        attention_atoms,
+        kv_block_idx,
+        # The kernel's softmax runs on exp2, so log2(e) rides on the scale rather
+        # than costing an exp() per score.
+        softmax_scale * _LOG2E,
+        q.stride(0),
+        out.stride(0),
+        k.stride(1),
+        # Query heads that share one KV head; the kernel divides by it to find
+        # this program's KV head.
+        num_heads_q // num_heads_kv,
+        # The flat grid's fast axis is the head index, so the kernel needs the
+        # head count to take the modulus; the middle axis is the query tile.
+        num_heads_q,
+        n_q_tiles,
+        IS_CAUSAL=is_causal,
+        # Both are host-side values that the kernel only ever uses as a loop
+        # bound and a mask extent. As runtime scalars they force the inner KV
+        # loop to stay dynamic and every load mask to carry a term that is
+        # statically true; as constexpr they fold away.
+        KV_BLOCK_SIZE=kv_block_size,
+        HEAD_SIZE=head_size,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=block_n,
+        BLOCK_D=BLOCK_D,
+    )
+    return out

@@ -28,7 +28,7 @@ pytestmark = [
     pytest.mark.mixed_moe_gemm,
     pytest.mark.skipif(
         flag_train.vendor_name
-        not in ("nvidia", "hygon", "metax", "thead", "iluvatar", "ascend"),
+        not in ("nvidia", "hygon", "metax", "thead", "iluvatar", "ascend", "mthreads"),
         reason="Unsupported accelerator",
     ),
 ]

@@ -26,6 +26,10 @@ import yaml
 
 import flag_train
 from flag_train.cli_override import add_override_arguments, apply_overrides_from_args
+from flag_train.reference_candidate import (
+    add_reference_candidate_argument,
+    configure_reference_candidate,
+)
 
 BUILTIN_MARKS = {
     "filterwarnings",
@@ -98,6 +102,7 @@ def pytest_addoption(parser):
 
     # Add dynamic operator override options
     add_override_arguments(parser)
+    add_reference_candidate_argument(parser)
 
 
 def pytest_configure(config):
@@ -137,6 +142,7 @@ def pytest_configure(config):
         )
 
     # Apply dynamic operator overrides
+    configure_reference_candidate(config)
     config._override_registry = apply_overrides_from_args(config.option)
 
 
@@ -211,6 +217,9 @@ def pytest_runtest_logreport(report):
             result["reason"] = reason
     elif report.when == "call":
         result["result"] = report.outcome
+        reference_candidate = getattr(report, "reference_candidate", None)
+        if reference_candidate:
+            result["candidate_source"] = reference_candidate["candidate_source"]
         if report.outcome in ["skipped", "failed"]:
             reason = get_reason(report)
             result["reason"] = reason

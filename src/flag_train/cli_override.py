@@ -29,7 +29,11 @@ from typing import Any, Dict, Optional
 
 import yaml
 
-from .dynamic_registry import DynamicOpOverride
+from .dynamic_registry import (
+    DynamicOpOverride,
+    default_impl_name,
+    validate_operator_name,
+)
 
 
 def parse_override_spec(spec: str) -> tuple:
@@ -41,6 +45,11 @@ def parse_override_spec(spec: str) -> tuple:
         - "op_name:filepath:func_name" - load specified function
         - "op_name=filepath" - alternative syntax
         - "op_name=filepath:func_name" - alternative syntax
+
+    ``op_name`` may be bare (``fused_proj_rms_backward``) or qualified
+    (``megatron.fused_proj_rms_backward`` /
+    ``flag_train.megatron.fused_proj_rms_backward``). When no function name
+    is given, the bare operator name is used.
 
     Args:
         spec: Override specification string
@@ -60,6 +69,10 @@ def parse_override_spec(spec: str) -> tuple:
     else:
         raise ValueError(f"Invalid override spec format: {spec}")
 
+    # Validate the operator path early so malformed specs fail with a clear
+    # message instead of becoming a literal attribute name.
+    validate_operator_name(op_name)
+
     # Parse the rest for filepath and optional function name
     if ":" in rest:
         filepath, func_name = rest.split(":", 1)
@@ -67,7 +80,12 @@ def parse_override_spec(spec: str) -> tuple:
         func_name = func_name.strip()
     else:
         filepath = rest.strip()
-        func_name = op_name
+        func_name = default_impl_name(op_name)
+
+    if not filepath:
+        raise ValueError(f"Missing implementation file in override spec: {spec}")
+    if not func_name:
+        raise ValueError(f"Missing function name in override spec: {spec}")
 
     return op_name, filepath, func_name
 
@@ -113,21 +131,25 @@ def load_override_config(config_path: str) -> Dict[str, tuple]:
     override_dict = config.get("overrides", {})
 
     for op_name, spec in override_dict.items():
+        validate_operator_name(op_name)
         if isinstance(spec, str):
             # Simple string format: "filepath" or "filepath:func_name"
             if ":" in spec:
                 filepath, func_name = spec.split(":", 1)
             else:
                 filepath = spec
-                func_name = op_name
+                func_name = default_impl_name(op_name)
         elif isinstance(spec, dict):
             # Dict format with 'file' and optional 'function'
             filepath = spec.get("file")
-            func_name = spec.get("function", op_name)
+            func_name = spec.get("function", default_impl_name(op_name))
             if not filepath:
                 raise ValueError(f"Missing 'file' key for operator '{op_name}'")
         else:
             raise ValueError(f"Invalid override spec for '{op_name}': {spec}")
+
+        if not func_name:
+            raise ValueError(f"Missing function name for operator '{op_name}'")
 
         overrides[op_name] = (filepath, func_name)
 
@@ -152,35 +174,48 @@ def apply_overrides_from_args(
     if registry is None:
         registry = DynamicOpOverride()
 
-    # Apply overrides from config file
-    if hasattr(args, "override_config") and args.override_config:
-        try:
-            config_overrides = load_override_config(args.override_config)
-            for op_name, (filepath, func_name) in config_overrides.items():
-                success = registry.override_from_file(op_name, filepath, func_name)
-                if success:
-                    print(f"✓ Overridden {op_name} from {filepath}:{func_name}")
-                else:
-                    print(f"✗ Failed to override {op_name}", file=sys.stderr)
-                    sys.exit(1)
-        except Exception as e:
-            print(f"Error loading config: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    # Apply overrides from command-line specs
-    if hasattr(args, "override") and args.override:
-        for spec in args.override:
+    # Applying overrides is transactional: a bad spec, an unloadable
+    # candidate or a failing later entry must not leave this call's changes
+    # (including tracked-but-never-invoked candidates) behind. Pre-existing
+    # overrides on the supplied registry are restored exactly on failure.
+    snapshot = registry._snapshot_state()
+    try:
+        # Apply overrides from config file
+        if hasattr(args, "override_config") and args.override_config:
             try:
-                op_name, filepath, func_name = parse_override_spec(spec)
-                success = registry.override_from_file(op_name, filepath, func_name)
-                if success:
-                    print(f"✓ Overridden {op_name} from {filepath}:{func_name}")
-                else:
-                    print(f"✗ Failed to override {op_name}", file=sys.stderr)
-                    sys.exit(1)
+                config_overrides = load_override_config(args.override_config)
+                for op_name, (filepath, func_name) in config_overrides.items():
+                    # Resolve before loading the candidate so malformed,
+                    # unsupported or ambiguous operator paths fail loudly.
+                    registry.resolve_target(op_name)
+                    success = registry.override_from_file(op_name, filepath, func_name)
+                    if success:
+                        print(f"✓ Overridden {op_name} from {filepath}:{func_name}")
+                    else:
+                        print(f"✗ Failed to override {op_name}", file=sys.stderr)
+                        sys.exit(1)
             except Exception as e:
-                print(f"Error parsing override spec '{spec}': {e}", file=sys.stderr)
+                print(f"Error loading config: {e}", file=sys.stderr)
                 sys.exit(1)
+
+        # Apply overrides from command-line specs
+        if hasattr(args, "override") and args.override:
+            for spec in args.override:
+                try:
+                    op_name, filepath, func_name = parse_override_spec(spec)
+                    registry.resolve_target(op_name)
+                    success = registry.override_from_file(op_name, filepath, func_name)
+                    if success:
+                        print(f"✓ Overridden {op_name} from {filepath}:{func_name}")
+                    else:
+                        print(f"✗ Failed to override {op_name}", file=sys.stderr)
+                        sys.exit(1)
+                except Exception as e:
+                    print(f"Error parsing override spec '{spec}': {e}", file=sys.stderr)
+                    sys.exit(1)
+    except BaseException:
+        registry._rollback_state(snapshot)
+        raise
 
     return registry
 

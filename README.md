@@ -24,34 +24,51 @@ FlagOS runtime image plus `megatron-core`:
 | Backend | Image |
 | --- | --- |
 | `nvidia-cuda133` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-generic-13.3:2.2.0-0.2.3` |
+| `ascend-cann9.0.0` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-ascend-cann9.0.0:2.2.0-0.2.3` |
+| `metax-c550` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-metax-maca3.8.1.3:2.2.0-0.2.3` |
+| `hygon-bw1000` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-hygon-dtk26.04:2.2.0-0.2.3` |
+| `iluvatar-BI-V150` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-iluvatar-corex4.5.0:2.2.0-0.2.3` |
+| `mthreads-MTT-S5000` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-mthreads-musa5.2.0:2.2.0-0.2.3` |
 
 Image names and tags are owned by build-infra. The table reflects the
 `2.2.0-0.2.3` release; the current catalog is at
 <https://flagos-ai.github.io/release-info/>.
 
-Inside the image, only FlagTrain's own dependencies need installing:
+Inside the image, install FlagTrain and its optional test or vendor dependencies
+with `uv pip install`:
 
 ```bash
-python -m pip install -e .           # runtime
-python -m pip install -e ".[test]"   # development and tests
+uv pip install -e .                  # runtime
+uv pip install -e ".[test]"          # development and tests
+uv pip install -e ".[test,nvidia]"   # NVIDIA dependencies and tests
 ```
 
-On the FlagOS network, set `PIP_INDEX_URL` to the mirror before installing (the
-image's pip does not persist one); see [docs/installation.md](docs/installation.md).
+> `uv` is a builtin command/feature in `build-infra` images
+
+> **Important:** Use `uv pip install`, not `pip install`, when installing a
+> vendor extra. DeepSpeed declares generic `torch` and `triton` dependencies,
+> while FlagOS `build-infra` images already provide hardware-specific
+> compatible builds. FlagTrain uses `[tool.uv].exclude-dependencies` to keep
+> those image packages out of dependency resolution and still install
+> DeepSpeed's other transitive dependencies. `pip` does not read this `uv`
+> configuration and currently has no equivalent project setting for
+> excluding selected transitive dependencies.
+
+On the FlagOS network, set `UV_DEFAULT_INDEX` to the package mirror before
+installing.
 
 Vendor extras install the stack pinned in `backends.yaml` and are intended for
 environments without a FlagOS image:
 
 ```bash
-python -m pip install -e ".[metax]"        # MetaX
-python -m pip install -e ".[test,nvidia]"  # NVIDIA + tests
+uv pip install -e ".[metax]"        # MetaX
+uv pip install -e ".[test,nvidia]"  # NVIDIA + tests
 ```
 
-The image already provides torch, numpy, flagtree and megatron-core, so the
-vendor extra is not needed there; if the two disagree, the image wins. See
-[docs/installation.md](docs/installation.md) for the full image and extra
-tables, package indexes, and how the extras are kept in sync with
-`backends.yaml`.
+The image already provides `torch`, `numpy`, `flagtree` and `megatron-core`. The `uv`
+exclusion policy preserves the image-provided torch and Triton implementations
+while resolving the remaining vendor-extra dependencies. Keep vendor extras in
+sync with the versions documented in `backends.yaml`.
 
 ## Design Goals
 

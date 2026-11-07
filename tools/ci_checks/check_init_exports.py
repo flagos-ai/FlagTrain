@@ -39,11 +39,12 @@ def discover_init_files() -> list[Path]:
       - Main package: src/flag_train/__init__.py
       - Generic ops: src/flag_train/ops/__init__.py
       - Generic ops: src/flag_train/deepspeed/__init__.py
-      - Backend ops: src/flag_train/runtime/backend/*/*/ops/__init__.py
-      - Backend ops: src/flag_train/runtime/backend/*/*/deepspeed/__init__.py
+      - Backend ops: src/flag_train/runtime/backend/_<vendor>/<pkg>/__init__.py
+        for pkg in deepspeed, megatron, transformer_engine
+      - Architecture ops: .../runtime/backend/_<vendor>/<arch>/ops/__init__.py
 
-    Excludes utility/helper packages (utils, fused, etc.) since they typically
-    don't export operators with the same naming conventions.
+    Excludes utility/helper packages (utils, etc.) since they typically don't
+    export operators with the same naming conventions.
     """
     root = Path("src/flag_train")
     if not root.exists():
@@ -66,24 +67,21 @@ def discover_init_files() -> list[Path]:
     if ops_init.exists():
         files.append(ops_init)
 
-    # 3. All backend ops __init__.py files
-    # Pattern: src/flag_train/runtime/backend/_<vendor>/ops/__init__.py
+    # 3. All backend operator-package __init__.py files
+    # Pattern: src/flag_train/runtime/backend/_<vendor>/<pkg>/__init__.py
     # Pattern: src/flag_train/runtime/backend/_<vendor>/<arch>/ops/__init__.py
+    operator_packages = ("deepspeed", "megatron", "transformer_engine")
     backend_root = root / "runtime" / "backend"
     if backend_root.exists():
         for vendor_dir in backend_root.iterdir():
             if not vendor_dir.is_dir() or not vendor_dir.name.startswith("_"):
                 continue
 
-            # Check vendor-level ops/
-            vendor_ops_init = vendor_dir / "ops" / "__init__.py"
-            if vendor_ops_init.exists():
-                files.append(vendor_ops_init)
-
-            # Check vendor-level ops/
-            vendor_deepspeed_ops_init = vendor_dir / "ops" / "deepspeed" / "__init__.py"
-            if vendor_deepspeed_ops_init.exists():
-                files.append(vendor_deepspeed_ops_init)
+            # Check the vendor-level operator packages
+            for package in operator_packages:
+                vendor_pkg_init = vendor_dir / package / "__init__.py"
+                if vendor_pkg_init.exists():
+                    files.append(vendor_pkg_init)
 
             # Check architecture-level ops/ (e.g., _nvidia/hopper/ops/)
             for arch_dir in vendor_dir.iterdir():

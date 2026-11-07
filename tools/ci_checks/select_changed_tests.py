@@ -24,7 +24,7 @@ files do not share a name. Here they do, so the mapping collapses to a 1:1 rule
 by (component, filename stem):
 
     src/flag_train/<component>/<op>.py                        -> component/op
-    src/flag_train/runtime/backend/_<v>/ops/<component>/<op>.py -> component/op
+    src/flag_train/runtime/backend/_<v>/<component>/<op>.py   -> component/op
     tests/<component>/test_<op>.py                            -> component/op
     benchmark/<component>/test_<op>.py                        -> component/op
 
@@ -76,9 +76,13 @@ TESTS_ROOT = ROOT / "tests"
 BENCH_ROOT = ROOT / "benchmark"
 
 DOC_RE = re.compile(r"\.(md|rst)$|^docs/")
+# Backend packages that mirror a generic component; keep in sync with
+# ``flag_train.runtime.backend._OPERATOR_PACKAGES``.
+OPERATOR_PACKAGES = ("deepspeed", "megatron", "transformer_engine")
 GENERIC_OP_RE = re.compile(r"^src/flag_train/([^/]+)/([^/]+)\.py$")
 VENDOR_OP_RE = re.compile(
-    r"^src/flag_train/runtime/backend/_[^/]+/ops/([^/]+)/([^/]+)\.py$"
+    r"^src/flag_train/runtime/backend/_[^/]+/"
+    rf"({'|'.join(OPERATOR_PACKAGES)})/([^/]+)\.py$"
 )
 TEST_RE = re.compile(r"^tests/([^/]+)/test_(.+)\.py$")
 BENCH_RE = re.compile(r"^benchmark/([^/]+)/test_(.+)\.py$")

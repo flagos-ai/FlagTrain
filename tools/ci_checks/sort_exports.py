@@ -421,21 +421,19 @@ def discover_init_files() -> list[Path]:
     if ops_init.exists():
         files.append(ops_init)
 
-    # 3. All backend ops __init__.py files
+    # 3. All backend operator-package __init__.py files
+    operator_packages = ("deepspeed", "megatron", "transformer_engine")
     backend_root = root / "runtime" / "backend"
     if backend_root.exists():
         for vendor_dir in backend_root.iterdir():
             if not vendor_dir.is_dir() or not vendor_dir.name.startswith("_"):
                 continue
 
-            # Check vendor-level ops/
-            vendor_ops_init = vendor_dir / "ops" / "__init__.py"
-            if vendor_ops_init.exists():
-                files.append(vendor_ops_init)
-
-            vendor_ops_init = vendor_dir / "ops" / "deepspeed" / "__init__.py"
-            if vendor_ops_init.exists():
-                files.append(vendor_ops_init)
+            # Check the vendor-level operator packages
+            for package in operator_packages:
+                vendor_pkg_init = vendor_dir / package / "__init__.py"
+                if vendor_pkg_init.exists():
+                    files.append(vendor_pkg_init)
 
             # Check architecture-level ops/
             for arch_dir in vendor_dir.iterdir():

@@ -24,9 +24,10 @@
 #                  installed. Never install a vendor stack next to the one the
 #                  image was built with.
 #   --no-prebuilt  also install this backend's `deps:` from backends.yaml,
-#                  through the vendor's package index -- for a vendor image
-#                  that does not carry the FlagOS stack (thead's own pytorch
-#                  image).
+#                  through the vendor's package index. Every backend uses this
+#                  today, so the pins -- including the test reference packages
+#                  in them, megatron-core for one -- are installed rather than
+#                  assumed to be in the image.
 #
 # Everything comes out of backends.yaml, the same file the nvidia runner image
 # documents its pins in:
@@ -253,8 +254,9 @@ if [ "${PREBUILT}" -eq 0 ]; then
 fi
 
 # FlagTrain plus its test dependencies, as declared in pyproject.toml's
-# `[test]` extra (pytest, deepspeed, megatron-core, ...). Installed last so
-# the vendor pins above are already satisfied and pip leaves them alone.
+# `[test]` extra (pytest only). The reference packages the tests import
+# (megatron-core) are declared in `deps:` above, next to the vendor stack, and
+# are installed only with --no-prebuilt -- the mode every backend uses today.
 # pyyaml/sqlalchemy/numpy/packaging come from the package's core dependencies.
 python3 -m pip install "${pip_args[@]}" --no-build-isolation -e "${REPO_ROOT}[test]"
 
