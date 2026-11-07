@@ -44,6 +44,7 @@ _CORE_SHAPES = [
     (8, 4096, 11008),
 ]
 
+
 def fast_gelu_ref(x):
     """Megatron-LM's ``fast_gelu`` body; timed when Megatron is unavailable."""
     return 0.5 * x * (1 + torch.tanh(0.7978845608 * x * (1 + 0.044715 * x**2)))
