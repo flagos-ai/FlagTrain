@@ -47,12 +47,13 @@
 #
 # The performance stage writes benchmark_result.json with --record json and
 # passes --base-data=tools/op_flagtrain_perf_baseline.json, then runs
-# tools/perf_summary.py: every shape uses compared_speedup when the NVIDIA
-# baseline matched (otherwise the local torch-baseline speedup), and the tool
-# writes per-dtype/op summaries (summary.json/csv/md) that are uploaded with
-# the accuracy report. --base-data is optional: a missing baseline disables
-# the "vs Base" column without failing the run. When an operator has no
-# on-machine baseline (torch_op is None), that column is its only baseline.
+# tools/perf_summary.py: every shape uses the local torch-baseline speedup
+# when present (otherwise compared_speedup when the NVIDIA baseline matched),
+# and the tool writes per-dtype/op summaries (summary.json/csv/md) that are
+# uploaded with the accuracy report. --base-data is optional: a missing
+# baseline disables the "vs Base" column without failing the run. When an
+# operator has no on-machine baseline (torch_op is None), that column is its
+# only baseline.
 #
 # No shape uses a secret: a fork's PR builds and tests exactly like a branch
 # here.
