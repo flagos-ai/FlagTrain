@@ -17,6 +17,9 @@ from .quick_geglu import quick_geglu
 from .quick_gelu import quick_gelu
 from .scaled_masked_softmax_cuda_backward import scaled_masked_softmax_cuda_backward
 from .scaled_masked_softmax_cuda_forward import scaled_masked_softmax_cuda_forward
+from .scaled_upper_triang_masked_softmax_backward import (
+    scaled_upper_triang_masked_softmax_backward,
+)
 from .scaled_upper_triang_masked_softmax_forward import (
     scaled_upper_triang_masked_softmax_forward,
 )
@@ -41,6 +44,7 @@ __all__ = [
     "quick_gelu",
     "scaled_masked_softmax_cuda_backward",
     "scaled_masked_softmax_cuda_forward",
+    "scaled_upper_triang_masked_softmax_backward",
     "scaled_upper_triang_masked_softmax_forward",
     "tanh_soft_clamp",
     "weighted_squared_relu_impl",
