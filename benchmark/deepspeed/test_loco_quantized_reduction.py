@@ -59,6 +59,10 @@ SEED = 0
 
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
+# The baseline is DeepSpeed's quantized_reduction kernel on the vendors that
+# ship it; everywhere else, or when it cannot be built, there is no on-machine
+# baseline and ``torch_op`` is None, so --base-data is the only comparison.
+
 
 def _load_deepspeed_reduce():
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
@@ -73,7 +77,7 @@ def _load_deepspeed_reduce():
         warnings.warn(
             f"{flag_train.vendor_name!r} is expected to use DeepSpeed's "
             f"quantized_reduction as its baseline, but it could not be loaded: "
-            f"{exc!r}. Falling back to the torch composition; build deepspeed "
+            f"{exc!r}. This run has no on-machine baseline; build deepspeed "
             f"to enable the quantized_reduction baseline.",
             stacklevel=2,
         )
@@ -85,65 +89,8 @@ _deepspeed_reduce, _deepspeed_quant_type = _load_deepspeed_reduce()
 _BASELINE = (
     "deepspeed quantized_reduction"
     if _deepspeed_reduce is not None
-    else "torch composition"
+    else "none (no on-machine baseline; --base-data is the only comparison)"
 )
-
-
-def _unpack(b, num_bits):
-    if num_bits == 8:
-        return b
-
-    x = b.to(torch.int32)
-    return torch.stack([x >> 4, (x << 28) >> 28], dim=-1).reshape(
-        *b.shape[:-1], b.shape[-1] * 2
-    )
-
-
-def _pack(e, num_bits):
-    if num_bits == 8:
-        return (e.to(torch.int32) & 0xFF).to(torch.int8)
-
-    e = e.to(torch.int32) & 0xF
-    return ((e[..., 0::2] << 4) | e[..., 1::2]).to(torch.int8)
-
-
-def torch_reduction(
-    data, scales, in_groups, out_groups, num_bits, quant_type, devices_per_node
-):
-    symmetric = int(quant_type) == int(QuantizationType.Symmetric)
-    scales_elems = 1 if symmetric else 2
-
-    epit = data.numel() // devices_per_node
-    epog = epit // out_groups
-    gpit = in_groups // devices_per_node
-
-    q = _unpack(data.reshape(devices_per_node, out_groups, epog), num_bits).float()
-
-    if symmetric:
-        s = scales.reshape(devices_per_node, gpit)[:, :, None]
-        acc = (q * s).sum(0)
-        amax = torch.maximum(acc.amax(-1), -acc.amin(-1))
-        qscale = torch.where(
-            amax == 0, torch.ones_like(amax), (2**num_bits) / (2.0 * amax)
-        )
-        off = torch.zeros_like(qscale)
-    else:
-        sc = scales.reshape(devices_per_node, gpit, 2)
-        s, o = sc[:, :, 0][:, :, None], sc[:, :, 1][:, :, None]
-        acc = (q * s + o).sum(0)
-        mx, mn = acc.amax(-1), acc.amin(-1)
-        rng = mx - mn
-        qscale = torch.where(rng == 0, torch.ones_like(rng), (2**num_bits) / rng)
-        off = (mx + mn) / 2
-    if symmetric:
-        step = 1.0 / qscale
-    else:
-        step = torch.stack([1.0 / qscale, off], dim=-1).reshape(-1)
-    lo_q, hi_q = -(2 ** (num_bits - 1)), 2 ** (num_bits - 1) - 1
-    qout = torch.round((acc - off[..., None]) * qscale[..., None]).clamp(lo_q, hi_q)
-
-    packed = _pack(qout.to(torch.int32), num_bits).reshape(-1)
-    return [packed, step.reshape(out_groups, scales_elems)]
 
 
 def train_reduction(
@@ -154,26 +101,27 @@ def train_reduction(
     )
 
 
-def torch_op(
+def _baseline(
     data, scales, in_groups, out_groups, num_bits, quant_type, devices_per_node
 ):
-    if _deepspeed_reduce is not None:
-        return _deepspeed_reduce(
-            data,
-            scales,
-            in_groups,
-            out_groups,
-            num_bits,
-            (
-                _deepspeed_quant_type.Symmetric
-                if int(quant_type) == int(QuantizationType.Symmetric)
-                else _deepspeed_quant_type.Asymmetric
-            ),
-            devices_per_node,
-        )
-    return torch_reduction(
-        data, scales, in_groups, out_groups, num_bits, quant_type, devices_per_node
+    """DeepSpeed's quantized_reduction kernel."""
+    return _deepspeed_reduce(
+        data,
+        scales,
+        in_groups,
+        out_groups,
+        num_bits,
+        (
+            _deepspeed_quant_type.Symmetric
+            if int(quant_type) == int(QuantizationType.Symmetric)
+            else _deepspeed_quant_type.Asymmetric
+        ),
+        devices_per_node,
     )
+
+
+# ``None`` is the benchmark harness's "no on-machine baseline" sentinel.
+torch_op = _baseline if _deepspeed_reduce is not None else None
 
 
 def _make_inputs(out_groups, bpg, num_tensors, num_bits, symmetric, device):
@@ -253,7 +201,6 @@ def test_loco_quantized_reduction_perf(num_bits, symmetric):
         torch_op=torch_op,
         input_fn=input_fn,
         dtypes=[torch.int8],
-        native_baseline=_deepspeed_reduce is not None,
     )
     bench.set_train(train_reduction)
     bench.run()

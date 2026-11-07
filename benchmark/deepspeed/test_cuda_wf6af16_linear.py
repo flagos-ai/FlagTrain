@@ -17,12 +17,13 @@ The baseline follows ``_DEEPSPEED_BASELINE_VENDORS`` below:
 
 * on a listed backend with an Ampere GPU, DeepSpeed's ``cuda_wf6af16_linear``
   **is** the baseline. The CUDA kernel asserts ``__CUDA_ARCH__ == 800``, so on
-  any other architecture it cannot run -- the baseline falls back to the torch
-  reference there rather than measuring nothing;
-* everywhere else the baseline is ``cuda_wf6af16_ref``, an unfused torch
-  composition (unpack, dequantize to an fp16 weight matrix, cuBLAS GEMM). It
-  is not a competitor, and the speedup there says how far the kernel is from
-  *a* correct implementation rather than from the best one.
+  any other architecture it cannot run;
+* everywhere else there is no on-machine baseline. An unfused torch composition
+  (unpack, dequantize to an fp16 weight matrix, cuBLAS GEMM) is not a
+  competitor and is not timed: a ratio against it says how far the kernel is
+  from *a* correct implementation rather than from the best one. ``torch_op`` is
+  ``None``, so the framework reports Train latency only and ``--base-data`` is
+  the only comparison.
 
 The weight packings differ between the two implementations (DeepSpeed
 interleaves bits across threads for its MMA pipeline, FlagTrain packs densely
@@ -95,51 +96,22 @@ def _pack_weights_fp6(codes):
     return weights_2bit.contiguous(), weights_4bit.contiguous()
 
 
-# ---------------------------------------------------------------------------
-# Reference implementation
-# ---------------------------------------------------------------------------
-
-
-def _unpack_weights_fp6(weights_2bit, weights_4bit):
-    """Inverse of ``_pack_weights_fp6``, composed from plain torch ops."""
-    out_channels, packed_k = weights_2bit.shape
-    in_channels = packed_k * 4
-
-    b2 = weights_2bit.to(torch.int32)
-    top2 = torch.stack([(b2 >> s) & 0x3 for s in (6, 4, 2, 0)], dim=-1)
-    top2 = top2.reshape(out_channels, in_channels)
-
-    b4 = weights_4bit.to(torch.int32)
-    low4 = torch.stack([(b4 >> s) & 0xF for s in (4, 0)], dim=-1)
-    low4 = low4.reshape(out_channels, in_channels)
-
-    return ((top2 << 4) | low4).to(torch.uint8)
-
-
-def cuda_wf6af16_ref(hidden_states, weights_2bit, weights_4bit, scales):
-    """Unfused torch baseline: dequantize, then a plain fp16 GEMM."""
-    codes = _unpack_weights_fp6(weights_2bit, weights_4bit)
-    table = _fp6_e3m2_table(device=codes.device)
-    w = table[codes.long()].to(torch.float16) * scales[:, None]
-    return hidden_states @ w.T
-
-
 # Backends whose baseline is DeepSpeed when the extension and GPU allow it.
 # cuda_wf6af16_linear ships in the InferenceCore CUDA extension, so only a
 # backend that can compile and execute one can host it. Hygon is deliberately
 # absent: the extension builds through HIP there, but the kernel body is
 # guarded by __CUDA_ARCH__ in [800, 900) (kernel_matmul.cuh), so the DCU build
-# compiles to a stub that returns garbage or fails the launch outright; the
-# torch reference is the only baseline a DCU can run.
+# compiles to a stub that returns garbage or fails the launch outright; a DCU
+# therefore has no on-machine baseline.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
 
 def _load_deepspeed_cuda_wf6af16():
-    """DeepSpeed's cuda_wf6af16_linear, or ``None`` when it cannot run here.
+    """Harness-ready cuda_wf6af16_linear, or ``None`` when it cannot run here.
 
     Besides the extension building at all, the kernel hard-codes
     ``__CUDA_ARCH__ == 800``, so on non-Ampere NVIDIA GPUs it is treated as
-    unavailable and the torch reference becomes the baseline.
+    unavailable and no on-machine baseline is timed.
     """
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
         return None
@@ -156,7 +128,8 @@ def _load_deepspeed_cuda_wf6af16():
         inf_module.create_handle()
     except Exception:
         # The baseline is advisory, not contractual: a missing extension just
-        # means the torch reference is timed instead.
+        # means no on-machine baseline is timed and --base-data is the only
+        # comparison.
         return None
 
     def deepspeed_cuda_wf6af16(hidden_states, weights_2bit, weights_4bit, scales):
@@ -184,19 +157,23 @@ def _load_deepspeed_cuda_wf6af16():
         )
         return output
 
-    # The DeepSpeed packing needs the host-side preprocess_weight; expose it
-    # so the input setup can pre-pack.
-    deepspeed_cuda_wf6af16.preprocess_weight = inf_module.preprocess_weight
-    return deepspeed_cuda_wf6af16
+    def torch_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
+        return deepspeed_cuda_wf6af16(hidden, ds_w2, ds_w4, scales)
+
+    # The DeepSpeed packing needs the host-side preprocess_weight; expose it on
+    # the harness-ready callable so the input setup can pre-pack.
+    torch_op.preprocess_weight = inf_module.preprocess_weight
+    return torch_op
 
 
-# Resolved once, so the first-use JIT compile is not counted in the measurement.
-_deepspeed_cuda_wf6af16 = _load_deepspeed_cuda_wf6af16()
+# Resolved once, so the first-use JIT compile is not counted in the measurement;
+# ``None`` is the benchmark harness's "no on-machine baseline" sentinel.
+torch_op = _load_deepspeed_cuda_wf6af16()
 
 _BASELINE = (
     "deepspeed cuda_wf6af16_linear"
-    if _deepspeed_cuda_wf6af16 is not None
-    else "cuda_wf6af16_ref (torch)"
+    if torch_op is not None
+    else "none (no on-machine baseline; --base-data is the only comparison)"
 )
 
 
@@ -221,16 +198,15 @@ def cuda_wf6af16_input_fn(shape, dtype, device):
 
     weights_2bit, weights_4bit = _pack_weights_fp6(codes.to(device))
 
-    if _deepspeed_cuda_wf6af16 is not None:
+    ds_w2 = ds_w4 = None
+    if torch_op is not None:
         # DeepSpeed's packer wants the fake-quantized fp16 weights on CPU; the
         # table values are exact in fp16, so the repack is lossless.
         table = _fp6_e3m2_table()
         fake_fp16 = table[codes.long()].to(torch.float16)
-        ds_w2, ds_w4 = _deepspeed_cuda_wf6af16.preprocess_weight(fake_fp16)
+        ds_w2, ds_w4 = torch_op.preprocess_weight(fake_fp16)
         ds_w2 = ds_w2.to(device)
         ds_w4 = ds_w4.to(device)
-    else:
-        ds_w2 = ds_w4 = None
 
     yield (
         hidden.to(device),
@@ -242,15 +218,12 @@ def cuda_wf6af16_input_fn(shape, dtype, device):
     )
 
 
-def torch_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
-    """Baseline, chosen by platform. See the module docstring."""
-    if _deepspeed_cuda_wf6af16 is not None:
-        return _deepspeed_cuda_wf6af16(hidden, ds_w2, ds_w4, scales)
-    return cuda_wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
-
-
 def train_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
-    """The operator under test."""
+    """The operator under test.
+
+    ``ds_w2``/``ds_w4`` are the baseline's packing and are accepted only so both
+    ops are handed the same tuple.
+    """
     out_channels = scales.shape[0]
     tokens, in_channels = hidden.shape
     output = torch.empty(
@@ -270,14 +243,15 @@ def train_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
 
 @pytest.mark.cuda_wf6af16_linear
 def test_cuda_wf6af16_linear_perf():
+    print(f"\nBaseline: {_BASELINE}")
+
     bench = CudaWf6Af16LinearBenchmark(
         input_fn=cuda_wf6af16_input_fn,
         op_name="cuda_wf6af16_linear",
+        # None when DeepSpeed's kernel cannot run here: a torch composition is
+        # not timed as a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
         dtypes=[torch.float16],
-        # The local ratio is a real comparison when the baseline is DeepSpeed's
-        # kernel, so --base-data's cross-hardware figure does not apply.
-        native_baseline=_deepspeed_cuda_wf6af16 is not None,
     )
     bench.set_train(train_op)
     bench.run()

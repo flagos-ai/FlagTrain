@@ -139,14 +139,6 @@ class Benchmark:
     DEFAULT_SHAPE_DESC = "M, N"
     DEFAULT_SHAPE_FILES = "core_shapes.yaml"
     EPS = 1e-7
-    # True when ``torch_op`` IS the upstream/vendor implementation (megatron-core,
-    # ``deepspeed.ops.*``, flash-attn, ...) rather than a plain-torch transcription
-    # of it. The local Torch-vs-Train ratio is then already a real comparison, so
-    # ``--base-data`` is ignored for this operator: there is no "vs Base" column,
-    # and tools/perf_summary.py summarizes the raw Train Speedup instead. Set it
-    # from the same runtime resolution that picks ``torch_op`` -- e.g.
-    # ``native_baseline=_deepspeed_lamb is not None``.
-    native_baseline: bool = False
     """
     the base class for the operations benchmark
     """
@@ -554,9 +546,6 @@ class Benchmark:
         )
         if Config.native_baseline_skip_reason:
             result.native_baseline_skip_reason = Config.native_baseline_skip_reason
-        ignored_reason = self.base_data_ignored_reason()
-        if ignored_reason:
-            result.base_data_ignored = ignored_reason
         print(result)
         result_dict = asdict(result)
         if reference_mode_enabled():
@@ -568,8 +557,6 @@ class Benchmark:
             result_dict["native_baseline_skip_reason"] = (
                 Config.native_baseline_skip_reason
             )
-        if ignored_reason:
-            result_dict["base_data_ignored"] = ignored_reason
         update_result(self.op_name, result_dict)
         emit_record_logger(result.to_json())
         return result
@@ -634,17 +621,21 @@ class Benchmark:
         Config.executed_case_ids.update(executed)
         return results
 
-    def base_data_ignored_reason(self):
-        """Why ``--base-data`` does not apply here, or ``None`` when it does.
+    def _has_on_machine_baseline(self) -> bool:
+        """Whether ``torch_op`` can actually be timed on this machine.
 
-        A benchmark whose ``torch_op`` is the upstream implementation
-        (``native_baseline``) already measures a real reference on this device,
-        so the cross-hardware figure would replace a better number with a
-        worse one.
+        Two independent reasons leave ``latency_base`` without a value:
+
+        * ``torch_op is None`` -- the vendor has no reference implementation at
+          all (the "vendor-native missing" case carried over from FlagGems-vllm,
+          e.g. a custom op that is absent on this backend);
+        * ``Config.skip_native`` -- a benchmark marker says this vendor's native
+          baseline is deliberately not measured.
+
+        In both cases the local ``speedup`` has no denominator and stays
+        ``None``; ``--base-data`` becomes the only available comparison.
         """
-        if Config.base_data is not None and self.native_baseline:
-            return "native baseline"
-        return None
+        return self.torch_op is not None and not Config.skip_native
 
     def _record_base_comparison(self, metric, dtype):
         """Fill ``compared_speedup`` from the optional NVIDIA baseline.
@@ -655,8 +646,6 @@ class Benchmark:
         missing, the raw ratio is kept and the precise miss reason is recorded.
         """
         if Config.base_data is None or not metric.latency:
-            return
-        if self.base_data_ignored_reason():
             return
         base_rec, miss_reason = lookup_base_record_ex(
             Config.base_data,
@@ -669,6 +658,18 @@ class Benchmark:
         if base_ms is None:
             metric.base_miss_reason = miss_reason
             print(f"[vs Base][miss] {miss_reason}")
+            if self.torch_op is None:
+                # Method A, ported from FlagGems-vllm: with no vendor-native
+                # implementation on this machine and no NV baseline record,
+                # no baseline exists at all. Fail instead of publishing a row
+                # whose speedup and compared_speedup are both None.
+                # ``skip_native`` is an explicit per-vendor opt-out, so it
+                # keeps the soft-miss behavior.
+                pytest.fail(
+                    f"no baseline available for '{self.op_name}' "
+                    f"(dtype={dtype}): vendor-native missing and NV baseline "
+                    f"unmatched ({miss_reason})"
+                )
             return
         # Both values are milliseconds, so the raw ratio is dimensionless.
         # Divide by this chip's scaling factor for the baseline's bottleneck
@@ -706,7 +707,10 @@ class Benchmark:
                 )
             args, kwargs = self.unpack_to_args_kwargs(input)
             metric.shape_detail = self.record_shapes(*args, **kwargs)
-            if "latency_base" in self.to_bench_metrics and not Config.skip_native:
+            if (
+                "latency_base" in self.to_bench_metrics
+                and self._has_on_machine_baseline()
+            ):
                 metric.latency_base = self.get_latency(self.torch_op, *args, **kwargs)
             if "latency" in self.to_bench_metrics:
                 if reference_mode_enabled():
@@ -735,6 +739,11 @@ class Benchmark:
                     metric.candidate_source = "reference"
                 elif self.train_op:
                     metric.latency = self.get_latency(self.train_op, *args, **kwargs)
+                elif self.torch_op is None:
+                    raise RuntimeError(
+                        "torch_op is None and no train_op was set: there is "
+                        "nothing to benchmark"
+                    )
                 else:
                     if self.op_name == "zero_":
                         with flag_train.use_train():
@@ -749,29 +758,25 @@ class Benchmark:
                                 self.torch_op, *args, **kwargs
                             )
             if "speedup" in self.to_bench_metrics:
-                if Config.skip_native:
-                    if metric.latency_base is not None and metric.latency is not None:
-                        metric.speedup = (metric.latency_base + self.EPS) / (
-                            metric.latency + self.EPS
-                        )
-                else:
+                # Both operands are required. With no on-machine baseline
+                # (torch_op None or skip_native) latency_base stays None, and
+                # the report shows N/A rather than dividing a nonexistent value.
+                if metric.latency_base is not None and metric.latency is not None:
                     metric.speedup = (metric.latency_base + self.EPS) / (
                         metric.latency + self.EPS
                     )
 
             if "gbps" in self.to_bench_metrics:
-                if Config.skip_native:
-                    if metric.latency_base is not None:
-                        metric.gbps_base = self.get_gbps(
-                            args, latency=metric.latency_base
-                        )
-                    if metric.latency is not None:
-                        metric.gbps = self.get_gbps(args, latency=metric.latency)
-                else:
+                if metric.latency_base is not None:
                     metric.gbps_base = self.get_gbps(args, latency=metric.latency_base)
+                if metric.latency is not None:
                     metric.gbps = self.get_gbps(args, latency=metric.latency)
 
-            if "tflops" in self.to_bench_metrics:
+            if (
+                "tflops" in self.to_bench_metrics
+                and self.torch_op is not None
+                and metric.latency is not None
+            ):
                 metric.tflops = (
                     self.get_tflops(self.torch_op, *args, **kwargs)
                     / metric.latency
@@ -803,15 +808,6 @@ class Benchmark:
         if reference_mode_enabled() and "latency" not in self.to_bench_metrics:
             raise ReferenceContractError(
                 "--ref-as-candidate requires the candidate latency metric."
-            )
-        ignored_reason = self.base_data_ignored_reason()
-        if ignored_reason:
-            # Once per operator, not once per shape: what changes is which
-            # baseline CI reports, and that is the same for every row.
-            print(
-                f"[base-data] {self.op_name}: ignored ({ignored_reason}); the "
-                "'vs Base' column is hidden and the summary uses the Train "
-                "Speedup."
             )
         configured_case_ids = getattr(Config, "case_ids", None)
         selection_requested = case_ids is not None or configured_case_ids is not None

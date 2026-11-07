@@ -15,9 +15,11 @@
 
 The baseline is Megatron-LM's ``fused_gated_norm`` on the backends in
 ``_MCORE_BASELINE_VENDORS`` when the installed megatron-core provides it -- the
-kernel this port is a port *of* -- and ``fused_gated_norm_ref``, a plain-torch
-composition of the same contract, everywhere else and when that import fails.
-``_BASELINE`` records which one was measured.
+kernel this port is a port *of*, and a real Triton kernel rather than a torch
+composition. Everywhere else, and when that import fails, there is no on-machine
+baseline: a plain-torch composition is not timed, so ``torch_op`` is ``None``
+and ``--base-data`` is the only comparison. ``_BASELINE`` records which one was
+measured.
 
 Both take the same ``(x, gate, weight)`` tuple, so there is nothing to
 pre-compute outside the timed region; both are forward-only. Latency is reported
@@ -73,45 +75,39 @@ if flag_train.runtime.device.support_bf16:
     _DTYPES.append(torch.bfloat16)
 
 
-def fused_gated_norm_ref(x, gate, weight, eps, zero_centered=False):
-    """Plain-torch composition of the same contract; the fallback baseline."""
-    w = weight.to(torch.float32) + (1.0 if zero_centered else 0.0)
-    xf = x.to(torch.float32)
-    inv = torch.rsqrt((xf * xf).sum(dim=-1, keepdim=True) / x.shape[-1] + eps)
-    norm = (xf * inv * w).to(x.dtype).to(torch.float32)
-    gate_f = gate.to(torch.float32)
-    return (norm * (gate_f * torch.sigmoid(gate_f))).to(x.dtype)
-
-
 # Backends whose baseline is Megatron-LM's kernel; it cannot run elsewhere.
 _MCORE_BASELINE_VENDORS = {"nvidia"}
 
 
 def _load_mcore_fused_gated_norm():
-    """Megatron-LM's fused_gated_norm, or ``None`` when it is not the baseline."""
+    """Megatron's fused_gated_norm adapted to this benchmark, or ``None``."""
     if flag_train.vendor_name not in _MCORE_BASELINE_VENDORS:
         return None
     try:
         from megatron.core.fusions.fused_gated_norm import fused_gated_norm
-
-        return fused_gated_norm
     except Exception as exc:
         warnings.warn(
             f"{flag_train.vendor_name!r} uses Megatron-LM's fused_gated_norm as "
             f"its baseline when megatron-core provides it, but the import "
-            f"failed: {exc!r}. Falling back to fused_gated_norm_ref.",
+            f"failed: {exc!r}. This run has no on-machine baseline; "
+            f"--base-data is the only comparison.",
             stacklevel=2,
         )
         return None
 
+    def torch_op(x, gate, weight, variant):
+        return fused_gated_norm(x, gate, weight, _EPS, variant == "zero_centered")
+
+    return torch_op
+
 
 # Resolved once, so the first-use Triton JIT compile is not counted in the
-# measurement.
-_mcore_fused_gated_norm = _load_mcore_fused_gated_norm()
+# measurement. ``None`` is the harness's "no on-machine baseline" sentinel.
+torch_op = _load_mcore_fused_gated_norm()
 _BASELINE = (
     "megatron-core fused_gated_norm"
-    if _mcore_fused_gated_norm is not None
-    else "fused_gated_norm_ref (torch)"
+    if torch_op is not None
+    else "none (no on-machine baseline; --base-data is the only comparison)"
 )
 
 
@@ -164,12 +160,6 @@ def fused_gated_norm_input_fn(shape, dtype, device):
             yield _make_operands(shape, dtype, device, variant)
 
 
-def torch_op(x, gate, weight, variant):
-    """Baseline, chosen by platform. See the module docstring."""
-    impl = _mcore_fused_gated_norm or fused_gated_norm_ref
-    return impl(x, gate, weight, _EPS, variant == "zero_centered")
-
-
 def train_op(x, gate, weight, variant):
     """The operator under test."""
     return flag_train.megatron.fused_gated_norm(
@@ -183,11 +173,10 @@ def test_fused_gated_norm_perf():
     bench = FusedGatedNormBenchmark(
         input_fn=fused_gated_norm_input_fn,
         op_name="fused_gated_norm",
+        # None when megatron-core is unavailable: a torch composition is not
+        # timed as a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
         dtypes=_DTYPES,
-        # The local ratio is a real comparison when the baseline is Megatron's
-        # kernel, so --base-data's cross-hardware figure does not apply.
-        native_baseline=_mcore_fused_gated_norm is not None,
     )
     bench.set_train(train_op)
     bench.run()
