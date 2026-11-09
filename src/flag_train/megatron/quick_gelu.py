@@ -11,12 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Megatron-LM Quick GELU: ``x * sigmoid(1.702 * x)``.
-
-Forward only. The backward is a separate operator, so this module returns a
-plain tensor with no ``grad_fn`` and keeps no autograd state.
-"""
-
 import logging
 
 import torch
@@ -120,5 +114,5 @@ def quick_gelu(x):
     Returns:
         Tensor: same shape and dtype as ``x``, with no autograd history.
     """
-    logger.debug("FORWARD QUICK_GELU")
+    logger.debug("TRAIN QUICK_GELU")
     return _quick_gelu_forward(x)

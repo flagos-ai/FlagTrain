@@ -17,9 +17,9 @@ The preferred baseline is Megatron-LM's official
 ``megatron.core.activations.quick_gelu`` interface. If Megatron-LM is not
 installed, the benchmark logs a warning and falls back to the equivalent
 PyTorch composition. Timing, warmup and synchronization come from
-``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode). The shapes
-below are fixed, so ``--level`` does not change the case list. The operator is
-forward-only, so there is no backward benchmark.
+``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode).
+``--level core`` runs the small, medium and large shapes below;
+``--level comprehensive`` adds the extra shapes.
 """
 
 import os
@@ -97,14 +97,16 @@ def quick_gelu_input_fn(shape, dtype, device):
     yield (torch.randn(shape, dtype=dtype, device=device),)
 
 
-def _run():
-    # The operator is forward-only, so there is no backward case to measure.
+def _run(is_backward):
     bench = QuickGeluBenchmark(
         input_fn=quick_gelu_input_fn,
-        op_name="quick_gelu",
+        op_name="quick_gelu_backward" if is_backward else "quick_gelu",
         torch_op=base_op(),
         dtypes=_dtypes(),
-        is_backward=False,
+        is_backward=is_backward,
+        # Megatron's own activation is a real local baseline; the torch
+        # composition is not, and --base-data still applies to it.
+        native_baseline=_mcore_quick_gelu is not None,
     )
     bench.set_train(flag_train.megatron.quick_gelu)
     # On Ascend, enable parallel scheduling of all blocks to avoid excessive logical cores
@@ -117,4 +119,4 @@ def _run():
 
 @pytest.mark.quick_gelu
 def test_quick_gelu_perf():
-    _run()
+    _run(is_backward=False)

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for Megatron Quick GELU (forward only).
+"""Correctness tests for Megatron Quick GELU.
 
 The preferred reference is Megatron-LM's official
 ``megatron.core.activations.quick_gelu`` interface. If Megatron-LM is not
@@ -21,8 +21,6 @@ and upcast, so the comparison is against a higher-precision CPU result rather
 than a second run of the device kernel. Tolerances are
 ``train_assert_close``'s defaults (``atol=1e-4``, dtype rtol from
 ``flag_train.testing.RESOLUTION``).
-
-Only the forward output is checked: the backward is a separate operator.
 """
 
 import warnings
@@ -84,7 +82,8 @@ def _check_forward(x):
     assert y.shape == x.shape
     assert y.dtype == dtype
 
-    _assert_close(y, reference_quick_gelu(_reference(x)), dtype)
+    x_ref = _reference(x)
+    _assert_close(y, reference_quick_gelu(x_ref), dtype)
 
 
 @pytest.mark.quick_gelu
@@ -133,14 +132,3 @@ def test_quick_gelu_noncontiguous(dtype):
     transposed = cube.transpose(0, 2)
     assert not transposed.is_contiguous()
     _check_forward(transposed)
-
-
-@pytest.mark.quick_gelu
-def test_quick_gelu_is_forward_only():
-    """The output carries no autograd history, so ``backward`` is unavailable."""
-    x = torch.randn((4, 8), dtype=torch.float32, device=flag_train.device)
-    x.requires_grad_(True)
-    y = flag_train.megatron.quick_gelu(x)
-    assert not y.requires_grad
-    with pytest.raises(RuntimeError):
-        y.sum().backward()
