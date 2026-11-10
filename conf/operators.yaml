@@ -425,6 +425,21 @@ ops:
   source: megatron.core.fusions.fused_softmax
   stages:
   - beta: '0.0.0'
+- id: scaled_upper_triang_masked_softmax_backward
+  description: Gradient of the scaled upper-triangular masked softmax; masked positions are zero.
+  for:
+  - ScaledUpperTriangMaskedSoftmax
+  labels:
+  - megatron
+  - attention
+  - softmax
+  from:
+  - megatron
+  kind:
+  - Attention
+  source: megatron.core.fusions.fused_softmax
+  stages:
+  - beta: '0.0.0'
 - id: scaled_upper_triang_masked_softmax_forward
   description: Scaled softmax with Megatron's upper-triangular causal mask; masked entries are zero.
   for:
