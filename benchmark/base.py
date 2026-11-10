@@ -316,6 +316,17 @@ class Benchmark:
             return parsed_args, parsed_kwargs
         return parsed_args if parsed_args else parsed_kwargs
 
+    def baseline_shape_detail(self, *args, **kwargs):
+        """Shape detail used for the ``--base-data`` lookup.
+
+        ``record_shapes`` is what the report prints, and a benchmark may
+        compress it for readability (e.g. a long list of tensors on one line).
+        The baseline lookup needs the individual tensor dimensions to build
+        its signature, so it goes through this hook instead; by default the
+        two are the same.
+        """
+        return self.record_shapes(*args, **kwargs)
+
     def init_default_config(self):
         self.set_shapes(self.DEFAULT_SHAPE_FILES)
 
@@ -652,7 +663,7 @@ class Benchmark:
             Config.base_data,
             self.op_name,
             dtype,
-            metric.shape_detail,
+            getattr(metric, "baseline_shape_detail", metric.shape_detail),
             getattr(self, "base_variant", None),
         )
         base_ms = base_rec.get("latency_ms") if base_rec else None
@@ -708,6 +719,12 @@ class Benchmark:
                 )
             args, kwargs = self.unpack_to_args_kwargs(input)
             metric.shape_detail = self.record_shapes(*args, **kwargs)
+            # Kept off the dataclass on purpose: serialized results carry the
+            # report form only. Only the baseline lookup reads this.
+            if Config.base_data is not None:
+                metric.baseline_shape_detail = self.baseline_shape_detail(
+                    *args, **kwargs
+                )
             if (
                 "latency_base" in self.to_bench_metrics
                 and self._has_on_machine_baseline()

@@ -174,6 +174,14 @@ class LocoQrBenchmark(base.GenericBenchmark):
             f"bits={num_bits} {sym} {path}"
         )
 
+    def baseline_shape_detail(self, *args, **kwargs):
+        """The default structured form, for ``--base-data`` matching.
+
+        ``record_shapes`` above is the compact semantic key for the report;
+        the baseline lookup needs the per-tensor dimensions for its signature.
+        """
+        return super().record_shapes(*args, **kwargs)
+
     def get_gbps(self, args, latency):
         data, scales, in_groups, out_groups, _num_bits, _qt, num_tensors = args
         scales_elems = scales.numel() // in_groups

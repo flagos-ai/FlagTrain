@@ -129,6 +129,14 @@ class MultiTensorLionBenchmark(base.GenericBenchmark):
         gs = args[0]
         return f"{len(gs)} tensors x {list(gs[0].shape)}"
 
+    def baseline_shape_detail(self, *args, **kwargs):
+        """The default structured form, for ``--base-data`` matching.
+
+        ``record_shapes`` above is the compact report line; the baseline
+        lookup needs the per-tensor dimensions to build its signature.
+        """
+        return super().record_shapes(*args, **kwargs)
+
 
 def multi_tensor_lion_input_fn(shape, dtype, device):
     n_tensors, numel = shape
