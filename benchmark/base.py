@@ -25,6 +25,7 @@ import triton
 import yaml
 
 import flag_train
+from flag_train.dummy_candidate import get_dummy_probe
 from flag_train.reference_candidate import (
     ReferenceContractError,
     reference_execution,
@@ -825,6 +826,9 @@ class Benchmark:
             print(f"Listed {len(case_list.cases)} benchmark cases for {self.op_name}.")
             return case_list
 
+        probe = get_dummy_probe()
+        if probe is not None:
+            return probe.run_benchmark(self, selected_case_ids, Config)
         if selection_requested and not self.supports_cases():
             raise ValueError(
                 f"Operator '{self.op_name}' does not support --case-id yet."

@@ -26,6 +26,10 @@ import yaml
 
 import flag_train
 from flag_train.cli_override import add_override_arguments, apply_overrides_from_args
+from flag_train.dummy_candidate import (
+    add_dummy_candidate_arguments,
+    configure_dummy_candidate,
+)
 from flag_train.reference_candidate import (
     add_reference_candidate_argument,
     configure_reference_candidate,
@@ -103,6 +107,7 @@ def pytest_addoption(parser):
     # Add dynamic operator override options
     add_override_arguments(parser)
     add_reference_candidate_argument(parser)
+    add_dummy_candidate_arguments(parser)
 
 
 def pytest_configure(config):
@@ -143,7 +148,9 @@ def pytest_configure(config):
 
     # Apply dynamic operator overrides
     configure_reference_candidate(config)
-    config._override_registry = apply_overrides_from_args(config.option)
+    configure_dummy_candidate(config)
+    if not hasattr(config, "_override_registry"):
+        config._override_registry = apply_overrides_from_args(config.option)
 
 
 def pytest_runtest_teardown(item, nextitem):
@@ -228,6 +235,8 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_terminal_summary(terminalreporter):
+    if terminalreporter.config.getoption("dummy_candidate"):
+        return
     data = TEST_RESULTS
     with open(REPORT_FILE, "a+") as json_file:
         fcntl.flock(json_file, fcntl.LOCK_EX)
