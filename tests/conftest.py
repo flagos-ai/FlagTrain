@@ -113,7 +113,6 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     global RECORD_LOG
     global RECORD_JSON
-    global REPORT_FILE
     global REGISTERED_MARKS
     global RUNTEST_INFO
     global TO_CPU
@@ -127,11 +126,6 @@ def pytest_configure(config):
     RECORD_JSON = config.getoption("--record") == "json"
     TO_CPU = config.getoption("--ref") == "cpu"
     QUICK_MODE = config.getoption("--quick") is True
-
-    if RECORD_JSON:
-        report_file = config.getoption("--output")
-        if report_file:
-            REPORT_FILE = report_file
 
     if RECORD_LOG:
         RUNTEST_INFO = {}
@@ -235,10 +229,12 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_terminal_summary(terminalreporter):
-    if terminalreporter.config.getoption("dummy_candidate"):
+    config = terminalreporter.config
+    if config.getoption("dummy_candidate"):
         return
+    report_file = (config.getoption("--output") if RECORD_JSON else None) or REPORT_FILE
     data = TEST_RESULTS
-    with open(REPORT_FILE, "a+") as json_file:
+    with open(report_file, "a+") as json_file:
         fcntl.flock(json_file, fcntl.LOCK_EX)
         json_file.seek(0)
         content = json_file.read()

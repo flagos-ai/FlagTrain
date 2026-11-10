@@ -195,3 +195,59 @@ def test_dummy_conflicts_with_reference_mode(suite):
     )
     assert result.ret == pytest.ExitCode.USAGE_ERROR
     result.stderr.fnmatch_lines(["*cannot be combined with*"])
+
+
+def test_dummy_cli_fails_when_requested_benchmark_case_is_skipped(suite):
+    selected = "benchmark/test_probe_benchmark.py::test_benchmark::core::float32::1"
+    result = suite.runpytest_subprocess(
+        "tests",
+        "benchmark",
+        "--level",
+        "core",
+        "--dummy-candidate",
+        OP,
+        "--case-id",
+        selected,
+    )
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    report = json.loads((suite.path / "dummy-candidate-report.json").read_text())
+    assert report["status"] == "FAILED"
+    assert any(
+        row["phase"] == "correctness" and row["status"] == "REACHED"
+        for row in report["records"]
+    )
+    (row,) = [row for row in report["records"] if row.get("case_id") == selected]
+    assert row["status"] == "SKIP"
+    assert row["calls"] == 0
+
+
+@pytest.mark.parametrize("paths", [("tests", "benchmark"), ("benchmark", "tests")])
+def test_mixed_record_json_uses_default_report_paths(suite, paths):
+    (suite.path / "tests/test_probe.py").write_text("""
+def test_correctness():
+    assert 1 + 1 == 2
+""")
+    path = suite.path / "benchmark/test_probe_benchmark.py"
+    path.write_text(
+        path.read_text()
+        .replace(
+            "    def get_latency(self, *args, **kwargs):\n"
+            '        pytest.fail("Dummy traversal must not time either callable")',
+            "    def get_latency(self, op, *args, **kwargs):\n"
+            "        op(*args, **kwargs)\n"
+            "        return 1.0",
+        )
+        .replace(
+            '    if shape == (2,):\n        pytest.skip("input unavailable")\n', ""
+        )
+        .replace(
+            'bench.set_train(lambda x: get_candidate("megatron.dummy_probe")(x))',
+            "bench.set_train(torch.neg)",
+        )
+    )
+    result = suite.runpytest_subprocess(*paths, "--record=json")
+    assert result.ret == pytest.ExitCode.OK
+    accuracy = json.loads((suite.path / "accuracy_result.json").read_text())
+    benchmark = json.loads((suite.path / "benchmark_result.json").read_text())
+    assert accuracy["tests/test_probe.py::test_correctness"]["result"] == "passed"
+    assert benchmark["dummy_probe"]["details"][0]["result"][0]["latency"] == 1.0

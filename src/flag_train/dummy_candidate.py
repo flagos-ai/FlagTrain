@@ -257,7 +257,7 @@ class _DummyProbe:
                 continue
             self.case_ids.add(case.case_id)
             self._run_case(bench, case, record)
-            if record["status"] in {"REACHED", "SKIP"}:
+            if record["status"] == "REACHED":
                 config.executed_case_ids.add(case.case_id)
 
     def _run_case(self, bench, case, record):

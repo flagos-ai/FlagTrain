@@ -321,7 +321,6 @@ def pytest_addoption(parser):
         )
         parser.addoption(
             "--output",
-            default=REPORT_FILE,
             help="Path to report file for JSON output",
         )
     except ValueError:
@@ -370,7 +369,6 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     global Config  # noqa: F824
-    global REPORT_FILE
     global REGISTERED_MARKS
 
     config.addinivalue_line(
@@ -431,8 +429,7 @@ def pytest_configure(config):
     Config.parallel = int(config.getoption("--parallel") or 0)
     Config.mm_layout = config.getoption("--mm-layout")
     if Config.record_json or Config.list_cases:
-        Config.output = config.getoption("--output")
-        REPORT_FILE = Config.output
+        Config.output = config.getoption("--output") or REPORT_FILE
 
     if Config.record_log:
         cmd_args = [
@@ -602,7 +599,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     if config.getoption("dummy_candidate"):
         return
     if Config.list_cases:
-        with open(REPORT_FILE, "w") as f:
+        with open(Config.output, "w") as f:
             json.dump(
                 {
                     "schema_version": "flagtrain.benchmark-case-list/v2",
@@ -616,13 +613,13 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         return
 
     data = TEST_RESULTS
-    if os.path.exists(REPORT_FILE):
-        with open(REPORT_FILE, "r") as f:
+    if os.path.exists(Config.output):
+        with open(Config.output, "r") as f:
             existing_data = json.load(f)
         existing_data.update(TEST_RESULTS)
         data = existing_data
 
-    with open(REPORT_FILE, "w") as f:
+    with open(Config.output, "w") as f:
         json.dump(data, f, indent=2, default=str)
 
 
