@@ -13,14 +13,11 @@
 # limitations under the License.
 """Performance benchmark for the multi_tensor_adam operator.
 
-The baseline follows ``_DEEPSPEED_BASELINE_VENDORS`` below:
-
-* on a listed backend, DeepSpeed's ``multi_tensor_adam`` **is** the baseline. If
-  it cannot be built there the module raises rather than falling back -- timing
-  the torch reference and reporting it under the same name would answer a
-  different question;
-* on any other backend the baseline is ``multi_tensor_adam_ref``, the
-  plain-torch composition of the same contract.
+The baseline is DeepSpeed's ``multi_tensor_adam`` on the backends in
+``_DEEPSPEED_BASELINE_VENDORS``. When it cannot be built, or on any other
+backend, there is no on-machine baseline: a plain-torch composition is not a
+competitor, so it is not timed, ``torch_op`` is ``None``, and ``--base-data``
+is the only comparison. The ``Baseline:`` line reports which case ran.
 
 Unlike LAMB, each benchmark case runs the optimizer over a *batch* of parameter
 tensors rather than a single one. That is the whole point of the operator: the
@@ -77,81 +74,15 @@ _WEIGHT_DECAY = 0.1
 _CHUNK_SIZE = 2048 * 32
 
 
-# ---------------------------------------------------------------------------
-# Reference implementation
-#
-# Exists so the operator can be benchmarked against a plain-torch composition of
-# the same contract on any device. The DeepSpeed oracle needs the ``deepspeed``
-# package and a CUDA device, so without a torch reference the operator would be
-# unbenchmarkable off NVIDIA.
-# ---------------------------------------------------------------------------
-
-
-def multi_tensor_adam_ref(
-    g_list,
-    p_list,
-    m_list,
-    v_list,
-    lr,
-    beta1,
-    beta2,
-    epsilon,
-    step,
-    mode,
-    bias_correction,
-    weight_decay,
-):
-    """Plain-torch reference matching ``csrc/adam/multi_tensor_adam.cu``.
-
-    Steps every tensor in ``p_list``/``m_list``/``v_list`` in place, promoting
-    to fp32 for the arithmetic and rounding back to the storage dtype. Loops
-    over tensors one at a time, which is exactly the launch-overhead the fused
-    operator removes.
-    """
-    if bias_correction == 1:
-        bc1 = 1.0 - beta1**step
-        bc2 = 1.0 - beta2**step
-    else:
-        bc1 = 1.0
-        bc2 = 1.0
-
-    for g, p, m, v in zip(g_list, p_list, m_list, v_list):
-        g_f = g.float()
-        p_f = p.float()
-        m_f = m.float()
-        v_f = v.float()
-
-        if mode == 0:
-            g_f = g_f + weight_decay * p_f
-            m_new = beta1 * m_f + (1.0 - beta1) * g_f
-            v_new = beta2 * v_f + (1.0 - beta2) * g_f * g_f
-            m_hat = m_new / bc1
-            v_hat = v_new / bc2
-            update = m_hat / (torch.sqrt(v_hat) + epsilon)
-            p_new = p_f - lr * update
-        else:
-            m_new = beta1 * m_f + (1.0 - beta1) * g_f
-            v_new = beta2 * v_f + (1.0 - beta2) * g_f * g_f
-            m_hat = m_new / bc1
-            v_hat = v_new / bc2
-            update = m_hat / (torch.sqrt(v_hat) + epsilon) + weight_decay * p_f
-            p_new = p_f - lr * update
-
-        p.copy_(p_new.to(p.dtype))
-        m.copy_(m_new.to(m.dtype))
-        v.copy_(v_new.to(v.dtype))
-
-
 # Backends whose baseline is DeepSpeed. multi_tensor_adam ships as a CUDA op
-# builder, so only a backend that can compile and execute one can host it. On
-# these the baseline is not optional -- if it will not load, timing the torch
-# reference and reporting it under the DeepSpeed baseline's name would answer a
-# different question.
+# builder, so only a backend that can compile and execute one can host it. A
+# load failure is reported, not raised: with no runnable kernel there is no
+# on-machine baseline, and the module resolves that below.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
 
 
 def _load_deepspeed_multi_tensor_adam():
-    """DeepSpeed's multi_tensor_adam, or ``None`` on a backend that does not use it.
+    """Harness-ready multi_tensor_adam, or ``None`` where it is not the baseline.
 
     ``FusedAdamBuilder`` JIT-compiles the CUDA source shipped inside the
     ``deepspeed`` package, then reuses the build cached under ``torch_extensions``.
@@ -162,25 +93,31 @@ def _load_deepspeed_multi_tensor_adam():
     try:
         from deepspeed.ops.op_builder import FusedAdamBuilder
 
-        return FusedAdamBuilder().load().multi_tensor_adam
+        multi_tensor_adam = FusedAdamBuilder().load().multi_tensor_adam
     except Exception as exc:
         warnings.warn(
             f"{flag_train.vendor_name!r} is expected to use DeepSpeed's "
             f"multi_tensor_adam as its baseline, but it could not be loaded: "
-            f"{exc!r}. Falling back to the torch reference; build deepspeed to "
-            f"enable the fused baseline.",
+            f"{exc!r}. This run has no on-machine baseline; a torch "
+            f"composition is not timed, so --base-data is the only comparison.",
             stacklevel=2,
         )
         return None
 
+    def torch_op(g, p, m, v):
+        return _call(multi_tensor_adam, g, p, m, v)
 
-# Resolved once, so the first-use JIT compile is not counted in the measurement.
-_deepspeed_multi_tensor_adam = _load_deepspeed_multi_tensor_adam()
+    return torch_op
+
+
+# Resolved once, so the first-use JIT compile is not counted in the measurement;
+# ``None`` is the benchmark harness's "no on-machine baseline" sentinel.
+torch_op = _load_deepspeed_multi_tensor_adam()
 
 _BASELINE = (
     "deepspeed multi_tensor_adam"
-    if _deepspeed_multi_tensor_adam is not None
-    else "multi_tensor_adam_ref (torch)"
+    if torch_op is not None
+    else "none (no on-machine baseline; --base-data is the only comparison)"
 )
 
 
@@ -237,31 +174,6 @@ def _call(op, g, p, m, v):
     )
 
 
-def torch_op(g, p, m, v):
-    """Baseline, chosen by platform.
-
-    The two baselines take different arguments: DeepSpeed's op takes the
-    MultiTensorApply-style tuple, while the torch reference takes the four
-    tensor lists directly.
-    """
-    if _deepspeed_multi_tensor_adam is not None:
-        return _call(_deepspeed_multi_tensor_adam, g, p, m, v)
-    return multi_tensor_adam_ref(
-        g,
-        p,
-        m,
-        v,
-        _LR,
-        _BETA1,
-        _BETA2,
-        _EPS,
-        _STEP,
-        _MODE,
-        _BIAS_CORRECTION,
-        _WEIGHT_DECAY,
-    )
-
-
 def train_op(g, p, m, v):
     """The operator under test."""
     return _call(flag_train.deepspeed.multi_tensor_adam, g, p, m, v)
@@ -274,6 +186,8 @@ def test_multi_tensor_adam_perf():
     bench = MultiTensorAdamBenchmark(
         input_fn=multi_tensor_adam_input_fn,
         op_name="multi_tensor_adam",
+        # None when DeepSpeed is unavailable: a torch composition is not timed
+        # as a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
         # DeepSpeed's CUDA op has no bf16 kernel, so only fp32/fp16 give an
         # apples-to-apples baseline. The Triton op supports bf16 too; that is

@@ -13,21 +13,24 @@
 # limitations under the License.
 """Performance of the fused mHC projection + RMS + compute_h forward.
 
-The baseline is Megatron's own ``fused_proj_rms_compute_h`` forward from
-``megatron/core/fusions/fused_mhc_kernels.py``: the installed module when it
-ships the mHC kernels (which dispatches to its cuTile kernel when available),
-otherwise a verbatim copy of its torch path. It returns the public four
-outputs -- the reduced projection is internal -- so the untimed check compares
+The baseline is Megatron's own ``fused_proj_rms_compute_h`` from
+``megatron/core/fusions/fused_mhc_kernels.py``: the public entry when its cuTile
+kernel can run here (it dispatches to ``CutileProjRmsComputeH``, a real kernel),
+otherwise the same entry's ``_torch_proj_rms_compute_h`` branch, a torch
+composition the vendor defines, carried below as ``_reference_forward``. That
+same transcription is also the untimed correctness check in ``_input_fn``.
+``_BASELINE`` records which case was measured. It returns the public four
+outputs (the reduced projection is internal), so the untimed check compares
 those four.
 
 This benchmarks mHC's real configuration: low-precision activations with the
 mapping parameters kept in fp32 (``keep_in_fp32``), so ``promote_types`` makes
 the projection fp32.
 
-Precision caveat: when the baseline takes Megatron's torch path, the harness
-has disabled torch tf32, so its fp32 matmul is IEEE while the operator's fp32
-dot is tf32; that speedup includes the precision difference. With Megatron's
-cuTile kernel available both sides use tf32.
+Precision caveat: when the untimed check runs Megatron's torch path, the
+harness has disabled torch tf32, so its fp32 matmul is IEEE while the
+operator's fp32 dot is tf32. With Megatron's cuTile kernel as the timed
+baseline both sides use tf32.
 
 Run::
 
@@ -35,6 +38,7 @@ Run::
 """
 
 import math
+import warnings
 
 import pytest
 import torch
@@ -64,7 +68,7 @@ _WEIGHT_DTYPE = torch.float32
 _TOLERANCE = {torch.float16: 1e-3, torch.bfloat16: 2e-2}
 
 
-def _megatron_torch_forward(
+def _reference_forward(
     x,
     weight,
     alpha_pre,
@@ -110,10 +114,40 @@ def _megatron_torch_forward(
 
 
 def _load_megatron_forward():
-    return _megatron_torch_forward
+    """Megatron's cuTile forward, else the torch path it dispatches to.
+
+    ``fused_proj_rms_compute_h`` is Megatron's public entry, but with cuTile
+    unavailable it falls back to the same torch composition carried above, so
+    that path is the vendor-equivalent baseline when the kernel cannot run.
+    Importing megatron-core proves nothing about the kernel, so the probe runs
+    it once on a tiny input.
+    """
+    try:
+        from megatron.core.fusions import fused_mhc_kernels
+
+        if not fused_mhc_kernels.is_cutile_available():
+            raise RuntimeError("Megatron's cuTile mHC backend is unavailable")
+
+        op = fused_mhc_kernels.fused_proj_rms_compute_h
+        x = torch.randn((2, 8), dtype=torch.bfloat16, device=flag_train.device)
+        weight = torch.randn((8, 8), dtype=torch.float32, device=flag_train.device)
+        alpha = torch.full((1,), 0.01, dtype=torch.float32, device=flag_train.device)
+        bias = torch.zeros(8, dtype=torch.float32, device=flag_train.device)
+        with base.torch_device_fn.device(x.device):
+            op(x, weight, alpha, alpha, alpha, bias, 2, backend="cutile")
+            base.torch_device_fn.synchronize()
+        return op, "megatron fused_proj_rms_compute_h (cuTile)"
+    except Exception as exc:
+        warnings.warn(
+            "Megatron-LM's cuTile fused_proj_rms_compute_h forward kernel is "
+            f"unavailable ({exc!r}); timing its torch path instead, copied "
+            "verbatim into _reference_forward.",
+            stacklevel=2,
+        )
+        return _reference_forward, "megatron fused_proj_rms_compute_h torch path"
 
 
-torch_op = _load_megatron_forward()
+torch_op, _BASELINE = _load_megatron_forward()
 
 
 def _input_fn(shape, dtype, device):
@@ -130,7 +164,7 @@ def _input_fn(shape, dtype, device):
     # One untimed correctness check per shape so both sides answer the same
     # question (the operator's fp32 dot is tf32; see the module docstring).
     # Megatron's forward returns four tensors; `proj` is our backward extra.
-    expected = torch_op(*args)
+    expected = _reference_forward(*args)
     got = flag_train.megatron.fused_proj_rms_compute_h_forward(*args)
     tolerance = _TOLERANCE[dtype]
     for name, result, ref in zip(("h_pre", "h_post", "h_res", "r"), got[:4], expected):
@@ -178,9 +212,12 @@ class ProjRmsComputeHBenchmark(base.GenericBenchmark):
 )
 def test_fused_proj_rms_compute_h_forward_perf():
     """mHC's real case: low-precision activations with a keep_in_fp32 weight."""
+    print(f"\nBaseline: {_BASELINE}")
     bench = ProjRmsComputeHBenchmark(
         input_fn=_input_fn,
         op_name="fused_proj_rms_compute_h_forward",
+        # Megatron's cuTile kernel, or its torch path when the kernel cannot
+        # run here.
         torch_op=torch_op,
         dtypes=_ACTIVATION_DTYPES,
     )
