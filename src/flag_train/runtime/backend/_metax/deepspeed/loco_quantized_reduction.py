@@ -639,7 +639,7 @@ def loco_quantized_reduction(
     quant_type=QuantizationType.Symmetric,
     devices_per_node: int = 1,
 ) -> List[torch.Tensor]:
-    logger.debug("TRAIN LOCO_QUANTIZED_REDUCTION")
+    logger.debug("TRAIN_METAX LOCO_QUANTIZED_REDUCTION")
     num_tensors = int(devices_per_node)
     if num_tensors < 1:
         raise ValueError(f"devices_per_node must be >= 1, got {num_tensors}")
