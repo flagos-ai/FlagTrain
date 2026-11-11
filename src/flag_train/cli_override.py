@@ -233,6 +233,8 @@ def add_override_arguments(parser) -> None:
             this only targets pytest's parser rather than being a generic
             argparse helper.
     """
+    if getattr(parser, "_flagtrain_override_arguments", False):
+        return
     group = parser.getgroup("operator override", "dynamic operator override options")
 
     group.addoption(
@@ -260,3 +262,4 @@ def add_override_arguments(parser) -> None:
         action="store_true",
         help="List all active operator overrides and exit",
     )
+    parser._flagtrain_override_arguments = True

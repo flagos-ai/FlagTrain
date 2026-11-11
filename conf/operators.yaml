@@ -102,6 +102,21 @@ ops:
   source: megatron.core.activations
   stages:
   - beta: '0.0.0'
+- id: fp8_gemm_triton
+  description: GEMM with grouped custom FP8 weight dequantization.
+  for:
+  - fp8_gemm_triton
+  labels:
+  - deepspeed
+  - gemm
+  - quantization
+  from:
+  - deepspeed
+  kind:
+  - Quantization
+  source: deepspeed.ops.fp_quantizer.fp8_gemm_triton
+  stages:
+  - beta: '0.0.0'
 - id: fused_gated_norm
   description: 'Fused RMSNorm over the trailing dim plus SiLU gating, with an optional
     zero-centered weight offset. Forward only; the normalised activation is materialised

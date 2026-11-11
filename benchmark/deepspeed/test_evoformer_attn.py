@@ -20,10 +20,12 @@ other DeepSpeed benchmarks here choose theirs:
 
 * on a backend in ``_DEEPSPEED_BASELINE_VENDORS``, DeepSpeed's
   ``DS4Sci_EvoformerAttention`` **is** the baseline when it can be loaded. If it
-  cannot be loaded there the module warns and falls back to the torch reference
-  -- the reported baseline name then says which one was actually measured;
-* on any other backend the baseline is the torch composition below, the same
-  contract written out in plain torch.
+  cannot be loaded there the module warns and runs without an on-machine
+  baseline, leaving the comparison to ``--base-data``;
+* on any other backend there is no on-machine baseline either. A plain-torch
+  composition is not a valid baseline -- a ratio against it would say how far
+  the kernel is from *a* correct implementation rather than from the best one --
+  so ``torch_op`` is ``None`` and ``--base-data`` is the only comparison.
 
 Only the forward is measured, because only the forward is ported: upstream's
 ``attention_bwd`` and its trainable entry are absent from this package.
@@ -97,51 +99,22 @@ _DTYPES = [torch.float16, torch.bfloat16]
 
 
 # ---------------------------------------------------------------------------
-# Reference implementation
-#
-# Composed here rather than imported from the tests: the reference belongs to
-# whoever needs it, and this one is not the same object as the tests'. The
-# tests' reference is an *accuracy* oracle and runs in fp32 so that what it
-# measures is the kernel; this one is a *speed* baseline and runs in the operand
-# dtype, tensor cores included, which is how upstream's own
-# ``attention_reference`` is written. A baseline that ran in fp32 would be
-# slower than any real competitor and would flatter the kernel.
-# ---------------------------------------------------------------------------
-
-
-def _reference(q, k, v, bias1=None, bias2=None):
-    dtype = q.dtype
-    qh = q.to(dtype).transpose(-2, -3)
-    kh = k.to(dtype).transpose(-2, -3)
-    vh = v.to(dtype).transpose(-2, -3)
-
-    scores = qh @ kh.transpose(-1, -2) / (q.shape[-1] ** 0.5)
-    if bias1 is not None:
-        scores = scores + bias1.to(dtype)
-    if bias2 is not None:
-        scores = scores + bias2.to(dtype)
-
-    return (torch.softmax(scores, dim=-1) @ vh).transpose(-2, -3)
-
-
-# ---------------------------------------------------------------------------
 # Baseline
 # ---------------------------------------------------------------------------
 
 # Backends whose baseline is DeepSpeed. Its operator is a CUDA extension builder,
 # so only a backend that can compile and run one can host it. On these the
-# baseline is expected, not mandatory: if it fails to load we warn and fall back
-# to the torch reference, and the reported baseline name records which one was
-# measured.
+# baseline is expected, not mandatory: if it fails to load we warn and run with
+# no on-machine baseline, leaving the comparison to --base-data.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
 
 def _load_deepspeed_evoformer():
-    """DeepSpeed's public entry, or ``None`` when it could not be loaded.
+    """Harness-ready DS4Sci_EvoformerAttention, or ``None`` when unavailable.
 
     On a backend in ``_DEEPSPEED_BASELINE_VENDORS`` a load failure is warned about
-    rather than raised: the benchmark still runs, with the torch reference as the
-    baseline.
+    rather than raised: the benchmark still runs, with ``torch_op=None`` and
+    ``--base-data`` as the only comparison.
     """
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
         return None
@@ -151,26 +124,33 @@ def _load_deepspeed_evoformer():
         from deepspeed.ops.op_builder import EvoformerAttnBuilder
 
         EvoformerAttnBuilder().load()
-        return DS4Sci_EvoformerAttention
     except Exception as exc:
         warnings.warn(
             f"{flag_train.vendor_name!r} is expected to use DeepSpeed's "
             f"DS4Sci_EvoformerAttention as its baseline, but it could not be "
-            f"loaded: {exc!r}. Falling back to the torch reference; build "
-            f"deepspeed with CUTLASS >= 3.1 (`pip install nvidia-cutlass`) to "
-            f"enable the DeepSpeed baseline.",
+            f"loaded: {exc!r}. This run has no on-machine baseline; "
+            f"--base-data is the only comparison. Build deepspeed with "
+            f"CUTLASS >= 3.1 (`pip install nvidia-cutlass`) to enable the "
+            f"DeepSpeed baseline.",
             stacklevel=2,
         )
         return None
 
+    def torch_op(q, k, v, bias1, bias2):
+        # A fresh list per call: upstream's entry appends to the one it is handed.
+        return DS4Sci_EvoformerAttention(q, k, v, [bias1, bias2])
 
-# Resolved once, so the first-use JIT compile is not counted in the measurement.
-_deepspeed_evoformer = _load_deepspeed_evoformer()
+    return torch_op
+
+
+# Resolved once, so the first-use JIT compile is not counted in the measurement;
+# ``None`` is the benchmark harness's "no on-machine baseline" sentinel.
+torch_op = _load_deepspeed_evoformer()
 
 _BASELINE = (
     "deepspeed DS4Sci_EvoformerAttention"
-    if _deepspeed_evoformer is not None
-    else "evoformer_attn_ref (torch)"
+    if torch_op is not None
+    else "none (no on-machine baseline; --base-data is the only comparison)"
 )
 
 
@@ -217,19 +197,6 @@ def evoformer_attn_input_fn(shape, dtype, device):
     yield q, k, v, bias1, bias2
 
 
-def torch_op(q, k, v, bias1, bias2):
-    """Baseline, chosen by platform. See the module docstring.
-
-    The two baselines take the biases differently -- a list for upstream's entry,
-    two tensors for the reference -- so the call is shaped here rather than in
-    the timed region.
-    """
-    if _deepspeed_evoformer is None:
-        return _reference(q, k, v, bias1, bias2)
-    # A fresh list per call: upstream's entry appends to the one it is handed.
-    return _deepspeed_evoformer(q, k, v, [bias1, bias2])
-
-
 def train_op(q, k, v, bias1, bias2):
     """The operator under test.
 
@@ -247,11 +214,10 @@ def test_evoformer_attn_perf():
     bench = EvoformerAttnBenchmark(
         input_fn=evoformer_attn_input_fn,
         op_name="evoformer_attn",
+        # None when DeepSpeed is unavailable: a torch composition is not timed
+        # as a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
         dtypes=_DTYPES,
-        # The local ratio is a real comparison when the baseline is DeepSpeed's
-        # kernel, so --base-data's cross-hardware figure does not apply.
-        native_baseline=_deepspeed_evoformer is not None,
     )
     bench.set_train(train_op)
     bench.run()

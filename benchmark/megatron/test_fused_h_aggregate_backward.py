@@ -13,47 +13,18 @@
 # limitations under the License.
 """Performance benchmark for the fused n-stream weighted aggregation (backward).
 
-The baseline is ``torch.autograd.grad`` through Megatron-LM's
-``native_h_aggregate`` -- the reference this operator is the derivative of --
-taken from the installed ``megatron-core`` when that provides it, and otherwise
-from ``native_h_aggregate_ref``: the transcription of ``hyper_connection.py``
-this file carries, ``@torch.compile``-wrapped exactly as Megatron ships it.
-megatron-core 0.19 and earlier have no ``hyper_connection`` module, so the
-fallback is what lets an older container time a Megatron baseline instead of
-skipping. The two paths are import success and import failure. The compiled
-wrapper is kept either way, because it is what Megatron pays for.
-The correctness suite differentiates the same function, so
-the timed baseline is not an unchecked one; this file only times it.
-
-Keeping that compile across a twenty-row sweep takes one adjustment, made by
-``_full_compile_budget``: dynamo stops compiling after 8 recompiles per code
-object and serves the eager function from then on, and the eager derivative of
-this stage is unfused (it materializes the ``[s, b, n, C]`` product before
-reducing) -- 2-3x slower than the compiled one. The fixture raises the budget
-for this module's run, so every row is timed against the compiled derivative.
+The baseline is Megatron-LM's cuTile ``_cutile_h_aggregate_bwd`` when the
+installed megatron-core provides one that can run here. When it cannot, the
+baseline is the autograd derivative of Megatron's own ``native_h_aggregate``
+(a ``@torch.compile``d torch composition), built on the same ``(x, h_pre)`` the
+operator is given; with an older megatron-core that predates it, the
+transcription below is compiled the way Megatron compiles it. ``_BASELINE``
+records which case was measured.
 
 Timing range: only the backward. The operator under test takes ``grad_output``,
-``x`` and ``h_pre`` and does no forward work; charging the baseline for the
-forward that builds its graph would compare two different things.
-``_MegatronBackwardBaseline`` therefore builds the graph outside the timed
-region -- once per input set -- and every repetition runs ``torch.autograd.grad``
-over it with ``retain_graph=True``. The saved state this leaves live is, like
-``x`` and ``h_pre`` on the operator's side, what the stage is given rather than
-what it produces.
-
-That requires one adjustment to the baseline, made by the module's
-``_no_buffer_donation`` fixture. A backward that inductor compiled with *donated
-buffers* refuses to run with ``retain_graph=True``: it is allowed to write into
-the forward's saved tensors, so it may run at most once. Disabling donation for
-this benchmark's run lets the same compiled derivative be re-run over the same
-graph. It is the conservative direction: the donating backward allocates less, so
-the measured baseline is the slower of the two.
-
-The setting is process-wide because the donation decision is baked into the
-compiled artifact: a graph compiled while it was off keeps that shape, the
-scoping is restored by the fixture. It only affects functions whose backward
-goes through AOTAutograd, and this file's baseline is the only one in the
-benchmark suite. ``base.py`` pins TF32 the same way, for the same reason.
+``x`` and ``h_pre`` and does no forward work; Megatron's cuTile backward takes
+the same three operands, so there is nothing to build outside the timed region
+and nothing is charged to the baseline that the operator does not do.
 
 The harness's own ``is_backward`` path is not used: it calls ``randn_like`` on
 the op's output, and both this operator and the baseline return a tuple.
@@ -65,7 +36,6 @@ three inputs and two outputs imply) and TFLOP/s (one multiply per element for
 ``grad_x`` and a multiply-add for ``grad_h``, i.e. ``3 * s * b * n * C``).
 """
 
-import importlib.metadata
 import warnings
 
 import pytest
@@ -110,108 +80,30 @@ _DTYPES = [torch.float16]
 if flag_train.runtime.device.support_bf16:
     _DTYPES.append(torch.bfloat16)
 
-# ---------------------------------------------------------------------------
-# Megatron baseline
-#
-# ``native_h_aggregate`` arrived with the mHC stages in megatron-core 0.20; an
-# older install has no ``hyper_connection`` module. So the baseline is the
-# installed function when it can be imported, and otherwise a transcription of
-# Megatron-LM's ``hyper_connection.py`` compiled the way Megatron compiles it.
-# The rule is the same on every supported backend: import success picks
-# megatron-core, import failure the transcription.
-# ---------------------------------------------------------------------------
-
-
-def _mcore_version():
-    try:
-        return importlib.metadata.version("megatron-core")
-    except Exception:
-        return "not installed"
-
-
-_MCORE_VERSION = _mcore_version()
-
 
 def native_h_aggregate_ref(x, h_pre):
-    """Megatron-LM's ``native_h_aggregate``, transcribed.
-
-    From ``megatron/core/transformer/hyper_connection.py`` at Megatron-LM 0.20,
-    kept operation for operation, because this is the function whose derivative
-    the operator is measured against. Upstream it carries a ``@torch.compile``
-    decorator; the transcription is compiled by ``_load_native_h_aggregate``
-    below so both baselines pay the same wrapper.
-    """
+    """Megatron-LM's ``native_h_aggregate`` body, transcribed."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
 def _load_native_h_aggregate():
-    """The compiled baseline, and a label for where it came from.
-
-    The compiled wrapper is kept: its derivative is what Megatron's training step
-    actually runs, so it is what the operator has to be measured against. The
-    import is done once at module import because ``megatron.core``'s ``__init__``
-    pulls in the whole core tree.
-    """
+    """Megatron's ``native_h_aggregate``, or its transcribed body compiled."""
     try:
         from megatron.core.transformer.hyper_connection import native_h_aggregate
-    except Exception as exc:
-        warnings.warn(
-            f"megatron-core {_MCORE_VERSION} does not provide "
-            f"native_h_aggregate ({exc!r}); fused_h_aggregate_backward is "
-            f"benchmarked against the autograd derivative of "
-            f"native_h_aggregate_ref, this file's transcription of "
-            f"Megatron-LM's implementation, compiled the way Megatron compiles "
-            f"it",
-            stacklevel=2,
-        )
-        return torch.compile(native_h_aggregate_ref), (
-            f"vendored from Megatron-LM (megatron-core {_MCORE_VERSION})"
-        )
-
-    # The label reports the version of the source actually imported, which a
-    # PYTHONPATH checkout can differ from the distribution metadata.
-    try:
-        from megatron.core.package_info import __version__ as source_version
     except Exception:
-        source_version = _MCORE_VERSION
-    return native_h_aggregate, f"megatron-core {source_version}"
+        return torch.compile(native_h_aggregate_ref), "transcribed"
+    return native_h_aggregate, "megatron-core"
 
 
-_native_h_aggregate, _BASELINE_SOURCE = _load_native_h_aggregate()
-
-# The baseline's source and version are part of the label: a speedup means little
-# without the implementation it was measured against.
-_BASELINE = (
-    "megatron native_h_aggregate autograd backward "
-    f"({_BASELINE_SOURCE}, @torch.compile, donated buffers off)"
-)
-
-
-# Dynamo counts recompiles per code object and stops compiling after 8 by
-# default, serving the eager function from then on. The sweep below needs one
-# graph per (shape, dtype), so its tail would otherwise be timed against an
-# *unfused* baseline -- neither what a training step pays (it compiles once per
-# shape and caches the graph) nor a stable number: which rows came out eager
-# would depend on what ran earlier in the process. Measured: with the default
-# budget the bf16 half of the sweep, when a forward benchmark had already spent
-# the budget in the same process, ran 2-3x slower than the fp16 half at the same
-# shapes. The budget is raised for this module's run; see
-# ``_full_compile_budget``.
+# The compiled baseline needs one graph per (shape, dtype); with dynamo's
+# default budget of 8 recompiles the tail of the sweep would be served eager.
 _COMPILE_BUDGET = 256
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _full_compile_budget():
-    """Keep ``@torch.compile`` compiling across the whole sweep.
-
-    Only the recompile budget is raised -- the compiled code is untouched. The
-    graphs dynamo builds under it stay cached after the fixture restores the
-    setting, which is the point: every row is measured against the compiled
-    derivative Megatron runs.
-    """
+    """Keep ``@torch.compile`` compiling across the whole sweep."""
     config = torch._dynamo.config
-    # Older torch spells the knob ``cache_size_limit``; where both exist they are
-    # aliases, so setting both is redundant but harmless.
     names = [
         name
         for name in ("recompile_limit", "cache_size_limit")
@@ -231,12 +123,8 @@ def _full_compile_budget():
 def _no_buffer_donation():
     """Compile the baseline's backward without buffer donation.
 
-    A donating backward may write into the forward's saved tensors, so PyTorch
-    only lets it run once (``retain_graph=False``); the graph here has to be
-    re-run for every timed repetition. Module-scoped rather than wrapped around
-    the graph build: the decision is baked into the compiled artifact, and
-    inductor compiles lazily per shape and dtype, so the setting has to hold for
-    every compile this benchmark triggers. Restored afterwards.
+    A donating backward may only run once (``retain_graph=False``); this
+    benchmark re-runs the same graph for every timed repetition.
     """
     config = torch._functorch.config
     saved = config.donated_buffer
@@ -250,14 +138,12 @@ def _no_buffer_donation():
 class _MegatronBackwardBaseline:
     """Megatron's backward for one input set, with the graph built up front.
 
-    See the module docstring for why the forward is outside the timed region.
-    The graph is keyed on the identity of the two differentiable inputs and the
-    originals are held for exactly that reason -- a freed tensor's address can be
-    handed to the next case's allocation, and an ``id()``-only cache would then
-    reuse a graph built from different data.
+    Only the backward is timed; the forward that builds the graph is done once
+    per input set, outside the timed region.
     """
 
-    def __init__(self):
+    def __init__(self, forward):
+        self._forward = forward
         self._source_x = None
         self._source_h = None
         self._x = None
@@ -270,7 +156,7 @@ class _MegatronBackwardBaseline:
         # graph it never needs.
         self._x = x.detach().clone().requires_grad_(True)
         self._h = h_pre.detach().clone().requires_grad_(True)
-        self._out = _native_h_aggregate(self._x, self._h)
+        self._out = self._forward(self._x, self._h)
         self._source_x = x
         self._source_h = h_pre
 
@@ -282,7 +168,36 @@ class _MegatronBackwardBaseline:
         )
 
 
-_MEGATRON_BACKWARD = _MegatronBackwardBaseline()
+def _load_baseline():
+    """Megatron's cuTile backward, else the autograd of ``native_h_aggregate``."""
+    try:
+        from megatron.core.fusions.fused_mhc_kernels import _cutile_h_aggregate_bwd
+
+        x = torch.randn((1, 1, 2, 8), dtype=torch.bfloat16, device=flag_train.device)
+        h_pre = torch.randn((1, 1, 2), dtype=torch.bfloat16, device=flag_train.device)
+        grad_output = torch.randn(
+            (1, 1, 8), dtype=torch.bfloat16, device=flag_train.device
+        )
+        with base.torch_device_fn.device(x.device):
+            _cutile_h_aggregate_bwd(grad_output, x, h_pre)
+            base.torch_device_fn.synchronize()
+        return _cutile_h_aggregate_bwd, "megatron _cutile_h_aggregate_bwd"
+    except Exception as exc:
+        warnings.warn(
+            "Megatron-LM's cuTile fused_h_aggregate_backward kernel is "
+            f"unavailable ({exc!r}); timing the autograd derivative of its "
+            "native_h_aggregate torch composition instead.",
+            stacklevel=2,
+        )
+
+    op, source = _load_native_h_aggregate()
+    return _MegatronBackwardBaseline(op), (
+        f"megatron native_h_aggregate autograd ({source}, @torch.compile, "
+        "donated buffers off)"
+    )
+
+
+torch_op, _BASELINE = _load_baseline()
 
 
 class FusedHAggregateBackwardBenchmark(base.GenericBenchmark):
@@ -337,11 +252,6 @@ def fused_h_aggregate_backward_input_fn(shape, dtype, device):
     yield grad_output, x, h_pre
 
 
-def torch_op(grad_output, x, h_pre):
-    """Baseline: Megatron's autograd backward. See the module docstring."""
-    return _MEGATRON_BACKWARD(grad_output, x, h_pre)
-
-
 def train_op(grad_output, x, h_pre):
     """The operator under test."""
     return flag_train.megatron.fused_h_aggregate_backward(grad_output, x, h_pre)
@@ -354,6 +264,8 @@ def test_fused_h_aggregate_backward_perf():
     bench = FusedHAggregateBackwardBenchmark(
         input_fn=fused_h_aggregate_backward_input_fn,
         op_name="fused_h_aggregate_backward",
+        # Megatron's cuTile kernel, or the autograd of its native_h_aggregate
+        # composition when that kernel cannot run here.
         torch_op=torch_op,
         dtypes=_DTYPES,
     )

@@ -16,9 +16,10 @@
 The baseline is Megatron-LM's ``ScaledMaskedSoftmax.forward``, the operator
 this port is a port *of*. When ``megatron.core.fusions.fused_softmax`` cannot
 supply it, its one-line method body is vendored below and run against the same
-Apex CUDA extension. When that extension is unavailable, the benchmark warns
-and falls back to ``masked_softmax_ref``, the plain-torch scale + sentinel +
-softmax composition. ``_BASELINE`` records which one was measured.
+Apex CUDA extension. When that extension is unavailable there is no on-machine
+baseline: a plain-torch scale + sentinel + softmax composition is not timed,
+``torch_op`` is ``None``, and ``--base-data`` is the only comparison.
+``_BASELINE`` records which case was measured.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). Both implementations read the
@@ -39,7 +40,6 @@ import flag_train.megatron
 from .. import base
 
 _SCALE = 0.125
-_MASKED_SCORE = -10000.0
 _EXTENSION = "scaled_masked_softmax_cuda"
 
 # ``[b, np, sq, sk]`` attention scores. The sweep walks the key axis through
@@ -61,21 +61,6 @@ if flag_train.runtime.device.support_bf16:
     _DTYPES.append(torch.bfloat16)
 
 
-def masked_softmax_ref(inputs, mask, scale):
-    """Torch composition of the forward; the fallback baseline."""
-    scores = inputs.to(torch.float32) * scale
-    masked = mask.bool().expand_as(scores)
-    scores = scores.masked_fill(masked, _MASKED_SCORE)
-    row_max = scores.max(dim=-1, keepdim=True).values
-    numerator = torch.exp(scores - row_max)
-    result = numerator / numerator.sum(dim=-1, keepdim=True)
-    result = result.masked_fill(masked, 0.0)
-    result = torch.where(
-        masked.all(dim=-1, keepdim=True), torch.zeros_like(result), result
-    )
-    return result.to(inputs.dtype)
-
-
 def _megatron_version():
     for distribution in ("megatron-core", "megatron"):
         try:
@@ -94,16 +79,22 @@ def _vendored_forward(inputs, mask, scale):
 
 
 def _load_megatron_baseline():
-    """Megatron's forward, or ``None`` when this install cannot provide one."""
+    """Harness-ready Megatron forward, and the label for ``_BASELINE``.
+
+    ``torch_op`` is ``None`` when this install cannot provide one; the label then
+    says so. When the class cannot be imported, its one-line body is vendored
+    against the same Apex extension.
+    """
     if importlib.util.find_spec(_EXTENSION) is None:
         warnings.warn(
             f"Megatron-LM's fused masked softmax forward needs the Apex "
-            f"'{_EXTENSION}' extension, which is not installed. Falling back to "
-            f"masked_softmax_ref (torch).",
+            f"'{_EXTENSION}' extension, which is not installed. This run has no "
+            f"on-machine baseline; a torch composition is not timed, so "
+            f"--base-data is the only comparison.",
             RuntimeWarning,
             stacklevel=2,
         )
-        return None
+        return None, "none (no on-machine baseline; --base-data is the only comparison)"
     version = _megatron_version()
     try:
         from megatron.core.fusions.fused_softmax import ScaledMaskedSoftmax
@@ -115,28 +106,15 @@ def _load_megatron_baseline():
             RuntimeWarning,
             stacklevel=2,
         )
-        return "vendored"
-    return ScaledMaskedSoftmax
+        return _vendored_forward, (
+            "Megatron-LM ScaledMaskedSoftmax.forward (vendored body, "
+            f"megatron-core {version or 'absent'})"
+        )
+    return ScaledMaskedSoftmax.apply, f"megatron-core {version} ScaledMaskedSoftmax"
 
 
-_MEGATRON = _load_megatron_baseline()
-if _MEGATRON is None:
-    _BASELINE = "masked_softmax_ref (torch)"
-elif _MEGATRON == "vendored":
-    _BASELINE = (
-        "Megatron-LM ScaledMaskedSoftmax.forward (vendored body, "
-        f"megatron-core {_megatron_version() or 'absent'})"
-    )
-else:
-    _BASELINE = f"megatron-core {_megatron_version()} ScaledMaskedSoftmax"
-
-
-def _baseline_forward(inputs, mask, scale):
-    if _MEGATRON is None:
-        return masked_softmax_ref(inputs, mask, scale)
-    if _MEGATRON == "vendored":
-        return _vendored_forward(inputs, mask, scale)
-    return _MEGATRON.apply(inputs, mask, scale)
+# Resolved once, so the first-use import is not counted in the measurement.
+torch_op, _BASELINE = _load_megatron_baseline()
 
 
 class ScaledMaskedSoftmaxForwardBenchmark(base.GenericBenchmark):
@@ -171,11 +149,6 @@ def masked_forward_input_fn(shape, dtype, device):
     yield scores, mask, _SCALE
 
 
-def torch_op(scores, mask, scale):
-    """Baseline, chosen at import time. See the module docstring."""
-    return _baseline_forward(scores, mask, scale)
-
-
 def train_op(scores, mask, scale):
     """The operator under test."""
     return flag_train.megatron.scaled_masked_softmax_cuda_forward(scores, mask, scale)
@@ -187,6 +160,8 @@ def test_scaled_masked_softmax_cuda_forward_perf():
     bench = ScaledMaskedSoftmaxForwardBenchmark(
         input_fn=masked_forward_input_fn,
         op_name="scaled_masked_softmax_cuda_forward",
+        # None when the Apex extension is unavailable: a torch composition is
+        # not timed as a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
         dtypes=_DTYPES,
     )

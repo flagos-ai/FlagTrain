@@ -17,10 +17,9 @@
 Mirrors FlagGems-vllm's tools/run_tests.py::parse_perf_data and
 tools/psum_text::parse_lines:
 
-  * per shape: ``compared_speedup`` when present (the vs-Base value), else the
-    local torch-baseline ``speedup``. An operator whose benchmark declares a
-    native baseline (``base_data_ignored`` in its JSON) never carries
-    ``compared_speedup``, so it is summarized by the local ``speedup``;
+  * per shape: the local torch-baseline ``speedup`` when present, else the
+    vs-Base ``compared_speedup``; ``--speedup-source nv_baseline`` reverses
+    that preference;
   * per dtype: arithmetic mean over shapes that carry a numeric value
     (``None`` is excluded, ``0.0`` is kept);
   * per op: arithmetic mean over dtypes that carry a value.
@@ -82,7 +81,7 @@ def numeric(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def parse_benchmark_data(raw: dict) -> dict:
+def parse_benchmark_data(raw: dict, speedup_source: str = "origin") -> dict:
     """Return ``{op: record}`` from one benchmark JSON payload."""
     parsed = {}
     for op, bucket in (raw or {}).items():
@@ -97,7 +96,6 @@ def parse_benchmark_data(raw: dict) -> dict:
                 "perf_avg": None,
                 "base_miss_reasons": [],
                 "base_data_used": False,
-                "base_data_ignored": False,
                 "matched_shapes": None,
                 "missed_shapes": None,
             }
@@ -109,29 +107,30 @@ def parse_benchmark_data(raw: dict) -> dict:
         matched = 0
         missed = 0
         base_data_used = False
-        base_data_ignored = False
 
         for detail in bucket.get("details") or []:
             if not isinstance(detail, dict):
                 continue
             dtype = display_dtype(detail.get("dtype", "unknown"))
-            if detail.get("base_data_ignored"):
-                base_data_ignored = True
             details = {}
             total = 0.0
             count = 0
             for row in detail.get("result") or []:
                 shape = str(row.get("shape_detail", "Unknown")).replace(" ", "")
+                # Default matches upstream: a missing key counts as 0.0, while
+                # an explicit None is excluded from the mean below.
+                measured = row.get("speedup", 0.0)
+                compared = row.get("compared_speedup")
+                if speedup_source == "nv_baseline":
+                    speedup = compared if compared is not None else measured
+                else:  # origin, the default: the local torch-baseline ratio
+                    speedup = measured if measured is not None else compared
                 entry = {
                     "base": row.get("latency_base", 0.0),
                     "gems": row.get("latency", 0.0),
-                    # Default matches upstream: a missing key counts as 0.0,
-                    # while an explicit None is excluded from the mean below.
-                    "speedup": row.get("speedup", 0.0),
+                    "speedup": speedup,
                 }
-                compared = row.get("compared_speedup")
                 if compared is not None:
-                    entry["speedup"] = compared
                     base_data_used = True
                     matched += 1
                 miss = row.get("base_miss_reason")
@@ -163,7 +162,6 @@ def parse_benchmark_data(raw: dict) -> dict:
             "perf_avg": (sum(averages) / len(averages)) if averages else None,
             "base_miss_reasons": miss_reasons,
             "base_data_used": base_data_used,
-            "base_data_ignored": base_data_ignored,
             "matched_shapes": matched if base_data_used else None,
             "missed_shapes": missed if base_data_used else None,
         }
@@ -284,26 +282,12 @@ def write_markdown(path: Path, summary: dict, columns: list) -> None:
         lines += ["", "## Baseline misses", ""]
         lines += [f"- {op}: {reason}" for op, reason in misses]
 
-    ignored = [
-        op
-        for op, entry in summary["result"].items()
-        if entry["performance"].get("base_data_ignored")
-    ]
-    if ignored:
-        lines += ["", "## Base data ignored", ""]
-        lines += [
-            f"- {op}: the baseline is the native implementation, so PerfAvg is "
-            "the local Train Speedup"
-            for op in ignored
-        ]
-
     lines += [
         "",
-        "PerfAvg is the arithmetic mean of the per-dtype means; a shape uses",
-        "`compared_speedup` when the baseline matched, otherwise the local",
-        'torch-baseline `speedup`. Operators in "Base data ignored" never use',
-        "`compared_speedup`: their baseline is the native implementation, so",
-        "`--base-data` does not apply to them.",
+        "PerfAvg is the arithmetic mean of the per-dtype means; by default a",
+        "shape uses the local torch-baseline `speedup`, falling back to",
+        "`compared_speedup` when speedup is missing. `--speedup-source",
+        "nv_baseline` reverses that preference.",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -351,6 +335,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
+        "--speedup-source",
+        choices=["origin", "nv_baseline"],
+        default="origin",
+        help=(
+            "Which ratio each shape reports when --base-data matched and both "
+            "ratios exist. 'origin' (default): the local torch-baseline "
+            "speedup, falling back to vs-Base compared_speedup when speedup "
+            "is missing. 'nv_baseline': prefer vs-Base and fall back to the "
+            "local speedup. Without --base-data only the local speedup exists."
+        ),
+    )
+    parser.add_argument(
         "--min-speedup",
         type=float,
         default=None,
@@ -375,7 +371,7 @@ def main() -> None:
         except (OSError, ValueError) as error:
             print(f"::warning:: cannot read {path}: {error}", file=sys.stderr)
             continue
-        parsed_by_file.append(parse_benchmark_data(raw))
+        parsed_by_file.append(parse_benchmark_data(raw, args.speedup_source))
 
     if not parsed_by_file:
         raise SystemExit("no readable benchmark JSON inputs")
