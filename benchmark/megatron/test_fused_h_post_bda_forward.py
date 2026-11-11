@@ -35,6 +35,22 @@ import flag_train
 
 from .. import base
 
+# Inductor's async compile sends each Triton kernel to a worker process and
+# pickles the compiled kernel back. Vendor Triton builds whose JITFunction
+# cannot be pickled (it carries an RLock) fail there with
+# "TypeError: cannot pickle '_thread.RLock' object" while compiling the
+# baseline. The failure only appears once the worker pool is ready, so the
+# smoke compile in ``_load_baseline`` can succeed and the crash land mid-sweep.
+# One compile thread keeps compilation in-process; it changes compile time
+# only, not the measured kernel time.
+try:
+    import torch._inductor.config
+
+    if getattr(torch._inductor.config, "compile_threads", 1) != 1:
+        torch._inductor.config.compile_threads = 1
+except ImportError:
+    pass
+
 _DTYPES = [torch.bfloat16, torch.float16, torch.float32]
 _CORE_SHAPES = [
     (2, 4, 4, 1024, 0),
