@@ -56,14 +56,12 @@ arithmetic contract -- the same fp32 score accumulation, the same ``exp2``-based
 softmax, the same ``lse`` definition -- so results agree to the tolerance upstream's
 own test asserts (``1e-2`` fp16, ``5e-2`` bf16; see ``evoformer_attn.md``).
 
-What upstream's ``EvoformerFusedAttention.forward`` does around the kernel is not
-copied either: it normalises absent biases (``torch.tensor([])``) and calls
-``.contiguous()`` on everything, and that part *is* here -- ``evoformer_attn``
-accepts ``None`` for a bias and requires contiguous operands, because those are
-what the kernel needs to be handed. What is not here is the ``biases`` list
-handling of the public entry, which appends to the caller's list
-(``biases.append`` at evoformer_attn.py:92-95); with the public entry unported,
-nothing takes a list.
+What upstream's public entry does around the kernel is mirrored too. The public
+``evoformer_attn(Q, K, V, biases)`` takes the same 0-2-entry bias list, pads that
+list in place exactly as upstream does, calls ``.contiguous()`` on the operands
+and the biases, and returns only the output tensor. The internal
+``_attention(q, k, v, bias1, bias2)`` is the layer that returns ``(out, lse)``;
+the public entry discards ``lse``, as upstream's does.
 """
 
 import logging
@@ -454,6 +452,22 @@ def _normalize_bias(bias, q):
     return _empty_bias_like(q) if bias is None else bias
 
 
+def _normalize_biases(biases):
+    """Pad the public 0-2-entry bias list in place, exactly as DeepSpeed does.
+
+    Upstream's ``DS4Sci_EvoformerAttention`` appends ``None`` until the list has
+    two entries and then reads ``biases[0]``/``biases[1]``.  Keeping the same
+    list handling (including the in-place append) is what makes the public entry
+    a drop-in replacement, not just the argument count.
+    """
+    assert len(biases) <= 2, "biases must contain at most two entries"
+    if len(biases) == 0:
+        biases.append(None)
+    if len(biases) == 1:
+        biases.append(None)
+    return biases[0], biases[1]
+
+
 def _lse_shape(batch, heads, seq_len):
     """``[B*N, H, ceil(L/32)*32]`` -- upstream pads lse to a multiple of 32.
 
@@ -464,8 +478,14 @@ def _lse_shape(batch, heads, seq_len):
     return (batch, heads, triton.cdiv(seq_len, 32) * 32)
 
 
-def evoformer_attn(q, k, v, bias1=None, bias2=None):
-    """Evoformer attention forward.
+def _attention(q, k, v, bias1=None, bias2=None):
+    """Internal Evoformer attention forward, returning ``(out, lse)``.
+
+    This mirrors upstream's private ``_attention`` and is the layer the public
+    ``evoformer_attn`` calls.  The public entry returns only ``out``; ``lse`` is
+    kept here because it is the second half of the kernel's contract and what a
+    gradient would need.  Inputs must already be contiguous (the public entry
+    makes them so).
 
     Args:
         q (Tensor): queries ``[..., L, H, D]``, contiguous.
@@ -479,9 +499,6 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
     Returns:
         ``(out, lse)``: the attention output, shaped like ``q``, and the fp32
         log-sum-exp of each query row's scores, shaped ``[B*N, H, ceil(L/32)*32]``.
-        This is exactly what upstream's ``_attention`` returns. ``lse`` is part
-        of that contract rather than an extra: it is the second half of what the
-        forward is defined to produce, and it is what a gradient would need.
 
     Requires ``D <= 64``, which is upstream's own limit: its forward is compiled
     for it. ``L`` is *not* bounded below here. Upstream asserts ``L > 16``, but
@@ -493,11 +510,11 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
     ``num_queries = num_keys = seq_length`` from the query, so a cross-attention
     with different lengths is not something it supports either.
 
-    This is the generic implementation, and the one every backend without an
-    override runs. A backend with a specialised kernel replaces this *name*
-    through ``runtime.backend.SpecOpRegistrar`` when ``flag_train.deepspeed`` is
-    imported, so that is where to import the operator from -- importing it from
-    this module gets the generic kernel on every backend.
+    This is the generic implementation's internal layer.  A backend with a
+    specialised kernel provides its own ``_attention`` and public
+    ``evoformer_attn``; ``runtime.backend.SpecOpRegistrar`` installs the latter
+    when ``flag_train.deepspeed`` is imported.  Import the public operator from
+    ``flag_train.deepspeed``, not from this module.
     """
     logger.debug("TRAIN EVOFORMER_ATTN")
 
@@ -563,3 +580,42 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
             num_warps=num_warps,
         )
     return out, lse
+
+
+def evoformer_attn(Q, K, V, biases):
+    """Evoformer attention forward with DeepSpeed's public interface.
+
+    This is a drop-in replacement for ``DS4Sci_EvoformerAttention(Q, K, V,
+    biases)``: the biases arrive as a list of at most two entries (``None`` for
+    an absent bias), the list is padded in place to two entries like upstream's,
+    non-contiguous operands are made contiguous, and only the attention output is
+    returned.  ``biases`` must be a list, as upstream's entry calls ``append`` on
+    it.
+
+    Args:
+        Q (Tensor): queries ``[..., L, H, D]``.
+        K (Tensor): keys, same shape as ``Q``.
+        V (Tensor): values, same shape as ``Q``.
+        biases (list): 0-2 bias tensors. ``biases[0]`` is ``[B, N, 1, 1, L]``
+            and ``biases[1]`` is ``[B, 1, H, L, L]``; either may be ``None`` or
+            an empty tensor.
+
+    Returns:
+        Tensor: the attention output, shaped like ``Q``.  The log-sum-exp is
+        still produced by the internal ``_attention`` layer but, as in
+        upstream's public entry, is not returned here.
+    """
+    bias1, bias2 = _normalize_biases(biases)
+
+    # Upstream's public entry reaches the kernel through a wrapper that makes
+    # every operand contiguous; do the same before the checks/kernel see them.
+    q = Q.contiguous()
+    k = K.contiguous()
+    v = V.contiguous()
+    if bias1 is not None:
+        bias1 = bias1.contiguous()
+    if bias2 is not None:
+        bias2 = bias2.contiguous()
+
+    out, _ = _attention(q, k, v, bias1, bias2)
+    return out
