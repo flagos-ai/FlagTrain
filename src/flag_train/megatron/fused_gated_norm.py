@@ -21,7 +21,10 @@ the FlagTrain vendor-abstraction layer.  Semantics match the upstream kernel:
 * SiLU gating by a same-shaped ``gate`` tensor;
 * the normalised activation is materialised in the activation dtype *before*
   the FP32 gating multiply, preserving the rounding behaviour of the unfused
-  ``RMSNorm -> x * silu(gate)`` pipeline.
+  ``RMSNorm -> x * silu(gate)`` pipeline;
+* the dtypes are the ones Megatron's ``validate_gated_norm`` admits: ``x`` is
+  BF16 or FP16, ``gate`` is in ``x.dtype`` or FP32, and ``weight`` is BF16,
+  FP16 or FP32.
 
 The operator handles arbitrary (possibly non-contiguous) ``[batch, sequence,
 heads, dim]`` views, addressing logical rows through the per-dimension strides.
@@ -151,7 +154,9 @@ def _check_arguments(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor) 
     """Validate the operands; return the head dimension.
 
     Shared with backend overrides so a specialised implementation cannot come to
-    accept something the generic one rejects, or the reverse.
+    accept something the generic one rejects, or the reverse. The dtype checks
+    are Megatron's ``validate_gated_norm`` contract, so the operator accepts
+    exactly the dtypes the upstream call path admits.
     """
     if x.ndim != 4 or gate.shape != x.shape:
         raise ValueError("fused_gated_norm: gate must match x's 4-D shape")
@@ -172,6 +177,14 @@ def _check_arguments(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor) 
         raise ValueError(
             "fused_gated_norm: weight must be a contiguous (dim,) tensor on the input device"
         )
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("fused_gated_norm: x must be BF16 or FP16")
+    if gate.dtype not in (x.dtype, torch.float32):
+        raise ValueError(
+            "fused_gated_norm: gate must be in x's dtype or torch.float32"
+        )
+    if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError("fused_gated_norm: weight must be BF16, FP16 or FP32")
     return dim
 
 
@@ -186,9 +199,9 @@ def fused_gated_norm(
     """Run fused RMSNorm/SiLU gating (forward only).
 
     Args:
-        x: Core attention output, ``[batch, sequence, heads, dim]``.
+        x: Core attention output, ``[batch, sequence, heads, dim]`` (BF16 or FP16).
         gate: SiLU gate, same shape as ``x`` (``x.dtype`` or ``torch.float32``).
-        weight: Contiguous RMSNorm weight, shape ``(dim,)``.
+        weight: Contiguous RMSNorm weight, shape ``(dim,)`` (BF16, FP16 or FP32).
         eps: RMSNorm epsilon.
         zero_centered: If ``True``, apply ``weight + 1`` before gating.
     """
