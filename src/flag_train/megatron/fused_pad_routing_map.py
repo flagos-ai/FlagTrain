@@ -306,10 +306,20 @@ def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch
             argument itself is returned, unchanged.
     """
     logger.debug("TRAIN FUSED_PAD_ROUTING_MAP")
-    assert routing_map.dim() == 2, (
-        "fused_pad_routing_map expects a [num_tokens, num_experts] tensor, "
-        f"got shape {tuple(routing_map.shape)}"
-    )
+    if routing_map.dim() != 2:
+        # Upstream unpacks ``shape`` directly, so a bad rank is a ValueError;
+        # match that rather than an AssertionError.
+        raise ValueError(
+            "fused_pad_routing_map expects a [num_tokens, num_experts] tensor, "
+            f"got shape {tuple(routing_map.shape)}"
+        )
+
+    num_tokens, num_experts = routing_map.shape
+    # Upstream returns before touching device or pad_multiple when there are no
+    # tokens; keep that ordering so an empty input behaves identically.
+    if num_tokens == 0:
+        return routing_map
+
     # Accept whatever the active backend calls its device -- 'cuda' on
     # nvidia/hygon, 'npu' on ascend -- rather than hard-coding CUDA.
     assert (
@@ -318,10 +328,6 @@ def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch
     assert (
         isinstance(pad_multiple, int) and pad_multiple > 0
     ), f"pad_multiple must be a positive int, got {pad_multiple!r}"
-
-    num_tokens, num_experts = routing_map.shape
-    if num_tokens == 0:
-        return routing_map
 
     # Both kernels index the map as a dense [tokens, experts] array; a view
     # with another layout is densified once rather than read strided.

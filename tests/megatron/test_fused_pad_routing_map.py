@@ -370,6 +370,13 @@ def test_fused_pad_routing_map_empty_tokens(shape, dtype):
 
 
 @pytest.mark.fused_pad_routing_map
+def test_empty_tokens_return_before_device_and_pad_validation():
+    """Upstream returns the empty argument before checking device or pad_multiple."""
+    routing_map = torch.zeros((0, 8), dtype=torch.bool)  # CPU on purpose
+    assert flag_train.megatron.fused_pad_routing_map(routing_map, 0) is routing_map
+
+
+@pytest.mark.fused_pad_routing_map
 def test_fused_pad_routing_map_no_experts():
     """num_experts == 0 is legal; the result is empty and still int32."""
     routing_map = torch.zeros((16, 0), dtype=torch.bool, device=flag_train.device)
@@ -403,7 +410,7 @@ def test_fused_pad_routing_map_contract(shape):
 def test_fused_pad_routing_map_rejects_bad_arguments():
     routing_map = torch.zeros((16, 8), dtype=torch.bool, device=flag_train.device)
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         flag_train.megatron.fused_pad_routing_map(
             torch.zeros((16,), dtype=torch.bool, device=flag_train.device), 8
         )
