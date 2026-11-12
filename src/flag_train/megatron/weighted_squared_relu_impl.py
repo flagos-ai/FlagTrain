@@ -31,19 +31,36 @@ _NUM_WARPS = 4
 _BLOCK_SIZE = 1024
 _BLOCK_SIZE_16BIT = 2048
 
-_WEIGHTED_SQUARED_RELU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_WEIGHTED_SQUARED_RELU_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+)
 
 
-def _check_input(tensor, name):
-    if tensor.dtype not in _WEIGHTED_SQUARED_RELU_DTYPES:
-        wanted = " / ".join(str(dtype) for dtype in _WEIGHTED_SQUARED_RELU_DTYPES)
-        raise ValueError(f"{name} needs a {wanted} tensor, got {tensor.dtype}")
+def _check_device(tensor, name):
     if tensor.device.type == "cpu":
         raise ValueError(f"{name} needs a device tensor, not one on the CPU")
     if tensor.device.type != runtime_device.name:
         raise ValueError(
             f"{name} needs a {runtime_device.name} tensor, got {tensor.device.type}"
         )
+
+
+def _check_input(tensor, name):
+    if tensor.dtype not in _WEIGHTED_SQUARED_RELU_DTYPES:
+        wanted = " / ".join(str(dtype) for dtype in _WEIGHTED_SQUARED_RELU_DTYPES)
+        raise ValueError(f"{name} needs a {wanted} tensor, got {tensor.dtype}")
+    _check_device(tensor, name)
+
+
+def _check_weights(weights):
+    # Megatron multiplies the activation by a broadcastable weight tensor, so
+    # any real numeric dtype is valid here; the kernel converts it to fp32.
+    if weights.dtype.is_complex:
+        raise ValueError("weighted_squared_relu_impl weights must be real-valued")
+    _check_device(weights, "weighted_squared_relu_impl weights")
 
 
 @triton.jit
@@ -67,17 +84,21 @@ def _weighted_forward_kernel(
     weight_ptr,
     y_ptr,
     hidden,
+    weight_stride_row,
+    weight_stride_col,
     abs_scale,
     neg_two_over_scale,
     HAS_CLAMP: tl.constexpr,
     EVEN_HIDDEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """``y = squared_relu(x) * weight[row]``, optionally tanh soft-clamped.
+    """``y = squared_relu(x) * weight[row, col]``, optionally clamped.
 
-    One program handles a ``BLOCK_SIZE`` slice of one row, so the per-token
-    weight is a scalar load. The activation is computed in fp32, matching the
-    reference; the bounds check is dropped when ``hidden`` is block-aligned.
+    One program handles a ``BLOCK_SIZE`` slice of one row.  ``weight`` is a
+    broadcast view of shape ``(num_tokens, hidden)``: a broadcast dimension has
+    stride 0, so the same load covers per-token, per-column and scalar weights.
+    The activation is computed in fp32, matching the reference; the bounds check
+    is dropped when ``hidden`` is block-aligned.
     """
     row = tle.program_id(0)
     base = row * hidden
@@ -85,10 +106,17 @@ def _weighted_forward_kernel(
 
     if EVEN_HIDDEN:
         x = tl.load(x_ptr + base + columns).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + row * weight_stride_row + columns * weight_stride_col
+        ).to(tl.float32)
     else:
         mask = columns < hidden
         x = tl.load(x_ptr + base + columns, mask=mask, other=0.0).to(tl.float32)
-    weight = tl.load(weight_ptr + row).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + row * weight_stride_row + columns * weight_stride_col,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
 
     if HAS_CLAMP:
         act = _clamped_square(x, abs_scale, neg_two_over_scale)
@@ -136,7 +164,10 @@ def _clamped_forward_kernel(
 
 def _launch_config(dtype):
     """Block/warp pair measured fastest for ``dtype`` on this device."""
-    if runtime_device.vendor_name == "nvidia" and dtype != torch.float32:
+    if runtime_device.vendor_name == "nvidia" and dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ):
         return _BLOCK_SIZE_16BIT, _NUM_WARPS
     return _BLOCK_SIZE, _NUM_WARPS
 
@@ -150,7 +181,16 @@ def _clamp_operands(clamp_scale):
     return abs_scale, neg_two_over_scale
 
 
-def _launch_weighted(x, weights, out, hidden, num_tokens, clamp_scale):
+def _launch_weighted(
+    x,
+    weights,
+    out,
+    hidden,
+    num_tokens,
+    weight_stride_row,
+    weight_stride_col,
+    clamp_scale,
+):
     block_size, num_warps = _launch_config(x.dtype)
     if clamp_scale is None:
         abs_scale, neg_two_over_scale = 0.0, 0.0
@@ -163,6 +203,8 @@ def _launch_weighted(x, weights, out, hidden, num_tokens, clamp_scale):
             weights,
             out,
             hidden,
+            weight_stride_row,
+            weight_stride_col,
             abs_scale,
             neg_two_over_scale,
             HAS_CLAMP=clamp_scale is not None,
@@ -199,11 +241,13 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
     not a fused case (mirrors the reference's assertion).
 
     Args:
-        input (Tensor): fp16, bf16 or fp32 tensor of shape ``(B, hidden)`` or
-            ``(S, B, hidden)`` on the active device. Non-contiguous input is
+        input (Tensor): fp16, bf16, fp32 or fp64 tensor of shape ``(B, hidden)``
+            or ``(S, B, hidden)`` on the active device. Non-contiguous input is
             copied; empty input is returned without a launch.
-        weights (Tensor, optional): per-token weights of shape ``(B, 1)``
-            (``(S * B, 1)`` for a 3-D input), usually fp32.
+        weights (Tensor, optional): weights broadcastable to the flattened
+            activation ``(B, hidden)`` (``(S * B, hidden)`` for a 3-D input),
+            e.g. ``(B, 1)``, ``(1, hidden)`` or ``(1, 1)``.  Any real numeric
+            dtype is accepted and converted to fp32 for the multiply.
         clamp_scale (float, optional): the tanh soft-clamp scale.
 
     Returns:
@@ -224,19 +268,33 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
     num_tokens = math.prod(input.shape[:-1])
 
     if weights is not None:
-        _check_input(weights, "weighted_squared_relu_impl weights")
-        expected = (num_tokens, 1)
-        if tuple(weights.shape) != expected:
-            raise ValueError(
-                "weighted_squared_relu_impl weights must be broadcast per token, "
-                f"i.e. shape {expected} for an input of shape "
-                f"{tuple(input.shape)}, got {tuple(weights.shape)}"
-            )
+        _check_weights(weights)
         if weights.device != input.device:
             raise ValueError(
                 "weighted_squared_relu_impl weights must be on the same device as the "
                 f"input, got {weights.device} and {input.device}"
             )
+        # Megatron multiplies the flattened activation by the weights using
+        # ordinary broadcasting; accept the same shapes rather than only the
+        # common (num_tokens, 1).  ``broadcast_to`` is a stride-zero view, so
+        # scalar/per-column weights need no materialisation.
+        try:
+            broadcast_shape = torch.broadcast_shapes(
+                tuple(weights.shape), (num_tokens, hidden)
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                "weighted_squared_relu_impl weights must be broadcastable to "
+                f"{(num_tokens, hidden)} (the flattened activation shape), got "
+                f"{tuple(weights.shape)}"
+            ) from exc
+        if broadcast_shape != (num_tokens, hidden):
+            raise ValueError(
+                "weighted_squared_relu_impl weights must broadcast to exactly "
+                f"{(num_tokens, hidden)} (the flattened activation shape), got "
+                f"{tuple(weights.shape)} -> {tuple(broadcast_shape)}"
+            )
+        weights = torch.broadcast_to(weights, (num_tokens, hidden))
 
     if input.numel() == 0:
         # No launch when there is nothing to activate.
@@ -252,10 +310,12 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
     else:
         _launch_weighted(
             flat,
-            weights.contiguous().view(-1),
+            weights,
             out,
             hidden,
             num_tokens,
+            weights.stride(0),
+            weights.stride(1),
             clamp_scale,
         )
     return out.view(input.shape)

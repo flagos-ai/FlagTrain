@@ -337,15 +337,42 @@ def test_weighted_clamped_squared_relu(shape, dtype):
 
 
 @pytest.mark.weighted_squared_relu_impl
-@pytest.mark.parametrize("weights_dtype", utils.FLOAT_DTYPES)
+@pytest.mark.parametrize("weights_dtype", utils.ALL_FLOAT_DTYPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_weight_dtype(dtype, weights_dtype):
-    """Per-token weights may be fp32 while the activation is bf16/fp16."""
+    """Weights may be wider than the activation, including fp64."""
     utils.init_seed(5)
     shape = (8, 32)
     x = torch.randn(shape, dtype=dtype, device=flag_train.device)
     weights = _weights_for(shape, weights_dtype, seed=6)
     _check(x, weights, None)
+
+
+@pytest.mark.weighted_squared_relu_impl
+@pytest.mark.parametrize(
+    "weights_shape",
+    [(16, 1), (1, 1), (1, 64), (64,), (16, 64)],
+    ids=["per_token", "scalar", "per_column", "row_vector", "elementwise"],
+)
+def test_weighted_squared_relu_broadcast_weights(weights_shape):
+    """Megatron accepts any weights broadcastable to the flattened activation."""
+    utils.init_seed(12)
+    shape = (16, 64)
+    x = torch.randn(shape, dtype=torch.float32, device=flag_train.device)
+    weights = torch.rand(weights_shape, dtype=torch.float32, device=flag_train.device)
+    _check(x, weights, None)
+    _check(x, weights, _CLAMP_SCALE)
+
+
+@pytest.mark.weighted_squared_relu_impl
+@pytest.mark.skipif(not utils.fp64_is_supported, reason="device does not support fp64")
+def test_weighted_squared_relu_fp64():
+    """fp64 activations preserve Megatron's accepted input dtype."""
+    shape = (16, 64)
+    x = torch.randn(shape, dtype=torch.float64, device=flag_train.device)
+    weights = _weights_for(shape, torch.float64, seed=13)
+    _check(x, weights, None)
+    _check(x, weights, _CLAMP_SCALE)
 
 
 @pytest.mark.weighted_squared_relu_impl
@@ -431,9 +458,9 @@ def test_weighted_squared_relu_rejects_no_weights_and_no_clamp():
 @pytest.mark.weighted_squared_relu_impl
 def test_weighted_squared_relu_rejects_bad_weights_shape():
     x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
-    for shape in ((16,), (16, 2), (1, 1)):
+    for shape in ((16,), (16, 2), (2, 64)):
         weights = torch.rand(shape, dtype=torch.float32, device=flag_train.device)
-        with pytest.raises(ValueError, match="shape"):
+        with pytest.raises(ValueError, match="broadcast"):
             flag_train.megatron.weighted_squared_relu_impl(x, weights)
 
 
