@@ -172,6 +172,11 @@ def _activate(
     if MODE == 1:
         gate_c = tl.minimum(gate, clamp_value)
         linear_c = tl.minimum(tl.maximum(linear, -clamp_value), clamp_value)
+        # torch.clamp propagates NaN; tl.minimum/maximum default to
+        # minnum/maxnum, which replace NaN with the clamp bound. Restore the
+        # NaN so the clamped variant matches Megatron-LM's clamped_swiglu.
+        gate_c = tl.where(gate != gate, gate, gate_c)
+        linear_c = tl.where(linear != linear, linear, linear_c)
         return gate_c * _sigmoid(gate_c) * linear_c
     t = _tanh(gate / gate_scale)
     gate_v = (gate_scale * t) * _sigmoid(gate)
@@ -324,6 +329,11 @@ def bias_swiglu_impl(
 
     Returns:
         Tensor: same rank and dtype as ``input``, with the last dimension halved.
+
+    Raises:
+        RuntimeError: If a 3-D input has zero elements. Megatron-LM restores
+            the 3-D shape with ``view(..., -1)``, which is ambiguous for a
+            0-element tensor; this operator mirrors that behavior.
     """
     logger.debug("TRAIN BIAS_SWIGLU_IMPL")
     if bias is not None and not isinstance(bias, torch.Tensor):
@@ -341,4 +351,9 @@ def bias_swiglu_impl(
     mode, scale, linear_scale = _resolve_variant(
         clamp_value, gate_clamp_scale, linear_clamp_scale
     )
-    return _forward(flat, bias, mode, scale, linear_scale).view(out_shape)
+    y = _forward(flat, bias, mode, scale, linear_scale)
+    # Megatron-LM restores the 3-D shape with ``view(ori_shape[0],
+    # ori_shape[1], -1)``. The ``-1`` is ambiguous for a 0-element tensor, so a
+    # 3-D input whose leading dimensions contain zero raises RuntimeError.
+    # Keep that behavior: this operator mirrors the upstream entry point.
+    return y if input.ndim == 2 else y.view(out_shape[0], out_shape[1], -1)
