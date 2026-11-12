@@ -74,11 +74,12 @@ _BENCHMARK_SHAPES = [
     (2, 512, 16, 512),
 ]
 
-# FP32 exercises the exact-arithmetic path; BF16 only where the runtime has it.
-_DTYPES = [torch.float16, torch.float32]
+# Megatron's contract admits BF16/FP16 activations only -- its
+# ``validate_gated_norm`` rejects FP32 -- and BF16 only where the runtime has it.
+_DTYPES = [torch.float16]
 if utils.bf16_is_supported:
     _DTYPES.append(torch.bfloat16)
-_BENCHMARK_DTYPES = [dt for dt in _DTYPES if dt is not torch.float32]
+_BENCHMARK_DTYPES = _DTYPES
 
 # The variant tests cover both weight modes.
 _ZERO_CENTERED = pytest.mark.parametrize(
@@ -362,21 +363,35 @@ def test_fused_gated_norm_output_contract(dtype):
         ("head-dim", "power-of-two"),
         ("weight-shape", r"contiguous \(dim,\)"),
         ("weight-stride", r"contiguous \(dim,\)"),
+        ("x-dtype", "BF16 or FP16"),
+        ("gate-dtype", "gate must be in x's dtype"),
+        ("weight-dtype", "weight must be BF16, FP16 or FP32"),
     ],
 )
 def test_fused_gated_norm_rejects_invalid_input(bad_input, match):
-    """Unsupported layouts fail with a diagnostic instead of reading out of bounds."""
-    x, gate, weight = _operands(_SHAPE, torch.float32)
+    """Unsupported layouts and dtypes fail with a diagnostic.
+
+    The dtype cases pin the operator to Megatron's ``validate_gated_norm``
+    contract: no FP32 activation, no gate outside ``x.dtype``/FP32, and no
+    weight outside BF16/FP16/FP32.
+    """
+    x, gate, weight = _operands(_SHAPE, torch.float16)
     if bad_input == "x-ndim":
         x, gate = x.reshape(-1, 4, 64), gate.reshape(-1, 4, 64)
     elif bad_input == "gate-shape":
         gate = gate[..., :32]
     elif bad_input == "head-dim":
-        x, gate, weight = _operands((2, 8, 4, 96), torch.float32)
+        x, gate, weight = _operands((2, 8, 4, 96), torch.float16)
     elif bad_input == "weight-shape":
         weight = weight[:32]
+    elif bad_input == "weight-stride":
+        weight = _operands(_SHAPE, torch.float16)[2].repeat(2)[::2]
+    elif bad_input == "x-dtype":
+        x, gate, weight = _operands(_SHAPE, torch.float32)
+    elif bad_input == "gate-dtype":
+        gate = _operands(_SHAPE, torch.float16)[1].to(torch.float64)
     else:
-        weight = _operands(_SHAPE, torch.float32)[2].repeat(2)[::2]
+        weight = _operands(_SHAPE, torch.float16)[2].to(torch.float64)
 
     with pytest.raises(ValueError, match=match):
         flag_train.megatron.fused_gated_norm(x, gate, weight, _EPS)
