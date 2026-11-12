@@ -23,6 +23,7 @@ The reference mirrors the kernel's intermediate rounding: the normalised
 activation is cast to ``x.dtype`` before the FP32 gating multiply.
 """
 
+import inspect
 import warnings
 
 import pytest
@@ -184,6 +185,25 @@ def _check(x, gate, weight, dtype, zero_centered=False, impl=None, ref=None):
     )
     _assert_close(out, expected, dtype)
     return out
+
+
+@pytest.mark.fused_gated_norm
+def test_public_interface_matches_megatron():
+    """The public call shape and return are Megatron's operator interface.
+
+    Megatron's ``validate_gated_norm`` is a module-level policy used by the
+    training module, not part of this operator's signature; the operator itself
+    takes ``(x, gate, weight, eps, zero_centered=False)`` and returns a tensor.
+    """
+    params = inspect.signature(flag_train.megatron.fused_gated_norm).parameters
+    assert list(params) == ["x", "gate", "weight", "eps", "zero_centered"]
+    assert params["eps"].default is inspect.Parameter.empty
+    assert params["zero_centered"].default is False
+
+    x, gate, weight = _operands(_SHAPE, torch.float16)
+    out = flag_train.megatron.fused_gated_norm(x, gate, weight, 1e-6)
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == x.shape and out.dtype == x.dtype
 
 
 @pytest.mark.fused_gated_norm
