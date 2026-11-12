@@ -13,8 +13,9 @@
 # limitations under the License.
 """Ascend-correct evoformer attention forward.
 
-The arithmetic is ``flag_train.deepspeed.evoformer_attn``'s, unchanged. Two
-things the generic kernel does are wrong here, both measured on a 910B.
+The arithmetic is the generic implementation's ``_attention``, unchanged; the
+public ``evoformer_attn(Q, K, V, biases)`` wrapper is shared in spirit with it.
+Two things the generic kernel does are wrong here, both measured on a 910B.
 
 An ``or`` of two *runtime* comparisons is miscompiled as a store mask: the
 generic ``lse`` mask drops whole rows, a different set each run. Either side
@@ -50,6 +51,7 @@ from flag_train.deepspeed.evoformer_attn import (
     _check_launch_arguments,
     _lse_shape,
     _normalize_bias,
+    _normalize_biases,
     _pairs_of,
     _stride_bn,
 )
@@ -291,11 +293,12 @@ def _grid_for(m_tiles, head_axis, num_slices):
     return (m_tiles, head_axis, slots), n_iters, n_iters * slots != num_slices
 
 
-def evoformer_attn(q, k, v, bias1=None, bias2=None):
-    """Evoformer attention forward; see ``flag_train.deepspeed.evoformer_attn``.
+def _attention(q, k, v, bias1=None, bias2=None):
+    """Ascend internal forward, returning ``(out, lse)``.
 
-    Same signature, arithmetic and returned ``(out, lse)``. Only the ``lse`` store
-    mask and the grid differ -- see this module's docstring.
+    Same arithmetic as the generic ``_attention``; only the ``lse`` store mask
+    and the grid differ -- see this module's docstring.  The public
+    ``evoformer_attn`` below wraps this with DeepSpeed's interface.
     """
     logger.debug("TRAIN_ASCEND EVOFORMER_ATTN")
 
@@ -398,3 +401,22 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
                 num_warps=num_warps,
             )
     return out, lse
+
+
+def evoformer_attn(Q, K, V, biases):
+    """DeepSpeed-compatible public entry; returns only the output tensor.
+
+    See ``flag_train.deepspeed.evoformer_attn`` for the full contract.  The
+    internal ``_attention`` above is the Ascend kernel and still returns
+    ``(out, lse)``.
+    """
+    bias1, bias2 = _normalize_biases(biases)
+    q = Q.contiguous()
+    k = K.contiguous()
+    v = V.contiguous()
+    if bias1 is not None:
+        bias1 = bias1.contiguous()
+    if bias2 is not None:
+        bias2 = bias2.contiguous()
+    out, _ = _attention(q, k, v, bias1, bias2)
+    return out

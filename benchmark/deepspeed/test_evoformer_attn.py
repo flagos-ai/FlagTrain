@@ -198,13 +198,10 @@ def evoformer_attn_input_fn(shape, dtype, device):
 
 
 def train_op(q, k, v, bias1, bias2):
-    """The operator under test.
-
-    It returns ``(out, lse)`` where the baselines return just the output. The
-    harness only times the call, so the extra element costs an allocation and
-    nothing else -- and it is what the operator is defined to return.
-    """
-    return flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2)
+    """The operator under test; returns the same output tensor as the baseline."""
+    # A fresh list per call: upstream's public entry (and this port) pads the
+    # list to two entries in place.
+    return flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2])
 
 
 @pytest.mark.evoformer_attn
