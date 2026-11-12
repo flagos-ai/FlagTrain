@@ -55,8 +55,9 @@ Usage:
 import torch
 
 OP_NAME = "lamb"
-# fused_lamb only supports float32 parameters/state (see test_lamb.py).
-DTYPES = [torch.float32]
+# DeepSpeed's fused_lamb has an fp32 path and an fp64 path; the fp16-gradient
+# mixed path is correctness-only in FlagTrain and is not benchmarked.
+DTYPES = [torch.float32, torch.float64]
 IS_INPLACE = True  # p / m / v / p_copy are updated in place
 
 # FlagTrain/benchmark/deepspeed/test_lamb.py::_LAMB_SHAPES

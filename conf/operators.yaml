@@ -284,7 +284,8 @@ ops:
   stages:
   - beta: '0.0.0'
 - id: lamb
-  description: Fused LAMB optimizer update.
+  description: 'Fused LAMB optimizer update. Supports fp32 or fp64 master weights
+    and moments; fp16 gradients against fp32 master weights are also supported.'
   for:
   - fused_lamb
   labels:

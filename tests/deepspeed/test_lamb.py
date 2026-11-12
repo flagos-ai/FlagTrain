@@ -120,7 +120,11 @@ def lamb_ref(
             )
 
     p_old = p.clone()
-    scaled_grad = g / grad_scale
+    # The operator promotes the gradient to the master dtype before any
+    # arithmetic.  Reproduce that here: leaving an fp16 gradient in fp16 makes
+    # ``0.001 * g * g`` underflow to zero for small gradients, which changes the
+    # second moment and the trust ratio.
+    scaled_grad = g.to(p.dtype) / grad_scale
     m_new = beta1 * m + (1 - beta1) * scaled_grad
     v_new = beta2 * v + (1 - beta2) * scaled_grad * scaled_grad
 
@@ -150,10 +154,12 @@ def lamb_ref(
     p.copy_(p_new)
     m.copy_(m_new)
     v.copy_(v_new)
-    if p_copy.numel() > 0:
+    # DeepSpeed only writes p_copy on the fp16-gradient path; its fp32/fp64
+    # branches pass NULL.  Mirror that contract in the reference.
+    if p_copy.numel() > 0 and g.dtype == torch.float16:
         p_copy.copy_(p_new)
 
-    return coeff.reshape(1).to(torch.float32)
+    return coeff.reshape(1).to(p.dtype)
 
 
 _DEEPSPEED_UNAVAILABLE_MSG = (
@@ -207,6 +213,10 @@ requires_deepspeed_reference = pytest.mark.skipif(
     _deepspeed_lamb is None, reason=_DEEPSPEED_UNAVAILABLE_MSG
 )
 
+requires_fp64 = pytest.mark.skipif(
+    not utils.fp64_is_supported, reason="device does not support fp64"
+)
+
 
 def _no_p_copy(dtype, device):
     """The empty placeholder that tells every implementation to skip the copy.
@@ -219,12 +229,26 @@ def _no_p_copy(dtype, device):
 
 
 def _step(
-    op, param, exp_avg, exp_avg_sq, grad, step, mode, bias_correction, p_copy=None
+    op,
+    param,
+    exp_avg,
+    exp_avg_sq,
+    grad,
+    step,
+    mode,
+    bias_correction,
+    p_copy=None,
+    decay=_DECAY,
 ):
     """Run one in-place step through ``op`` with the shared hyper-parameters.
 
     Every implementation updates its tensors in place and returns the layer's
     trust ratio, so callers pass tensors they own.
+
+    ``decay`` is overridable because it is the only hyper-parameter that changes
+    *which branch* of the contract runs rather than only its values: with weight
+    decay the update is non-zero even for a zero gradient, so a test that needs
+    a vanishing update (the zero-norm trust ratio) must switch it off.
     """
     if p_copy is None:
         p_copy = _no_p_copy(param.dtype, param.device)
@@ -244,7 +268,7 @@ def _step(
         step,
         mode,
         int(bias_correction),
-        _DECAY,
+        decay,
     )
 
 
@@ -258,20 +282,194 @@ def _assert_step_matches(
     other_m,
     other_v,
     dtype,
+    atol=1e-4,
 ):
-    """The trust ratio and the three updated tensors must all agree."""
+    """The trust ratio and the three updated tensors must all agree.
+
+    ``atol`` is overridable because an fp64 step still receives float32
+    hyper-parameters (DeepSpeed's signature takes ``float``), so its second
+    moment/update differ from a double-precision reference at roughly fp32
+    epsilon rather than fp64 epsilon.
+    """
     utils.train_assert_close(
-        utils.to_reference(train_coeff), utils.to_reference(other_coeff), dtype
+        utils.to_reference(train_coeff),
+        utils.to_reference(other_coeff),
+        dtype,
+        atol=atol,
     )
     utils.train_assert_close(
-        utils.to_reference(train_p), utils.to_reference(other_p), dtype
+        utils.to_reference(train_p), utils.to_reference(other_p), dtype, atol=atol
     )
     utils.train_assert_close(
-        utils.to_reference(train_m), utils.to_reference(other_m), dtype
+        utils.to_reference(train_m), utils.to_reference(other_m), dtype, atol=atol
     )
     utils.train_assert_close(
-        utils.to_reference(train_v), utils.to_reference(other_v), dtype
+        utils.to_reference(train_v), utils.to_reference(other_v), dtype, atol=atol
     )
+
+
+def _check_one_step(
+    master_dtype,
+    grad_dtype,
+    shape,
+    mode,
+    bias_correction,
+    with_copy=False,
+    copy_dtype=torch.float16,
+    expect_copy=None,
+    atol=1e-4,
+):
+    """Compare one operator step with the torch reference (and DeepSpeed).
+
+    ``master_dtype`` is the dtype of p/m/v; ``grad_dtype`` may be float16 when
+    the master dtype is float32 (the mixed-precision contract).  When
+    ``with_copy`` is set, a p_copy of ``copy_dtype`` is primed with a sentinel
+    so a store that never runs is visible.  ``expect_copy`` defaults to whether
+    the upstream contract writes p_copy at all: only the fp16-gradient path
+    does, so fp32/fp64 steps must leave the buffer untouched.
+    """
+    if expect_copy is None:
+        expect_copy = master_dtype == torch.float32 and grad_dtype == torch.float16
+    p = torch.randn(shape, dtype=master_dtype, device=flag_train.device)
+    g = torch.randn(shape, dtype=grad_dtype, device=flag_train.device)
+    m = torch.zeros(shape, dtype=master_dtype, device=flag_train.device)
+    v = torch.zeros(shape, dtype=master_dtype, device=flag_train.device)
+
+    train = [p.clone(), m.clone(), v.clone()]
+    train_copy = None
+    if with_copy:
+        train_copy = torch.full(
+            shape, 123.0, dtype=copy_dtype, device=flag_train.device
+        )
+    train_coeff = _step(lamb, *train, g, 1, mode, bias_correction, p_copy=train_copy)
+
+    ref = [_reference_copy(p), _reference_copy(m), _reference_copy(v)]
+    ref_g = _reference_copy(g)
+    ref_copy = None
+    if with_copy:
+        ref_copy = torch.full(shape, 123.0, dtype=copy_dtype, device=ref_g.device)
+    ref_coeff = _step(lamb_ref, *ref, ref_g, 1, mode, bias_correction, p_copy=ref_copy)
+    _assert_step_matches(train_coeff, *train, ref_coeff, *ref, master_dtype, atol=atol)
+
+    if with_copy:
+        if expect_copy:
+            utils.train_assert_equal(
+                utils.to_reference(train_copy),
+                utils.to_reference(train[0].to(copy_dtype)),
+            )
+            utils.train_assert_equal(
+                utils.to_reference(ref_copy),
+                utils.to_reference(ref[0].to(copy_dtype)),
+            )
+        else:
+            # The full-precision paths leave p_copy untouched, as DeepSpeed's
+            # NULL p_copy argument does.
+            utils.train_assert_equal(
+                utils.to_reference(train_copy),
+                utils.to_reference(torch.full_like(train_copy, 123.0)),
+            )
+            utils.train_assert_equal(
+                utils.to_reference(ref_copy),
+                utils.to_reference(torch.full_like(ref_copy, 123.0)),
+            )
+
+    if _deepspeed_lamb is not None:
+        deepspeed = [p.clone(), m.clone(), v.clone()]
+        deepspeed_copy = None
+        if with_copy:
+            deepspeed_copy = torch.full(
+                shape, 123.0, dtype=copy_dtype, device=flag_train.device
+            )
+        deepspeed_coeff = _step(
+            _deepspeed_lamb,
+            *deepspeed,
+            g,
+            1,
+            mode,
+            bias_correction,
+            p_copy=deepspeed_copy,
+        )
+        _assert_step_matches(
+            train_coeff,
+            *train,
+            deepspeed_coeff,
+            *deepspeed,
+            master_dtype,
+            atol=atol,
+        )
+        # Upstream only writes p_copy on its fp16-gradient path; the fp32 and
+        # fp64 branches pass NULL, so the sentinel must survive there too.
+        if with_copy:
+            if expect_copy:
+                utils.train_assert_equal(
+                    utils.to_reference(deepspeed_copy),
+                    utils.to_reference(deepspeed[0].to(copy_dtype)),
+                )
+            else:
+                utils.train_assert_equal(
+                    utils.to_reference(deepspeed_copy),
+                    utils.to_reference(torch.full_like(deepspeed_copy, 123.0)),
+                )
+
+
+def _check_multistep(master_dtype, grad_dtype, mode, bias_correction, atol=1e-4):
+    """Accumulate moments over several steps and compare params and state."""
+    torch.manual_seed(0)
+    train_params = [
+        torch.randn(1024, dtype=master_dtype, device=flag_train.device)
+        for _ in range(2)
+    ]
+    ref_params = [_reference_copy(param) for param in train_params]
+    train_m = [torch.zeros_like(param) for param in train_params]
+    ref_m = [torch.zeros_like(param) for param in ref_params]
+    train_v = [torch.zeros_like(param) for param in train_params]
+    ref_v = [torch.zeros_like(param) for param in ref_params]
+
+    for step in range(1, 5):
+        for i, param in enumerate(train_params):
+            grad = torch.randn(param.shape, dtype=grad_dtype, device=flag_train.device)
+            _step(
+                lamb_ref,
+                ref_params[i],
+                ref_m[i],
+                ref_v[i],
+                _reference_copy(grad),
+                step,
+                mode,
+                bias_correction,
+            )
+            _step(
+                lamb,
+                param,
+                train_m[i],
+                train_v[i],
+                grad,
+                step,
+                mode,
+                bias_correction,
+            )
+
+    for train_param, ref_param in zip(train_params, ref_params):
+        utils.train_assert_close(
+            utils.to_reference(train_param),
+            utils.to_reference(ref_param),
+            master_dtype,
+            atol=atol,
+        )
+    for train_exp_avg, ref_exp_avg in zip(train_m, ref_m):
+        utils.train_assert_close(
+            utils.to_reference(train_exp_avg),
+            utils.to_reference(ref_exp_avg),
+            master_dtype,
+            atol=atol,
+        )
+    for train_exp_avg_sq, ref_exp_avg_sq in zip(train_v, ref_v):
+        utils.train_assert_close(
+            utils.to_reference(train_exp_avg_sq),
+            utils.to_reference(ref_exp_avg_sq),
+            master_dtype,
+            atol=atol,
+        )
 
 
 @pytest.mark.lamb
@@ -307,19 +505,268 @@ def test_lamb(shape, mode, bias_correction):
 
 
 @pytest.mark.lamb
-@pytest.mark.parametrize("shape", [(1024,), (4096,)])
-def test_lamb_p_copy(shape):
-    """The optional output copy must mirror the updated parameter.
+@requires_fp64
+@pytest.mark.parametrize("shape", [(1024,), (4096,), (16384,), (65536,), (1 << 20,)])
+@pytest.mark.parametrize("mode", [0, 1])
+@pytest.mark.parametrize("bias_correction", [0, 1])
+def test_lamb_fp64(shape, mode, bias_correction):
+    """Full float64 master weights, moments and gradients.
 
-    DeepSpeed cannot serve as the oracle here: fused_lamb_cuda_kernel.cu passes
-    NULL for p_copy on fp32 operands ("don't output p_copy for fp32, it's wasted
-    write"), so its copy is never written at any precision these tests run at.
-    The torch reference does write it, so it is the oracle.
+    The tolerance is looser than fp64 epsilon because the operator receives
+    float32 hyper-parameters (the upstream signature takes ``float``), which
+    rounds ``beta``/``eps``/``decay`` before the double-precision tensor math.
+    """
+    _check_one_step(
+        torch.float64,
+        torch.float64,
+        shape,
+        mode,
+        bias_correction,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.lamb
+@requires_fp64
+@pytest.mark.parametrize("mode", [0, 1])
+def test_lamb_fp64_p_copy_ignored(mode):
+    """The fp64 path must not write p_copy, matching DeepSpeed's NULL argument."""
+    _check_one_step(
+        torch.float64,
+        torch.float64,
+        (4096,),
+        mode,
+        1,
+        with_copy=True,
+        copy_dtype=torch.float64,
+        expect_copy=False,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.lamb
+@requires_fp64
+@pytest.mark.parametrize("mode", [0, 1])
+@pytest.mark.parametrize("bias_correction", [0, 1])
+def test_lamb_fp64_multistep(mode, bias_correction):
+    """Accumulated fp64 moments must stay consistent over several steps."""
+    _check_multistep(torch.float64, torch.float64, mode, bias_correction, atol=1e-5)
+
+
+@pytest.mark.lamb
+@pytest.mark.parametrize("shape", [(1024,), (16384,)])
+@pytest.mark.parametrize("mode", [0, 1])
+@pytest.mark.parametrize("bias_correction", [0, 1])
+@pytest.mark.parametrize("with_copy", [False, True], ids=["no_copy", "copy"])
+def test_lamb_mixed_fp16_grads(shape, mode, bias_correction, with_copy):
+    """fp16 gradients update fp32 master weights and fp32 moments.
+
+    The optional p_copy is fp16: it is the reduced-precision output buffer the
+    mixed-precision contract exists for.
+    """
+    _check_one_step(
+        torch.float32,
+        torch.float16,
+        shape,
+        mode,
+        bias_correction,
+        with_copy=with_copy,
+    )
+
+
+@pytest.mark.lamb
+@pytest.mark.parametrize("mode", [0, 1])
+@pytest.mark.parametrize("bias_correction", [0, 1])
+def test_lamb_mixed_fp16_grads_multistep(mode, bias_correction):
+    """fp16 gradients must keep accumulating into fp32 state correctly."""
+    _check_multistep(torch.float32, torch.float16, mode, bias_correction)
+
+
+@pytest.mark.lamb
+def test_lamb_rejects_unsupported_dtypes():
+    """The public contract only accepts the three supported combinations."""
+    shape = (1024,)
+    device = flag_train.device
+
+    def _zeros(dtype):
+        return torch.zeros(shape, dtype=dtype, device=device)
+
+    # fp16/bf16 master weights are not supported.
+    for dtype in (torch.float16, torch.bfloat16):
+        if dtype == torch.bfloat16 and not utils.bf16_is_supported:
+            continue
+        with pytest.raises(AssertionError):
+            _step(
+                lamb,
+                _zeros(dtype),
+                _zeros(dtype),
+                _zeros(dtype),
+                _zeros(dtype),
+                1,
+                1,
+                1,
+            )
+
+    # A float32 master may take fp16 gradients, but not bf16 ones.
+    if utils.bf16_is_supported:
+        with pytest.raises(AssertionError):
+            _step(
+                lamb,
+                _zeros(torch.float32),
+                _zeros(torch.float32),
+                _zeros(torch.float32),
+                _zeros(torch.bfloat16),
+                1,
+                1,
+                1,
+            )
+
+    # Moments must match the master dtype.
+    if utils.fp64_is_supported:
+        with pytest.raises(AssertionError):
+            _step(
+                lamb,
+                _zeros(torch.float32),
+                _zeros(torch.float64),
+                _zeros(torch.float32),
+                _zeros(torch.float32),
+                1,
+                1,
+                1,
+            )
+        # fp64 master requires an fp64 gradient, not fp32.
+        with pytest.raises(AssertionError):
+            _step(
+                lamb,
+                _zeros(torch.float64),
+                _zeros(torch.float64),
+                _zeros(torch.float64),
+                _zeros(torch.float32),
+                1,
+                1,
+                1,
+            )
+
+
+@pytest.mark.lamb
+@pytest.mark.parametrize("mode", [0, 1])
+def test_lamb_grid_stride(mode):
+    """A tensor above MAX_BLOCKS * BLOCK_SIZE exercises the grid-stride loops."""
+    _check_one_step(torch.float32, torch.float32, (1 << 20,), mode, 1)
+
+
+@pytest.mark.lamb
+def test_lamb_rejects_non_contiguous():
+    """CHECK_INPUT parity: every non-empty operand must be contiguous."""
+    shape = (1024,)
+    device = flag_train.device
+
+    p = torch.randn(2 * shape[0], device=device)[::2]
+    m = torch.zeros(shape, device=device)
+    v = torch.zeros(shape, device=device)
+    g = torch.randn(shape, device=device)
+    with pytest.raises(AssertionError):
+        _step(lamb, p, m, v, g, 1, 1, 1)
+
+    # A non-empty p_copy is checked the same way on the fp16-gradient path.
+    p = torch.randn(shape, device=device)
+    g = torch.randn(shape, dtype=torch.float16, device=device)
+    p_copy = torch.full((2 * shape[0],), 123.0, device=device)[::2]
+    with pytest.raises(AssertionError):
+        _step(lamb, p, m, v, g, 1, 1, 1, p_copy=p_copy)
+
+
+@pytest.mark.lamb
+def test_lamb_rejects_empty():
+    """DeepSpeed fails its zero-block launch; reject an empty tensor explicitly."""
+    shape = (0,)
+    device = flag_train.device
+    with pytest.raises(AssertionError):
+        _step(
+            lamb,
+            torch.empty(shape, device=device),
+            torch.empty(shape, device=device),
+            torch.empty(shape, device=device),
+            torch.empty(shape, device=device),
+            1,
+            1,
+            1,
+        )
+
+
+@pytest.mark.lamb
+def test_lamb_clamp_order_matches_upstream():
+    """DeepSpeed applies max first and min second; min_coeff wins when inverted."""
+    shape = (1024,)
+    device = flag_train.device
+    p = torch.ones(shape, device=device)
+    g = torch.ones(shape, device=device)
+    m = torch.zeros(shape, device=device)
+    v = torch.zeros(shape, device=device)
+    coeff = lamb(
+        p,
+        torch.empty((0,), device=device),
+        m,
+        v,
+        g,
+        1e-3,
+        0.9,
+        0.999,
+        0.5,
+        2.0,
+        1e-8,
+        1.0,
+        1,
+        1,
+        1,
+        0.01,
+    )
+    assert coeff.item() == pytest.approx(2.0)
+
+
+@pytest.mark.lamb
+@pytest.mark.parametrize("shape", [(1024,), (4096,)])
+def test_lamb_p_copy_ignored_on_full_precision(shape):
+    """The fp32 path must not write p_copy.
+
+    DeepSpeed's fused_lamb passes NULL for p_copy on fp32 operands ("don't
+    output p_copy for fp32, it's wasted write"), even when the caller supplies a
+    non-empty buffer.  The sentinel makes a stray store visible.
+    """
+    _check_one_step(
+        torch.float32,
+        torch.float32,
+        shape,
+        1,
+        1,
+        with_copy=True,
+        copy_dtype=torch.float32,
+        expect_copy=False,
+    )
+
+
+@pytest.mark.lamb
+@pytest.mark.parametrize("shape", [(16384,)])
+@pytest.mark.parametrize(
+    "copy_dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"]
+)
+def test_lamb_p_copy_reduced_precision(shape, copy_dtype):
+    """A reduced-precision copy is written on the fp16-gradient split path.
+
+    The copy store is exercised above the single-program size, where the
+    operator runs a second kernel and the cast to the copy's own dtype is
+    different code.  Only the fp16-gradient path writes p_copy; the fp32 path is
+    covered by ``test_lamb_p_copy_ignored_on_full_precision``.
+
+    The buffers are primed with a sentinel rather than left empty: a store that
+    never runs would otherwise pass by reading whatever an earlier, correct
+    result left in a recycled allocation.
     """
     dtype = torch.float32
+    sentinel = 123.0
 
     p = torch.randn(shape, dtype=dtype, device=flag_train.device)
-    g = torch.randn(shape, dtype=dtype, device=flag_train.device)
+    g = torch.randn(shape, dtype=torch.float16, device=flag_train.device)
     m = torch.zeros(shape, dtype=dtype, device=flag_train.device)
     v = torch.zeros(shape, dtype=dtype, device=flag_train.device)
 
@@ -328,7 +775,7 @@ def test_lamb_p_copy(shape):
         _reference_copy(m),
         _reference_copy(v),
     )
-    torch_copy = torch.empty_like(torch_p)
+    torch_copy = torch.full(shape, sentinel, dtype=copy_dtype, device=torch_p.device)
     _step(
         lamb_ref,
         torch_p,
@@ -341,14 +788,25 @@ def test_lamb_p_copy(shape):
         p_copy=torch_copy,
     )
 
-    p_copy = torch.empty_like(p)
+    p_copy = torch.full(shape, sentinel, dtype=copy_dtype, device=flag_train.device)
     _step(lamb, p, m, v, g, 1, 1, 1, p_copy=p_copy)
 
-    utils.train_assert_close(
-        utils.to_reference(p_copy), utils.to_reference(torch_copy), dtype
+    # Exactly this call's parameter rounded to the copy's dtype, bit for bit: a
+    # tolerance is the wrong tool here, because bf16 carries ~3 decimal digits,
+    # so a value on a rounding boundary can flip between the operator's and the
+    # reference's arithmetic over a 1e-7 difference and fail for no reason.
+    #
+    # Comparing exactly is also what makes the sentinel do its job on both sides:
+    # a copy store that never ran still holds the sentinel and fails here, rather
+    # than passing on whatever a recycled allocation happened to contain.
+    utils.train_assert_equal(
+        utils.to_reference(p_copy), utils.to_reference(p.to(copy_dtype))
     )
-    # The copy must also mirror the parameter the same call produced.
-    utils.train_assert_close(utils.to_reference(p_copy), utils.to_reference(p), dtype)
+    # The oracle's own copy too, so the check above is anchored to a copy this
+    # test knows was written.
+    utils.train_assert_equal(
+        utils.to_reference(torch_copy), utils.to_reference(torch_p.to(copy_dtype))
+    )
 
 
 @pytest.mark.lamb
@@ -438,3 +896,81 @@ def test_matches_deepspeed_oracle(mode, shape):
     deepspeed = [p.clone(), m.clone(), v.clone()]
     deepspeed_coeff = _step(_deepspeed_lamb, *deepspeed, g, 1, mode, 1)
     _assert_step_matches(train_coeff, *train, deepspeed_coeff, *deepspeed, dtype)
+
+
+@pytest.mark.lamb
+@pytest.mark.parametrize("shape", [(1024,), (16384,)])
+@pytest.mark.parametrize(
+    "param_zero,grad_zero",
+    [(False, True), (True, False), (True, True)],
+    ids=["zero_grad", "zero_param", "both_zero"],
+)
+def test_lamb_zero_norm_trust_ratio(shape, param_zero, grad_zero):
+    """Either norm vanishing must leave the trust ratio at exactly 1.0.
+
+    ``lamb_ref`` returns 1.0 *without clamping* when ``||w||`` or ``||u||`` is
+    zero, matching ``lamb_cuda_kernel_part3``. An implementation that loses one
+    half of that test instead returns a clamped ratio -- 10.0 or 0.01 at these
+    hyper-parameters -- and moves the parameters up to a hundred times too far.
+
+    Reaching the branch needs an all-zero operand, which no other test provides:
+    they all draw from ``randn``, so neither norm is ever zero. ``decay`` is
+    switched off because weight decay keeps the update non-zero even for a zero
+    gradient, so ``||u||`` would not vanish.
+
+    The two shapes straddle the operator's single-program cutoff, so the ratio is
+    checked both where one program holds the whole tensor and where it is folded
+    across programs.
+    """
+    dtype = torch.float32
+
+    p = (torch.zeros if param_zero else torch.randn)(
+        shape, dtype=dtype, device=flag_train.device
+    )
+    g = (torch.zeros if grad_zero else torch.randn)(
+        shape, dtype=dtype, device=flag_train.device
+    )
+    m = torch.zeros(shape, dtype=dtype, device=flag_train.device)
+    v = torch.zeros(shape, dtype=dtype, device=flag_train.device)
+
+    ref = [_reference_copy(p), _reference_copy(m), _reference_copy(v)]
+    ref_coeff = _step(lamb_ref, *ref, _reference_copy(g), 1, 1, 1, decay=0)
+
+    train = [p.clone(), m.clone(), v.clone()]
+    train_coeff = _step(lamb, *train, g, 1, 1, 1, decay=0)
+
+    # Exactly 1.0, unclamped. The reference is checked too: if the oracle itself
+    # started clamping, this case would no longer be exercising the rule it is
+    # named for.
+    one = torch.ones((1,), dtype=dtype, device=flag_train.device)
+    utils.train_assert_equal(utils.to_reference(ref_coeff), utils.to_reference(one))
+    utils.train_assert_equal(utils.to_reference(train_coeff), utils.to_reference(one))
+    _assert_step_matches(train_coeff, *train, ref_coeff, *ref, dtype)
+
+
+@pytest.mark.lamb
+def test_lamb_many_partial_norms():
+    """More partial norms than a single reduction tile holds.
+
+    The cross-block fold walks the partials one tile at a time. Every other shape
+    here tops out at 16384 elements -- 8 blocks on the Ascend override, 16 on the
+    generic kernel -- so that loop never iterates, and a defect in it (a wrong
+    stride into the second half of the partial array, a fold tile that drops the
+    tail) would go unnoticed. ``2**21 + 1`` elements is 257 blocks there and 2049
+    here, and the odd tail also exercises the masked last block.
+    """
+    dtype = torch.float32
+    shape = (2**21 + 1,)
+
+    p = torch.randn(shape, dtype=dtype, device=flag_train.device)
+    g = torch.randn(shape, dtype=dtype, device=flag_train.device)
+    m = torch.zeros(shape, dtype=dtype, device=flag_train.device)
+    v = torch.zeros(shape, dtype=dtype, device=flag_train.device)
+
+    ref = [_reference_copy(p), _reference_copy(m), _reference_copy(v)]
+    ref_coeff = _step(lamb_ref, *ref, _reference_copy(g), 1, 1, 1)
+
+    train = [p.clone(), m.clone(), v.clone()]
+    train_coeff = _step(lamb, *train, g, 1, 1, 1)
+
+    _assert_step_matches(train_coeff, *train, ref_coeff, *ref, dtype)
