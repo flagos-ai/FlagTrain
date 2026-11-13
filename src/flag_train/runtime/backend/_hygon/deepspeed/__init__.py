@@ -20,6 +20,11 @@ which is what ``SpecOpRegistrar`` registers.
 """
 
 from .blocked_flash import blocked_flash
+from .fp8_gemm_triton import fp8_gemm_triton
 from .mixed_gemm import mixed_gemm
 
-__all__ = ["blocked_flash", "mixed_gemm"]
+__all__ = [
+    "blocked_flash",
+    "fp8_gemm_triton",
+    "mixed_gemm",
+]
