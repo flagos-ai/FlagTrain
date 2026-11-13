@@ -291,10 +291,12 @@ def pytest_addoption(parser):
         required=False,
         choices=[
             str(ele).split(".")[-1]
-            for ele in consts.FLOAT_DTYPES
-            + consts.INT_DTYPES
-            + consts.BOOL_DTYPES
-            + [torch.cfloat]
+            for ele in consts.FLOAT_DTYPES + consts.INT_DTYPES + consts.BOOL_DTYPES
+            # fp64 is not a default dtype for every operator, but an operator
+            # that declares it (lamb) must be selectable by name here.  The
+            # benchmark's set_dtypes() still rejects it for operators that do
+            # not list it.
+            + [torch.float64, torch.cfloat]
         ],
         help=(
             "Specify the data types for benchmarks. "
