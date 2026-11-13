@@ -34,6 +34,7 @@ form so it cannot silently drift.
 
 import importlib.metadata
 import importlib.util
+import inspect
 import warnings
 
 import pytest
@@ -52,7 +53,7 @@ needs_extension = pytest.mark.skipif(
     reason="Megatron's Apex scaled-softmax CUDA extension is not installed",
 )
 
-_DTYPES = [torch.float16, torch.float32]
+_DTYPES = [torch.float16]
 if utils.bf16_is_supported:
     _DTYPES.append(torch.bfloat16)
 _EXT_DTYPES = [torch.float16] + ([torch.bfloat16] if utils.bf16_is_supported else [])
@@ -273,6 +274,23 @@ def test_baseline_source():
 
 
 @pytest.mark.scaled_masked_softmax_cuda_backward
+def test_public_interface_matches_megatron():
+    """The call shape is the Apex entry Megatron's backward invokes."""
+    params = inspect.signature(
+        flag_train.megatron.scaled_masked_softmax_cuda_backward
+    ).parameters
+    assert list(params) == ["output_grads", "softmax_results", "scale"]
+    assert all(param.default is inspect.Parameter.empty for param in params.values())
+
+    shape = (2, 4, 8, 8)
+    dy = torch.randn(shape, dtype=torch.float16, device=flag_train.device)
+    y = _softmax_like(dy)
+    dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
+    assert isinstance(dx, torch.Tensor)
+    assert dx.shape == dy.shape and dx.dtype == dy.dtype
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
 @pytest.mark.parametrize("shape", _SHAPES + _BENCH_SHAPES)
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_gradient_matches_autograd(shape, dtype):
@@ -395,8 +413,18 @@ def test_empty_batch(dtype):
 
 @pytest.mark.scaled_masked_softmax_cuda_backward
 @pytest.mark.parametrize("dtype", _DTYPES)
+def test_empty_key_length(dtype):
+    """Apex's dispatch returns an empty output for ``sk == 0``."""
+    dy = torch.empty((2, 2, 4, 0), dtype=dtype, device=flag_train.device)
+    y = torch.empty_like(dy)
+    dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
+    assert dx.shape == dy.shape and dx.dtype == dtype and dx.numel() == 0
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
+@pytest.mark.parametrize("dtype", _DTYPES)
 def test_does_not_mutate_operands(dtype):
-    """The Apex kernel is in-place on ``output_grads``; this port is not."""
+    """The masked Apex backward allocates a new gradient; this port does too."""
     shape = (2, 2, 8, 8)
     y = _softmax_like(torch.empty(shape, dtype=dtype, device=flag_train.device))
     dy = torch.randn(shape, dtype=dtype, device=flag_train.device)
@@ -456,43 +484,70 @@ def test_vendored_baseline_matches_torch(dtype):
 
 @pytest.mark.scaled_masked_softmax_cuda_backward
 @pytest.mark.parametrize(
-    ("case", "match"),
+    ("case", "match", "error"),
     [
-        ("ndim", "4-D"),
-        ("dtype", "needs a"),
-        ("shape", "matching shapes"),
-        ("dtype-mismatch", "matching dtypes"),
-        ("cpu", "not one on the CPU"),
-        ("key-limit", "exceeds Megatron"),
-        ("scale", "one element"),
+        ("ndim", "expected 3D tensor", RuntimeError),
+        ("dtype", "Only fp16 and bf16", RuntimeError),
+        ("cpu", "CPU", RuntimeError),
+        ("key-limit", "key_seq_len", RuntimeError),
+        ("scale", "one-element", TypeError),
     ],
 )
-def test_rejects_invalid_arguments(case, match):
-    if case == "dtype" and not flag_train.runtime.device.support_fp64:
-        # The fp64 rejection cannot be exercised where the device has no fp64:
-        # torch_npu's Tensor.double() silently keeps float32, so the guard
-        # would be handed a supported dtype and would rightly not raise.
-        pytest.skip("device does not support fp64")
-    dy = torch.randn((2, 2, 4, 4), dtype=torch.float32, device=flag_train.device)
+def test_rejects_invalid_arguments(case, match, error):
+    dy = torch.randn((2, 2, 4, 4), dtype=torch.float16, device=flag_train.device)
     y = _softmax_like(dy)
     if case == "ndim":
         dy, y = dy.reshape(2, 2, 16), y.reshape(2, 2, 16)
     elif case == "dtype":
-        dy, y = dy.double(), y.double()
-    elif case == "shape":
-        y = _softmax_like(torch.empty((2, 2, 4, 8), dtype=dy.dtype, device=dy.device))
-    elif case == "dtype-mismatch":
-        y = y.half()
+        dy, y = dy.float(), y.float()
     elif case == "cpu":
         y = y.cpu()
     elif case == "key-limit":
         dy = torch.empty((1, 1, 1, 4097), dtype=torch.float16, device=dy.device)
         y = _softmax_like(dy)
     elif case == "scale":
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(error, match=match):
             flag_train.megatron.scaled_masked_softmax_cuda_backward(
                 dy, y, torch.ones(2)
             )
         return
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(error, match=match):
+        flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
+def test_accepts_nonmatching_softmax_results_shape():
+    """Apex reads softmax_results as a flat stream; shape equality is unchecked."""
+    shape = (2, 2, 4, 4)
+    dy = torch.randn(shape, dtype=torch.float16, device=flag_train.device)
+    y = _softmax_like(dy).reshape(2, 2, 2, 8)
+
+    dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
+
+    expected = masked_backward_ref(_reference(dy), _reference(y).reshape(shape), _SCALE)
+    _assert_close(dx, expected, torch.float16)
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
+@pytest.mark.skipif(not utils.bf16_is_supported, reason="bf16 is unavailable")
+def test_accepts_mismatched_softmax_results_dtype():
+    """Apex dispatches on dy and reinterprets the results storage as that dtype."""
+    shape = (2, 2, 4, 4)
+    dy = torch.randn(shape, dtype=torch.float16, device=flag_train.device)
+    y_bf16 = _softmax_like(dy).to(torch.bfloat16)
+    raw = y_bf16.view(torch.uint8).reshape(-1)
+    y_as_fp16 = raw[: dy.numel() * dy.element_size()].view(torch.float16).view(shape)
+
+    dx = flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y_bf16, _SCALE)
+
+    expected = masked_backward_ref(_reference(dy), _reference(y_as_fp16), _SCALE)
+    _assert_close(dx, expected, torch.float16)
+
+
+@pytest.mark.scaled_masked_softmax_cuda_backward
+def test_rejects_softmax_results_too_small_for_apex_read():
+    """Apex would read past a short buffer; reject instead of corrupting memory."""
+    dy = torch.randn((2, 2, 4, 4), dtype=torch.float16, device=flag_train.device)
+    y = torch.empty((2, 2, 2, 4), dtype=torch.float16, device=flag_train.device)
+    with pytest.raises(RuntimeError, match="fewer elements"):
         flag_train.megatron.scaled_masked_softmax_cuda_backward(dy, y, _SCALE)
