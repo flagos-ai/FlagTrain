@@ -36,6 +36,7 @@ nothing here to test them against.
 Cases are seeded, so a failure reproduces rather than depending on the draw.
 """
 
+import importlib
 import warnings
 
 import pytest
@@ -81,6 +82,29 @@ _REFERENCE_SCORE_BUDGET = 1 << 26  # 67M entries, 268 MB of fp32
 # ---------------------------------------------------------------------------
 # Reference implementation
 # ---------------------------------------------------------------------------
+
+
+def _attention_impl():
+    """The active backend's internal ``_attention`` (returns ``(out, lse)``)."""
+    module = importlib.import_module(flag_train.deepspeed.evoformer_attn.__module__)
+    return module._attention
+
+
+def _call(q, k, v, bias1=None, bias2=None, need_lse=False):
+    """Call the public operator, or the active backend's lse-bearing layer.
+
+    ``need_lse`` is test-only: the public entry deliberately returns only the
+    output, like DeepSpeed's ``DS4Sci_EvoformerAttention``.  The internal layer
+    is reached through the module the public function was defined in, so this
+    still follows the Ascend override when one is registered.
+    """
+    if need_lse:
+        return _attention_impl()(q, k, v, bias1, bias2)
+
+    biases = []
+    if bias1 is not None or bias2 is not None:
+        biases = [bias1] if bias2 is None else [bias1, bias2]
+    return flag_train.deepspeed.evoformer_attn(q, k, v, biases)
 
 
 def _reference(q, k, v, bias1=None, bias2=None):
@@ -381,7 +405,7 @@ def test_forward_matches_reference(shape, dtype, biases):
     an unexercised kernel.
     """
     q, k, v, bias1, bias2 = _inputs(shape, dtype, bias1=biases[0], bias2=biases[1])
-    out, lse = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2)
+    out, lse = _call(q, k, v, bias1, bias2, need_lse=True)
 
     rq, rk, rv, rb1, rb2 = _reference_operands(q, k, v, bias1, bias2)
     ref_out, ref_lse = _reference(rq, rk, rv, rb1, rb2)
@@ -401,21 +425,80 @@ def test_forward_matches_reference(shape, dtype, biases):
 
 
 @pytest.mark.evoformer_attn
+def test_public_interface_matches_deepspeed_entry():
+    """The public entry has DeepSpeed's ``(Q, K, V, biases) -> out`` contract.
+
+    The operator's output must be a tensor (not ``(out, lse)``), the keyword
+    names must match, a 0/1-entry bias list must be padded in place to two
+    entries, and non-contiguous operands must be accepted and treated exactly as
+    their contiguous copies -- upstream's wrapper calls ``.contiguous()``.
+    """
+    dtype = torch.float16
+    shape = (1, 4, 64, 2, 32)
+    q, k, v, bias1, bias2 = _inputs(shape, dtype)
+
+    # Keyword call: parameter names are part of the interface.
+    out = flag_train.deepspeed.evoformer_attn(Q=q, K=k, V=v, biases=[bias1, bias2])
+    assert isinstance(out, torch.Tensor)
+    ref_out, _ = _call(q, k, v, bias1, bias2, need_lse=True)
+    utils.train_assert_equal(utils.to_reference(out), utils.to_reference(ref_out))
+
+    # The list is padded in place, exactly like upstream's entry.
+    empty_biases = []
+    flag_train.deepspeed.evoformer_attn(q, k, v, empty_biases)
+    assert empty_biases == [None, None]
+
+    one_bias = [bias1]
+    flag_train.deepspeed.evoformer_attn(q, k, v, one_bias)
+    assert len(one_bias) == 2 and one_bias[1] is None
+
+    with pytest.raises(AssertionError):
+        flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2, bias1])
+
+    # Non-contiguous q/k/v: a step-2 view of a wider tensor has the same shape.
+    q_store = torch.randn(1, 4, 64, 2, 64, dtype=dtype, device=flag_train.device)
+    k_store = torch.randn_like(q_store)
+    v_store = torch.randn_like(q_store)
+    q_nc, k_nc, v_nc = q_store[..., ::2], k_store[..., ::2], v_store[..., ::2]
+    assert not q_nc.is_contiguous()
+    out_nc = flag_train.deepspeed.evoformer_attn(q_nc, k_nc, v_nc, [bias1, bias2])
+    out_contig = flag_train.deepspeed.evoformer_attn(
+        q_nc.contiguous(),
+        k_nc.contiguous(),
+        v_nc.contiguous(),
+        [bias1, bias2],
+    )
+    utils.train_assert_equal(utils.to_reference(out_nc), utils.to_reference(out_contig))
+
+    # Non-contiguous bias2 is made contiguous too, not rejected.
+    b2_store = torch.randn(1, 1, 2, 64, 128, dtype=dtype, device=flag_train.device)
+    b2_nc = b2_store[..., ::2]
+    assert not b2_nc.is_contiguous()
+    out_b2_nc = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, b2_nc])
+    out_b2_contig = flag_train.deepspeed.evoformer_attn(
+        q, k, v, [bias1, b2_nc.contiguous()]
+    )
+    utils.train_assert_equal(
+        utils.to_reference(out_b2_nc), utils.to_reference(out_b2_contig)
+    )
+
+
+@pytest.mark.evoformer_attn
 @pytest.mark.parametrize("shape", _SHAPES)
 def test_lse_contract(shape):
     """``lse`` is ``[B*N, H, ceil(L/32)*32]`` fp32, +inf past the sequence.
 
     The padding is not cosmetic: it is upstream's arrangement, made so that its
-    backward can read past the sequence end without bounding every load. So this
-    is part of the forward's output contract -- a caller handing this lse to
-    upstream's backward gets the +inf it expects -- and a garbage or zero pad
-    would be silently wrong there rather than here.
+    backward can read past the sequence end without bounding every load. The
+    internal ``_attention`` layer produces lse for exactly that reason -- the
+    public entry, like upstream's, does not return it -- and a garbage or zero
+    pad would be silently wrong for a future backward rather than here.
     """
     dtype = torch.float16
     q, k, v, bias1, bias2 = _inputs(shape, dtype)
     batch, pairs, seq_len, heads, _ = shape
 
-    _, lse = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2)
+    _, lse = _call(q, k, v, bias1, bias2, need_lse=True)
 
     expected_len = (seq_len + 31) // 32 * 32
     assert lse.shape == (batch * pairs, heads, expected_len), lse.shape
@@ -448,8 +531,8 @@ def test_absent_bias_is_empty_tensor(dtype):
     shape = (1, 4, 64, 2, 32)
     q, k, v, bias1, bias2 = _inputs(shape, dtype)
 
-    with_none = flag_train.deepspeed.evoformer_attn(q, k, v, None, None)
-    with_empty = flag_train.deepspeed.evoformer_attn(q, k, v, _empty(q), _empty(q))
+    with_none = _call(q, k, v, None, None, need_lse=True)
+    with_empty = _call(q, k, v, _empty(q), _empty(q), need_lse=True)
     # Bit-identical, so the house equality helper rather than the closeness one:
     # the two spellings of "no bias" have to select the same kernel and produce
     # the same bits, not merely agree to a tolerance. Both sides are the
@@ -463,7 +546,7 @@ def test_absent_bias_is_empty_tensor(dtype):
     )
 
     # And an empty bias1 must not be the same as a present one.
-    with_bias, _ = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2)
+    with_bias, _ = _call(q, k, v, bias1, bias2, need_lse=True)
     assert not torch.equal(with_none[0], with_bias)
 
 
@@ -501,7 +584,7 @@ def test_a_masked_key_contributes_nothing(dtype, head_size):
     mask[..., 10:20] = 0
     bias1 = _mask_bias(mask, dtype)
 
-    out, lse = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, None)
+    out, lse = _call(q, k, v, bias1, None, need_lse=True)
 
     rq, rk, rv, rb1, _ = _reference_operands(
         q, k[..., keep, :, :], v[..., keep, :, :], bias1[..., keep], None
@@ -542,7 +625,7 @@ def test_padding_the_tail_matches_a_shorter_sequence(dtype, shape, cut):
     mask[..., cut:] = 0
     bias1 = _mask_bias(mask, dtype)
 
-    out, lse = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2)
+    out, lse = _call(q, k, v, bias1, bias2, need_lse=True)
 
     # The same attention over the first ``cut`` tokens -- bias2 is L x L, so it
     # is truncated on both axes, which is what "the padding is not there" means.
@@ -554,7 +637,7 @@ def test_padding_the_tail_matches_a_shorter_sequence(dtype, shape, cut):
     )
     b1s = bias1[..., :cut].contiguous()
     b2s = bias2[..., :cut, :cut].contiguous()
-    short_out, short_lse = flag_train.deepspeed.evoformer_attn(qs, ks, vs, b1s, b2s)
+    short_out, short_lse = _call(qs, ks, vs, b1s, b2s, need_lse=True)
 
     assert short_out.shape == short
     _assert_close("prefix out", out[:, :, :cut], short_out, dtype, _ATOL[dtype])
@@ -603,7 +686,7 @@ def test_large_shapes_match_reference(shape, dtype):
     would buy the same branch coverage for minutes of runtime.
     """
     q, k, v, bias1, bias2 = _inputs(shape, dtype)
-    out, lse = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2)
+    out, lse = _call(q, k, v, bias1, bias2, need_lse=True)
 
     rq, rk, rv, rb1, rb2 = _reference_operands(q, k, v, bias1, bias2)
     ref_out, ref_lse = _reference(rq, rk, rv, rb1, rb2)
@@ -653,18 +736,18 @@ def test_the_pair_dimension_has_a_grid_ceiling():
         ]
 
     q, k, v = operands(slices)
-    out, lse = flag_train.deepspeed.evoformer_attn(q, k, v)
+    out = _call(q, k, v)
     assert out.shape == q.shape
     assert bool(torch.isfinite(out).all())
 
     q, k, v = operands(slices + 1)
     if flag_train.vendor_name in _WALKING_SLICE_VENDORS:
-        out, lse = flag_train.deepspeed.evoformer_attn(q, k, v)
+        out = _call(q, k, v)
         assert out.shape == q.shape
         assert bool(torch.isfinite(out).all())
     else:
         with pytest.raises(ValueError, match="65535"):
-            flag_train.deepspeed.evoformer_attn(q, k, v)
+            _call(q, k, v)
 
 
 @pytest.mark.evoformer_attn
@@ -693,7 +776,7 @@ def test_sequences_below_upstreams_floor(seq_len, dtype):
     """
     shape = (1, 4, seq_len, 2, 32)
     q, k, v, bias1, bias2 = _inputs(shape, dtype, bias1=False)
-    out, lse = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2)
+    out, lse = _call(q, k, v, bias1, bias2, need_lse=True)
 
     rq, rk, rv, rb1, rb2 = _reference_operands(q, k, v, bias1, bias2)
     ref_out, ref_lse = _reference(rq, rk, rv, rb1, rb2)
@@ -730,7 +813,7 @@ def test_more_heads_than_one_launch_can_hold():
     batch, pairs, seq_len, heads, head_size = 1, 1, 64, 32769, 8
     shape = (batch, pairs, seq_len, heads, head_size)
     q, k, v, bias1, bias2 = _inputs(shape, dtype)
-    out, lse = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2)
+    out, lse = _call(q, k, v, bias1, bias2, need_lse=True)
 
     assert out.shape == q.shape
     assert lse.shape == (batch * pairs, heads, seq_len)
@@ -780,7 +863,7 @@ def test_a_fully_masked_query_row_is_nan(dtype):
     b2 = bias2.clone()
     b2[..., cut:, :] = float("-inf")
 
-    out, lse = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, b2)
+    out, lse = _call(q, k, v, bias1, b2, need_lse=True)
 
     assert bool(torch.isnan(out[:, :, cut:]).all()), "a fully masked row is NaN"
     assert bool(torch.isnan(lse[..., cut:]).all()), "and so is its lse"
@@ -829,7 +912,7 @@ def test_matches_deepspeed_oracle(shape, dtype):
     """
     q, k, v, bias1, bias2 = _inputs(shape, dtype)
 
-    train_out, train_lse = flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2)
+    train_out, train_lse = _call(q, k, v, bias1, bias2, need_lse=True)
 
     # Upstream's entry takes the biases as a list, and appends to it when it is
     # short -- which is why the list is built inline rather than reused.
@@ -838,9 +921,9 @@ def test_matches_deepspeed_oracle(shape, dtype):
     atol = _ATOL[dtype]
     _assert_close("out vs deepspeed", train_out, ds_out, dtype, atol)
 
-    # The lse has no counterpart on the public entry, so it is checked against
-    # the reference here instead: a pin that only ever looked at `out` would not
-    # notice a forward that stopped producing the second half of its contract.
+    # Neither public entry returns lse, so the active backend's internal layer is
+    # checked against the reference: a pin that only ever looked at `out` would
+    # not notice a forward that stopped producing the lse a backward would need.
     rq, rk, rv, rb1, rb2 = _reference_operands(q, k, v, bias1, bias2)
     _, ref_lse = _reference(rq, rk, rv, rb1, rb2)
     batch, pairs, seq_len, heads, _ = shape
@@ -860,11 +943,14 @@ def test_matches_deepspeed_oracle(shape, dtype):
 
 @pytest.mark.evoformer_attn
 def test_rejects_inputs_outside_the_contract():
-    """Every rejection names something upstream refuses too.
+    """Every rejection names a failure upstream also has, though not always as a
+    clean assertion.
 
-    None of these is this port inventing a limit: each is an assertion or a
-    ``TORCH_CHECK`` in the code being ported, and the point of raising here is
-    that the alternative is a Triton compile error or a silent wrong answer.
+    Most are an assertion or a ``TORCH_CHECK`` in the code being ported; the
+    dtype / device consistency and empty-axis checks are conditions upstream meets
+    through ``data_ptr<>`` or the launcher (or not at all), and the point of
+    raising here is that the alternative is a Triton compile error or a silent
+    wrong answer.
 
     What is *not* here is upstream's ``L > 16`` assert. That one is about the
     kernel being ported rather than about this one -- the tiles are masked, so a
@@ -877,38 +963,65 @@ def test_rejects_inputs_outside_the_contract():
 
     wide = torch.randn(1, 4, 64, 2, 128, dtype=dtype, device=flag_train.device)
     with pytest.raises(ValueError, match="head_size"):
-        flag_train.deepspeed.evoformer_attn(wide, wide, wide)
+        _call(wide, wide, wide)
 
     with pytest.raises(ValueError, match="same dtype"):
-        flag_train.deepspeed.evoformer_attn(q, k, v, bias1.to(torch.float32), bias2)
+        _call(q, k, v, bias1.to(torch.float32), bias2)
+
+    # The key may not silently disagree with the query's dtype or device.
+    with pytest.raises(
+        ValueError, match="query, key and value must have the same dtype"
+    ):
+        _call(q, k.to(torch.float32), v)
+
+    with pytest.raises(ValueError, match="bias1 must be on the query's device"):
+        _call(q, k, v, bias1.cpu(), bias2)
 
     with pytest.raises(ValueError, match="bias1"):
-        flag_train.deepspeed.evoformer_attn(q, k, v, bias1[:, :, 0], bias2)
-
-    # A transposed L x L bias has the shape bias2 must have and is a different
-    # matrix; only contiguity tells them apart.
-    with pytest.raises(ValueError, match="contiguous"):
-        flag_train.deepspeed.evoformer_attn(q, k, v, bias1, bias2.transpose(-1, -2))
-
-    # Same shape, non-contiguous: a strided view of the same storage.
-    strided = torch.randn(1, 4, 64, 4, 32, dtype=dtype, device=flag_train.device)
-    with pytest.raises(ValueError, match="contiguous"):
-        flag_train.deepspeed.evoformer_attn(
-            strided[:, :, :, ::2, :], k, v, bias1, bias2
-        )
+        _call(q, k, v, bias1[:, :, 0], bias2)
 
     with pytest.raises(ValueError, match="at least 3-D"):
-        flag_train.deepspeed.evoformer_attn(q[0, 0, 0], k[0, 0, 0], v[0, 0, 0])
+        _call(q[0, 0, 0], k[0, 0, 0], v[0, 0, 0])
 
     with pytest.raises(ValueError, match="device tensor"):
-        flag_train.deepspeed.evoformer_attn(q.cpu(), k.cpu(), v.cpu())
+        _call(q.cpu(), k.cpu(), v.cpu())
+
+    # An empty sequence/head/head-size axis has no kernel to run; upstream's
+    # L > 16 assert covers the first, and the other two would divide by zero
+    # while the (batch, pair) count is flattened.
+    for shape in ((1, 4, 0, 2, 32), (1, 4, 64, 0, 32), (1, 4, 64, 2, 0)):
+        empty = [
+            torch.zeros(shape, dtype=dtype, device=flag_train.device)
+            for _ in range(3)
+        ]
+        with pytest.raises(ValueError, match="non-empty"):
+            _call(*empty)
 
     # A 3-D operand has no pair dimension for a bias to be indexed by.
     flat = q.reshape(-1, 64, 2, 32)
     with pytest.raises(ValueError, match="5-D"):
-        flag_train.deepspeed.evoformer_attn(
-            flat, flat, flat, bias1.reshape(-1, 64), bias2
-        )
+        _call(flat, flat, flat, bias1.reshape(-1, 64), bias2)
+
+
+@pytest.mark.evoformer_attn
+def test_rejects_operands_on_a_different_device():
+    """One attention runs on one device; a second one is an input error.
+
+    Upstream asserts every operand is on an accelerator but never compares the
+    indices, so a mixed-device set reaches the kernel and fails there. This port
+    says which operand disagrees instead.
+    """
+    if getattr(flag_train.runtime.torch_device_fn, "device_count", lambda: 1)() < 2:
+        pytest.skip("needs two accelerator devices")
+    dtype = torch.float16
+    q, k, v, bias1, bias2 = _inputs((1, 4, 64, 2, 32), dtype)
+    other = torch.device(f"{flag_train.device}:1")
+
+    with pytest.raises(ValueError, match="same device"):
+        _call(q, k.to(other), v)
+
+    with pytest.raises(ValueError, match="bias2 must be on the query's device"):
+        _call(q, k, v, bias1, bias2.to(other))
 
 
 @pytest.mark.evoformer_attn
@@ -922,6 +1035,6 @@ def test_unbiased_query_may_have_any_leading_shape():
     dtype = torch.float16
     for shape in [(64, 2, 32), (3, 64, 2, 32), (1, 4, 64, 2, 32)]:
         q = torch.randn(shape, dtype=dtype, device=flag_train.device)
-        out, lse = flag_train.deepspeed.evoformer_attn(q, q.clone(), q.clone())
+        out, lse = _call(q, q.clone(), q.clone(), need_lse=True)
         assert out.shape == shape
         assert lse.shape == (q.numel() // (64 * 2 * 32), 2, 64)
