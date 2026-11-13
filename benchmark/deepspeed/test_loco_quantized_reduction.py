@@ -178,9 +178,10 @@ class LocoQrBenchmark(base.GenericBenchmark):
         """The default structured form, for ``--base-data`` matching.
 
         ``record_shapes`` above is the compact semantic key for the report;
-        the baseline lookup needs the per-tensor dimensions for its signature.
+        the baseline lookup needs the per-tensor dimensions and dtypes for its
+        signature.
         """
-        return super().record_shapes(*args, **kwargs)
+        return super().baseline_shape_detail(*args, **kwargs)
 
     def get_gbps(self, args, latency):
         data, scales, in_groups, out_groups, _num_bits, _qt, num_tensors = args

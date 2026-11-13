@@ -293,6 +293,37 @@ def _all_tensor_shapes_from_record(shape_detail):
     return tuple(sorted(shapes))
 
 
+def _all_tensor_specs_from_record(shape_detail):
+    """Collect every ``(shape, dtype)`` tensor spec into a sorted multiset.
+
+    ``baseline_shape_detail`` marks a tensor as ``(size, dtype)``. A caller
+    that still passes plain ``torch.Size`` items contributes ``(shape, None)``,
+    which cannot disambiguate records that differ only by dtype.
+    """
+    specs = []
+
+    def walk(item):
+        # torch.Size is itself a tuple, so the paired test comes first.
+        if (
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[0], torch.Size)
+            and isinstance(item[1], torch.dtype)
+        ):
+            specs.append((tuple(item[0]), str(item[1])))
+        elif isinstance(item, torch.Size):
+            specs.append((tuple(item), None))
+        elif isinstance(item, dict):
+            for value in item.values():
+                walk(value)
+        elif isinstance(item, (list, tuple)):
+            for value in item:
+                walk(value)
+
+    walk(shape_detail)
+    return tuple(sorted(specs, key=repr))
+
+
 def _all_scalars_from_record(shape_detail):
     """Collect scalar values from record_shapes() into a sorted tuple.
 
@@ -341,6 +372,27 @@ def _base_scalars_from_config(cfg):
     return tuple(sorted(scalars))
 
 
+def _base_specs_from_config(cfg):
+    """Collect ``(shape, dtype)`` for each tensor in a record's config.inputs.
+
+    ``None`` when the record predates dtype recording, so a caller can fall
+    back to shape-only matching rather than treating the absence as a mismatch.
+    """
+    if not isinstance(cfg, dict):
+        return None
+    inputs = cfg.get("inputs")
+    if not isinstance(inputs, dict):
+        return None
+    specs = []
+    for value in inputs.values():
+        if isinstance(value, dict) and isinstance(value.get("shape"), list):
+            dtype = value.get("dtype")
+            if dtype is None:
+                return None
+            specs.append((tuple(value["shape"]), str(dtype)))
+    return tuple(sorted(specs, key=repr))
+
+
 # Per (base_data, op_name) tensor-signature -> shape-key index, keyed by the
 # base_data object's id so the index is rebuilt only when the baseline changes.
 _SIG_INDEX_CACHE = {}
@@ -380,8 +432,48 @@ def _build_signature_index(base_data, op_name, variant=None):
     return index
 
 
+def _match_by_tensor_specs(op_shapes, keys, dtype, shape_detail):
+    """Disambiguate colliding shape keys by their tensor dtypes.
+
+    Returns ``(record, key)`` only when exactly one candidate record's
+    ``(shape, dtype)`` multiset equals the measured operands'. Ambiguity, or a
+    record that predates dtype recording, returns ``None`` so the caller keeps
+    its previous behaviour.
+    """
+    spec_sig = _all_tensor_specs_from_record(shape_detail)
+    if not spec_sig or any(dtype_str is None for _, dtype_str in spec_sig):
+        return None
+    matches = []
+    for key in keys:
+        rec = op_shapes[key].get(str(dtype))
+        if rec is None:
+            continue
+        if _base_specs_from_config(rec.get("config")) == spec_sig:
+            matches.append((rec, key))
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _match_typed_record(base_data, op_name, dtype, shape_detail, variant=None):
+    """The dtype-disambiguated match for a shape key that several records share.
+
+    Returns ``None`` unless the measured operands' dtypes single out one of the
+    candidates, so a caller can fall back to the first-shape key unchanged.
+    """
+    index = _build_signature_index(base_data, op_name, variant)
+    per_dtype = index.get(str(dtype))
+    if not per_dtype:
+        return None
+    keys = per_dtype.get(_all_tensor_shapes_from_record(shape_detail))
+    if not keys or len(keys) < 2:
+        return None
+    op_shapes = _resolve_op_entry(base_data, op_name, variant)["shapes"]
+    return _match_by_tensor_specs(op_shapes, keys, dtype, shape_detail)
+
+
 def _match_by_signature(base_data, op_name, dtype, shape_detail, variant=None):
-    """Fallback match by the multiset of tensor shapes, then by scalars."""
+    """Fallback match by tensor signature (shape, then dtype), then by scalars."""
     index = _build_signature_index(base_data, op_name, variant)
     per_dtype = index.get(str(dtype))
     if not per_dtype:
@@ -393,7 +485,12 @@ def _match_by_signature(base_data, op_name, dtype, shape_detail, variant=None):
     op_shapes = _resolve_op_entry(base_data, op_name, variant)["shapes"]
     if len(keys) == 1:
         return op_shapes[keys[0]].get(str(dtype)), keys[0]
-    # Tensor-signature collision: discriminate with the scalar set.
+    # Tensor-signature collision: an operand dtype can tell the candidates
+    # apart even when their shapes agree (a float32 gate beside an fp16 one).
+    typed = _match_by_tensor_specs(op_shapes, keys, dtype, shape_detail)
+    if typed is not None:
+        return typed
+    # Then the scalar set.
     rec_scalars = _all_scalars_from_record(shape_detail)
     for key in keys:
         rec = op_shapes[key].get(str(dtype))
@@ -429,6 +526,15 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant=None)
         if per_dtype:
             rec = per_dtype.get(str(dtype))
             if rec is not None:
+                # Variants share that key -- a float32 gate beside a float16
+                # activation has the same tensor shapes -- so when the measured
+                # operand dtypes single out another record, that one is the
+                # baseline this case was measured for.
+                typed = _match_typed_record(
+                    base_data, op_name, dtype, shape_detail, variant
+                )
+                if typed is not None:
+                    return typed[0], None
                 return rec, None
         # Fallback: semantic key / composite shape, matched by tensor signature.
         rec, matched_key = _match_by_signature(
