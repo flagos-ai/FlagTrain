@@ -367,8 +367,10 @@ def lamb(
             ``runtime_device.support_fp64``.
         p_copy (Tensor): optional reduced-precision copy of the updated weights.
             It is written only on the fp16-gradient mixed path, matching
-            DeepSpeed (whose fp32/fp64 branches pass NULL); any floating dtype
-            is accepted and the store casts, and an empty tensor skips the copy.
+            DeepSpeed (whose fp32/fp64 branches pass NULL).  On that path a
+            non-empty ``p_copy`` must be float16, as DeepSpeed reads it through
+            a Half pointer; on the fp32/fp64 paths it is ignored and its dtype
+            is not constrained.  An empty tensor skips the copy.
         m (Tensor): first moment estimate, same dtype as ``p``.
         v (Tensor): second moment estimate, same dtype as ``p``.
         g (Tensor): gradient.  It must match ``p``'s dtype for a full-precision
@@ -393,52 +395,73 @@ def lamb(
     """
     logger.debug("TRAIN LAMB")
 
-    assert (
-        p.dtype in _MASTER_DTYPES
-    ), f"lamb expects float32 or float64 parameters, got {p.dtype}"
-    assert (
-        m.dtype == p.dtype and v.dtype == p.dtype
-    ), "lamb requires the moment tensors to have the parameter dtype"
-    assert g.dtype in _GRAD_DTYPES[p.dtype], (
-        f"lamb with {p.dtype} parameters expects a "
-        f"{' or '.join(str(dtype) for dtype in _GRAD_DTYPES[p.dtype])} gradient, "
-        f"got {g.dtype}"
-    )
-    assert (
-        p.dtype != torch.float64 or runtime_device.support_fp64
-    ), "lamb: float64 parameters require a device with fp64 support"
+    # DeepSpeed dispatches on the gradient dtype with
+    # AT_DISPATCH_FLOATING_TYPES_AND_HALF; a dtype outside that dispatch (bf16,
+    # integer, ...) raises NotImplementedError before any tensor is touched.
+    if g.dtype not in (torch.float16, torch.float32, torch.float64):
+        raise NotImplementedError(f"lamb is not implemented for {g.dtype}")
+
+    if p.dtype not in _MASTER_DTYPES:
+        raise RuntimeError(f"lamb expects float32 or float64 parameters, got {p.dtype}")
+    if m.dtype != p.dtype or v.dtype != p.dtype:
+        raise RuntimeError(
+            "lamb requires the moment tensors to have the parameter dtype"
+        )
+    if g.dtype not in _GRAD_DTYPES[p.dtype]:
+        raise RuntimeError(
+            f"lamb with {p.dtype} parameters expects a "
+            f"{' or '.join(str(dtype) for dtype in _GRAD_DTYPES[p.dtype])} gradient, "
+            f"got {g.dtype}"
+        )
+    if p.dtype == torch.float64 and not runtime_device.support_fp64:
+        raise RuntimeError(
+            "lamb: float64 parameters require a device with fp64 support"
+        )
     # Accept whatever the active backend calls its device -- 'cuda' on
     # nvidia/hygon, 'npu' on ascend -- rather than hard-coding CUDA. A CPU
     # tensor still has to be rejected: the kernels would be launched against
     # memory the accelerator cannot see.
-    assert (
-        p.device.type == runtime_device.name
-    ), f"lamb only supports {runtime_device.name} tensors"
+    if p.device.type != runtime_device.name:
+        raise RuntimeError(f"lamb only supports {runtime_device.name} tensors")
 
     # CHECK_INPUT parity: every non-empty operand is flat-indexed by the
     # kernels, so each must be contiguous and on the parameter's device.  An
     # empty p_copy is the one tensor DeepSpeed also skips (its CHECK_INPUT is
     # guarded by numel() > 0).
     for name, tensor in (("p", p), ("m", m), ("v", v), ("g", g)):
-        assert (
-            tensor.device == p.device
-        ), f"lamb requires {name} on the same device as p"
-        assert tensor.is_contiguous(), f"lamb requires {name} to be contiguous"
-    if p_copy.numel() > 0:
-        assert p_copy.device == p.device, "lamb requires p_copy on the same device as p"
-        assert p_copy.is_contiguous(), "lamb requires p_copy to be contiguous"
-        assert (
-            p_copy.dtype.is_floating_point
-        ), "lamb p_copy must be a floating-point tensor"
+        if tensor.device != p.device:
+            raise RuntimeError(f"lamb requires {name} on the same device as p")
+        if not tensor.is_contiguous():
+            raise RuntimeError(f"lamb requires {name} to be contiguous")
 
     n = p.numel()
-    assert m.numel() == n and v.numel() == n and g.numel() == n
-    assert p_copy.numel() == 0 or p_copy.numel() == n
+    if m.numel() != n or v.numel() != n or g.numel() != n:
+        raise RuntimeError(
+            "lamb requires p, m, v and g to have the same number of elements"
+        )
+    if p_copy.numel() != 0 and p_copy.numel() != n:
+        raise RuntimeError(
+            "lamb requires p_copy to have the same number of elements as p, "
+            "or to be empty"
+        )
+    if p_copy.numel() > 0:
+        if p_copy.device != p.device:
+            raise RuntimeError("lamb requires p_copy on the same device as p")
+        if not p_copy.is_contiguous():
+            raise RuntimeError("lamb requires p_copy to be contiguous")
+        # DeepSpeed reads p_copy through a Half pointer on the fp16-gradient
+        # branch.  The fp32/fp64 branches pass NULL, so p_copy's dtype is
+        # irrelevant there.
+        if g.dtype == torch.float16 and p_copy.dtype != torch.float16:
+            raise RuntimeError(f"expected scalar type Half but found {p_copy.dtype}")
+
     # DeepSpeed launches zero blocks for an empty tensor and lets the CUDA
     # launch fail; reject it here instead of returning an uninitialised trust
     # ratio.  The same bound guards the kernel's 32-bit element offsets.
-    assert n > 0, "lamb requires at least one element"
-    assert n <= _INT32_MAX, "lamb tensor is too large to index with int32"
+    if n == 0:
+        raise RuntimeError("lamb requires at least one element")
+    if n > _INT32_MAX:
+        raise RuntimeError("lamb tensor is too large to index with int32")
 
     # Adam bias correction, matching DeepSpeed's step_size computation.
     if bias_correction == 1:

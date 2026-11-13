@@ -591,25 +591,36 @@ def test_lamb_rejects_unsupported_dtypes():
     def _zeros(dtype):
         return torch.zeros(shape, dtype=dtype, device=device)
 
-    # fp16/bf16 master weights are not supported.
-    for dtype in (torch.float16, torch.bfloat16):
-        if dtype == torch.bfloat16 and not utils.bf16_is_supported:
-            continue
-        with pytest.raises(AssertionError):
+    # fp16 master weights are rejected by the fp16-gradient branch's
+    # "parameter must be float" assertion.
+    with pytest.raises(RuntimeError):
+        _step(
+            lamb,
+            _zeros(torch.float16),
+            _zeros(torch.float16),
+            _zeros(torch.float16),
+            _zeros(torch.float16),
+            1,
+            1,
+            1,
+        )
+
+    if utils.bf16_is_supported:
+        # bf16 is outside DeepSpeed's AT_DISPATCH_FLOATING_TYPES_AND_HALF
+        # dispatch, so the failure is NotImplementedError before dtype pairing.
+        with pytest.raises(NotImplementedError):
             _step(
                 lamb,
-                _zeros(dtype),
-                _zeros(dtype),
-                _zeros(dtype),
-                _zeros(dtype),
+                _zeros(torch.bfloat16),
+                _zeros(torch.bfloat16),
+                _zeros(torch.bfloat16),
+                _zeros(torch.bfloat16),
                 1,
                 1,
                 1,
             )
-
-    # A float32 master may take fp16 gradients, but not bf16 ones.
-    if utils.bf16_is_supported:
-        with pytest.raises(AssertionError):
+        # A float32 master may take fp16 gradients, but not bf16 ones.
+        with pytest.raises(NotImplementedError):
             _step(
                 lamb,
                 _zeros(torch.float32),
@@ -623,7 +634,7 @@ def test_lamb_rejects_unsupported_dtypes():
 
     # Moments must match the master dtype.
     if utils.fp64_is_supported:
-        with pytest.raises(AssertionError):
+        with pytest.raises(RuntimeError):
             _step(
                 lamb,
                 _zeros(torch.float32),
@@ -635,7 +646,7 @@ def test_lamb_rejects_unsupported_dtypes():
                 1,
             )
         # fp64 master requires an fp64 gradient, not fp32.
-        with pytest.raises(AssertionError):
+        with pytest.raises(RuntimeError):
             _step(
                 lamb,
                 _zeros(torch.float64),
@@ -665,14 +676,14 @@ def test_lamb_rejects_non_contiguous():
     m = torch.zeros(shape, device=device)
     v = torch.zeros(shape, device=device)
     g = torch.randn(shape, device=device)
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError):
         _step(lamb, p, m, v, g, 1, 1, 1)
 
     # A non-empty p_copy is checked the same way on the fp16-gradient path.
     p = torch.randn(shape, device=device)
     g = torch.randn(shape, dtype=torch.float16, device=device)
     p_copy = torch.full((2 * shape[0],), 123.0, device=device)[::2]
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError):
         _step(lamb, p, m, v, g, 1, 1, 1, p_copy=p_copy)
 
 
@@ -681,7 +692,7 @@ def test_lamb_rejects_empty():
     """DeepSpeed fails its zero-block launch; reject an empty tensor explicitly."""
     shape = (0,)
     device = flag_train.device
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError):
         _step(
             lamb,
             torch.empty(shape, device=device),
@@ -726,12 +737,16 @@ def test_lamb_clamp_order_matches_upstream():
 
 @pytest.mark.lamb
 @pytest.mark.parametrize("shape", [(1024,), (4096,)])
-def test_lamb_p_copy_ignored_on_full_precision(shape):
-    """The fp32 path must not write p_copy.
+@pytest.mark.parametrize(
+    "copy_dtype", [torch.float32, torch.int32], ids=["float32", "int32"]
+)
+def test_lamb_p_copy_ignored_on_full_precision(shape, copy_dtype):
+    """The fp32 path must not write p_copy, whatever its dtype.
 
     DeepSpeed's fused_lamb passes NULL for p_copy on fp32 operands ("don't
     output p_copy for fp32, it's wasted write"), even when the caller supplies a
-    non-empty buffer.  The sentinel makes a stray store visible.
+    non-empty buffer, and it does not constrain that buffer's dtype.  The
+    sentinel makes a stray store visible.
     """
     _check_one_step(
         torch.float32,
@@ -740,29 +755,26 @@ def test_lamb_p_copy_ignored_on_full_precision(shape):
         1,
         1,
         with_copy=True,
-        copy_dtype=torch.float32,
+        copy_dtype=copy_dtype,
         expect_copy=False,
     )
 
 
 @pytest.mark.lamb
 @pytest.mark.parametrize("shape", [(16384,)])
-@pytest.mark.parametrize(
-    "copy_dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"]
-)
-def test_lamb_p_copy_reduced_precision(shape, copy_dtype):
-    """A reduced-precision copy is written on the fp16-gradient split path.
+def test_lamb_p_copy_reduced_precision(shape):
+    """A float16 copy is written on the fp16-gradient split path.
 
     The copy store is exercised above the single-program size, where the
-    operator runs a second kernel and the cast to the copy's own dtype is
-    different code.  Only the fp16-gradient path writes p_copy; the fp32 path is
-    covered by ``test_lamb_p_copy_ignored_on_full_precision``.
+    operator runs a second kernel.  Only the fp16-gradient path writes p_copy;
+    the fp32 path is covered by ``test_lamb_p_copy_ignored_on_full_precision``.
 
     The buffers are primed with a sentinel rather than left empty: a store that
     never runs would otherwise pass by reading whatever an earlier, correct
     result left in a recycled allocation.
     """
     dtype = torch.float32
+    copy_dtype = torch.float16
     sentinel = 123.0
 
     p = torch.randn(shape, dtype=dtype, device=flag_train.device)
@@ -791,10 +803,10 @@ def test_lamb_p_copy_reduced_precision(shape, copy_dtype):
     p_copy = torch.full(shape, sentinel, dtype=copy_dtype, device=flag_train.device)
     _step(lamb, p, m, v, g, 1, 1, 1, p_copy=p_copy)
 
-    # Exactly this call's parameter rounded to the copy's dtype, bit for bit: a
-    # tolerance is the wrong tool here, because bf16 carries ~3 decimal digits,
-    # so a value on a rounding boundary can flip between the operator's and the
-    # reference's arithmetic over a 1e-7 difference and fail for no reason.
+    # Exactly this call's parameter rounded to float16, bit for bit: a
+    # tolerance is the wrong tool here, because a value on a rounding boundary
+    # can flip between the operator's and the reference's arithmetic over a 1e-7
+    # difference and fail for no reason.
     #
     # Comparing exactly is also what makes the sentinel do its job on both sides:
     # a copy store that never ran still holds the sentinel and fails here, rather
@@ -807,6 +819,27 @@ def test_lamb_p_copy_reduced_precision(shape, copy_dtype):
     utils.train_assert_equal(
         utils.to_reference(torch_copy), utils.to_reference(torch_p.to(copy_dtype))
     )
+
+
+@pytest.mark.lamb
+@pytest.mark.parametrize(
+    "copy_dtype",
+    [torch.float32, torch.int32]
+    + ([torch.bfloat16] if utils.bf16_is_supported else []),
+    ids=["float32", "int32", "bfloat16"],
+)
+def test_lamb_mixed_rejects_non_half_p_copy(copy_dtype):
+    """DeepSpeed reads p_copy as Half on the fp16-gradient path."""
+    shape = (1024,)
+    device = flag_train.device
+    p = torch.randn(shape, dtype=torch.float32, device=device)
+    g = torch.randn(shape, dtype=torch.float16, device=device)
+    m = torch.zeros(shape, dtype=torch.float32, device=device)
+    v = torch.zeros(shape, dtype=torch.float32, device=device)
+    p_copy = torch.full(shape, 123.0, dtype=copy_dtype, device=device)
+
+    with pytest.raises(RuntimeError, match="expected scalar type Half"):
+        _step(lamb, p, m, v, g, 1, 1, 1, p_copy=p_copy)
 
 
 @pytest.mark.lamb

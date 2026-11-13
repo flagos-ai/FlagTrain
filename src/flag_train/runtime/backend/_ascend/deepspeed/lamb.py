@@ -383,55 +383,59 @@ def lamb(
     """
     logger.debug("TRAIN_ASCEND LAMB")
 
-    assert (
-        p.dtype in _MASTER_DTYPES
-    ), f"lamb expects float32 or float64 parameters, got {p.dtype}"
-    assert (
-        m.dtype == p.dtype and v.dtype == p.dtype
-    ), "lamb requires the moment tensors to have the parameter dtype"
-    assert g.dtype in _GRAD_DTYPES[p.dtype], (
-        f"lamb with {p.dtype} parameters expects a "
-        f"{' or '.join(str(dtype) for dtype in _GRAD_DTYPES[p.dtype])} gradient, "
-        f"got {g.dtype}"
-    )
-    assert (
-        p.dtype != torch.float64 or runtime_device.support_fp64
-    ), "lamb: float64 parameters require a device with fp64 support"
-    assert (
-        p.device.type == runtime_device.name
-    ), f"lamb only supports {runtime_device.name} tensors"
+    if g.dtype not in (torch.float16, torch.float32, torch.float64):
+        raise NotImplementedError(f"lamb is not implemented for {g.dtype}")
+
+    if p.dtype not in _MASTER_DTYPES:
+        raise RuntimeError(f"lamb expects float32 or float64 parameters, got {p.dtype}")
+    if m.dtype != p.dtype or v.dtype != p.dtype:
+        raise RuntimeError(
+            "lamb requires the moment tensors to have the parameter dtype"
+        )
+    if g.dtype not in _GRAD_DTYPES[p.dtype]:
+        raise RuntimeError(
+            f"lamb with {p.dtype} parameters expects a "
+            f"{' or '.join(str(dtype) for dtype in _GRAD_DTYPES[p.dtype])} gradient, "
+            f"got {g.dtype}"
+        )
+    if p.dtype == torch.float64 and not runtime_device.support_fp64:
+        raise RuntimeError(
+            "lamb: float64 parameters require a device with fp64 support"
+        )
+    if p.device.type != runtime_device.name:
+        raise RuntimeError(f"lamb only supports {runtime_device.name} tensors")
 
     n = p.numel()
-    assert m.numel() == n and v.numel() == n and g.numel() == n
-    assert p_copy.numel() == 0 or p_copy.numel() == n
-    assert n > 0, "lamb requires at least one element"
-    assert n <= _INT32_MAX, "lamb tensor is too large to index with int32"
-    assert (
-        m.device == p.device and v.device == p.device and g.device == p.device
-    ), "lamb requires p, m, v and g on the same device"
-    assert (
-        p_copy.numel() == 0 or p_copy.dtype.is_floating_point
-    ), "lamb p_copy must be a floating-point tensor"
+    if m.numel() != n or v.numel() != n or g.numel() != n:
+        raise RuntimeError(
+            "lamb requires p, m, v and g to have the same number of elements"
+        )
+    if p_copy.numel() != 0 and p_copy.numel() != n:
+        raise RuntimeError(
+            "lamb requires p_copy to have the same number of elements as p, "
+            "or to be empty"
+        )
+    if n == 0:
+        raise RuntimeError("lamb requires at least one element")
+    if n > _INT32_MAX:
+        raise RuntimeError("lamb tensor is too large to index with int32")
+
     # ``p_copy`` is dereferenced as a raw device pointer, so a host-side copy of
     # the weights (an offload buffer, say) would fault the device rather than
-    # raise. Catch it while it is still cheap.
-    assert (
-        p_copy.numel() == 0 or p_copy.device == p.device
-    ), "lamb requires p_copy on the same device as p"
-
-    # The kernels address every buffer as flat memory, so a strided view would
-    # silently step through the wrong elements rather than fail. Reject it here
-    # instead of returning wrong weights. (The generic kernel makes the same
-    # assumption without checking, so this is deliberately the stricter of the
-    # two.) A one-element placeholder is always contiguous, so the empty
-    # ``p_copy`` case needs no special handling.
-    assert (
-        p.is_contiguous()
-        and m.is_contiguous()
-        and v.is_contiguous()
-        and g.is_contiguous()
-        and p_copy.is_contiguous()
-    ), "lamb requires contiguous tensors"
+    # raise. Catch it while it is still cheap. A one-element placeholder is
+    # always contiguous, so the empty ``p_copy`` case needs no special handling.
+    for name, tensor in (("p", p), ("m", m), ("v", v), ("g", g)):
+        if tensor.device != p.device:
+            raise RuntimeError(f"lamb requires {name} on the same device as p")
+        if not tensor.is_contiguous():
+            raise RuntimeError(f"lamb requires {name} to be contiguous")
+    if p_copy.numel() > 0:
+        if p_copy.device != p.device:
+            raise RuntimeError("lamb requires p_copy on the same device as p")
+        if not p_copy.is_contiguous():
+            raise RuntimeError("lamb requires p_copy to be contiguous")
+        if g.dtype == torch.float16 and p_copy.dtype != torch.float16:
+            raise RuntimeError(f"expected scalar type Half but found {p_copy.dtype}")
 
     # ``g / grad_scale`` is a per-lane vector divide against a runtime scalar
     # that costs several instructions per lane, where the equivalent multiply
