@@ -335,6 +335,10 @@ def _check_launch_arguments(q, k, v, bias1, bias2, max_slices=_GRID_Z_MAX):
     dimension in its grid is capped at that axis's width; one that *walks* the
     dimension instead pays the cap on the walk's width and can serve any number
     of slices at all. A backend doing the latter passes ``None``.
+
+    The dtype / device consistency and non-empty-dimension checks are new here:
+    upstream reaches those failures through ``data_ptr<>`` and the kernel launch
+    (or not at all), so this is where they are said out loud.
     """
     if q.dim() < 3:
         raise ValueError(
@@ -343,6 +347,17 @@ def _check_launch_arguments(q, k, v, bias1, bias2, max_slices=_GRID_Z_MAX):
         )
     if k.shape != q.shape or v.shape != q.shape:
         raise ValueError("query, key and value must have the same shape")
+
+    # A zero-length sequence, head or head-size axis has no kernel to run: the
+    # flattened (batch, pair) count divides by the last three dimensions, and the
+    # lse/tile shapes collapse. Upstream refuses L <= 16 outright; this port
+    # serves short sequences, but an empty axis is not a short sequence.
+    if q.shape[-3] < 1 or q.shape[-2] < 1 or q.shape[-1] < 1:
+        raise ValueError(
+            "query, key and value must have non-empty sequence, head and "
+            f"head_size dimensions; got [..., {q.shape[-3]}, {q.shape[-2]}, "
+            f"{q.shape[-1]}]"
+        )
 
     for name, tensor in (("query", q), ("key", k), ("value", v)):
         if tensor.device.type == "cpu":
@@ -353,6 +368,15 @@ def _check_launch_arguments(q, k, v, bias1, bias2, max_slices=_GRID_Z_MAX):
                 f".contiguous() before reaching the kernel, so this port expects "
                 f"the same thing it would have received"
             )
+
+    # Upstream dispatches on the query's scalar type and then casts the key and
+    # value pointers to it, so a mismatch there fails inside its C++ extension.
+    # The kernel here would fail in the Triton compiler for the same reason; say
+    # it before either happens.
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("query, key and value must have the same dtype")
+    if k.device != q.device or v.device != q.device:
+        raise ValueError("query, key and value must be on the same device")
 
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("evoformer attention only supports fp16 and bf16")
@@ -426,6 +450,8 @@ def _check_bias_shapes(q, bias1, bias2):
                 "bias1 must be contiguous; its layout is what tells the kernel "
                 "where each (batch, pair) row starts"
             )
+        if bias1.device != q.device:
+            raise ValueError("bias1 must be on the query's device")
 
     if has_bias2:
         expected = (batch, 1, heads, seq_len, seq_len)
@@ -441,6 +467,8 @@ def _check_bias_shapes(q, bias1, bias2):
                 "bias2 must be contiguous; a transposed L x L matrix has the "
                 "same shape and would be read as the wrong matrix"
             )
+        if bias2.device != q.device:
+            raise ValueError("bias2 must be on the query's device")
 
 
 def _empty_bias_like(q):
