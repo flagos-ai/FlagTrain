@@ -14,9 +14,10 @@
 """Ascend-tuned fused scale + mask + softmax forward.
 
 Same contract as the generic implementation: ``softmax(scale * x)``, with the
-bool mask's ``True`` lanes excluded, masked keys and fully masked rows
-answering exactly zero. It carries its own kernel because the generic launcher
-requests ``num_stages=4`` (at most two are accepted here) and because a program
+mask read as raw bytes and byte 1 lanes excluded, masked keys and fully masked
+rows answering exactly zero. It carries its own kernel because the generic
+launcher requests ``num_stages=4`` (at most two are accepted here) and because
+a program
 costs ~73 ns whatever it carries, so the grid is pinned to the vector-core
 count and each program walks a contiguous run of row tiles. Per-launch values
 are ``constexpr`` (a second runtime scalar costs ~40%); a key length that is
@@ -27,12 +28,16 @@ costs 7-9%.
 """
 
 import logging
-import numbers
 
 import torch
 import triton
 import triton.language as tl
 
+from flag_train.megatron.scaled_masked_softmax_cuda_forward import (
+    _APEX_MAX_KEY_LEN,
+    _check_megatron_selection,
+    _mask_as_bool,
+)
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.runtime.backend._ascend.utils import CORE_NUM
@@ -40,7 +45,7 @@ from flag_train.utils import libentry
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 # ``FusedScaleMaskSoftmax.is_kernel_available`` rejects ``sk > 4096``.
 _MAX_KEY_LEN = 4096
@@ -58,20 +63,15 @@ _MAX_ROWS = 64
 
 def _check_input(inputs):
     if inputs.ndim != 4:
-        raise ValueError(
-            f"scaled masked softmax needs a 4-D tensor, got {inputs.ndim}-D"
-        )
+        raise RuntimeError(f"expected 4D tensor, got {inputs.ndim}-D")
     if inputs.dtype not in _SUPPORTED_DTYPES:
-        wanted = " / ".join(str(dtype) for dtype in _SUPPORTED_DTYPES)
-        raise ValueError(
-            f"scaled masked softmax needs a {wanted} tensor, got {inputs.dtype}"
-        )
+        raise RuntimeError(f"Only fp16 and bf16 are supported, got {inputs.dtype}")
     if inputs.device.type == "cpu":
-        raise ValueError(
+        raise RuntimeError(
             "scaled masked softmax needs a device tensor, not one on the CPU"
         )
     if inputs.device.type != runtime_device.name:
-        raise ValueError(
+        raise RuntimeError(
             "scaled masked softmax needs a "
             f"{runtime_device.name} tensor, got {inputs.device.type}"
         )
@@ -80,25 +80,17 @@ def _check_input(inputs):
 def _check_mask(mask, inputs):
     b, _, sq, sk = inputs.shape
     if mask.ndim != 4:
-        raise ValueError(
-            f"scaled masked softmax mask needs a 4-D tensor, got {mask.ndim}-D"
-        )
-    if mask.dtype != torch.bool:
-        raise ValueError(
-            f"scaled masked softmax mask needs a bool tensor, got {mask.dtype}"
-        )
-    if mask.shape[0] not in (1, b) or mask.shape[1] != 1:
-        raise ValueError(
-            "scaled masked softmax mask must be [b or 1, 1, sq, sk], got "
-            f"{tuple(mask.shape)}"
-        )
-    if mask.shape[2] != sq or mask.shape[3] != sk:
-        raise ValueError(
-            "scaled masked softmax mask must match the scores on the query and "
-            f"key axes, got {tuple(mask.shape[2:])} for scores {sq} x {sk}"
-        )
+        raise RuntimeError(f"expected 4D tensor, got {mask.ndim}-D mask")
+    if mask.shape[0] not in (1, b):
+        raise RuntimeError("pad_batches == 1 || pad_batches == batches")
+    if mask.shape[1] != 1:
+        raise RuntimeError("mask.size(1) == 1")
+    if mask.shape[2] != sq:
+        raise RuntimeError("mask.size(2) == query_seq_len")
+    if mask.shape[3] != sk:
+        raise RuntimeError("mask.size(3) == key_seq_len")
     if mask.device != inputs.device:
-        raise ValueError(
+        raise RuntimeError(
             "scaled masked softmax needs the scores and the mask on one device"
         )
 
@@ -106,13 +98,17 @@ def _check_mask(mask, inputs):
 def _check_scale(scale):
     if isinstance(scale, torch.Tensor):
         if scale.numel() != 1:
-            raise ValueError(
-                f"fused softmax scale needs one element, got {tuple(scale.shape)}"
+            raise TypeError(
+                "scaled masked softmax scale must be a real number or a "
+                f"one-element tensor, got {tuple(scale.shape)}"
             )
         scale = scale.item()
-    if not isinstance(scale, numbers.Real):
-        raise TypeError(f"scale needs a real number, got {type(scale).__name__}")
-    return float(scale)
+    if isinstance(scale, (str, bytes)):
+        raise TypeError("scaled masked softmax scale must be a real number")
+    try:
+        return float(scale)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("scaled masked softmax scale must be a real number") from exc
 
 
 @libentry()
@@ -234,39 +230,49 @@ def scaled_masked_softmax_cuda_forward(inputs, mask, scale):
     """Fused scale + mask + softmax, Megatron's masked-attention forward.
 
     Args:
-        inputs (Tensor): fp16, bf16 or fp32 scores of shape ``[b, np, sq, sk]``.
+        inputs (Tensor): fp16 or bf16 scores of shape ``[b, np, sq, sk]``.
             A non-contiguous tensor is copied.
-        mask (Tensor): bool mask of shape ``[b or 1, 1, sq, sk]`` where ``True``
+        mask (Tensor): 4-D mask of shape ``[b or 1, 1, sq, sk]``. As in Apex,
+            its contiguous storage is read as bytes and a byte equal to 1
             marks a key that must not be attended to.
         scale (float | Tensor): multiplier applied before the softmax.
 
     Returns:
         Tensor: contiguous softmax results with the input's shape and dtype.
-        Masked keys and fully masked rows are exactly zero.
+        Masked keys and fully masked rows are exactly zero. An empty batch or
+        head axis returns an empty tensor without a launch.
+
+    Raises:
+        RuntimeError: when Apex/Megatron would reject the call (wrong rank or
+            dtype, invalid mask shape, ``16 < sk <= 4096`` or the ``% 4``
+            selection gates, non-divisible query length, or key length over
+            4096/16384).
+        TypeError: when ``scale`` is not a real number or one-element tensor.
     """
     logger.debug("TRAIN_ASCEND SCALED_MASKED_SOFTMAX_CUDA_FORWARD")
     _check_input(inputs)
     _check_mask(mask, inputs)
     b, np_, sq, sk = inputs.shape
+    if sk > _APEX_MAX_KEY_LEN:
+        raise RuntimeError("key_seq_len <= 16384")
+    if sq <= 1:
+        raise RuntimeError("query_seq_len > 1")
     if sk > _MAX_KEY_LEN:
-        raise ValueError(
-            f"scaled masked softmax: key length {sk} exceeds Megatron's "
-            f"fused-softmax limit of {_MAX_KEY_LEN}"
-        )
-    if sk == 0:
-        raise ValueError("scaled masked softmax: key length must be positive")
+        raise RuntimeError("key_seq_len >= 0 && key_seq_len <= 4096")
     scale = _check_scale(scale)
+    _check_megatron_selection(b, np_, sq, sk)
     if inputs.numel() == 0:
         return torch.empty_like(inputs, memory_format=torch.contiguous_format)
 
-    # 16-bit kernels fold log2(e) into the scale and use exp2; fp32 keeps exp,
-    # whose rounding tolerance the folded argument would exceed.
-    exp2 = inputs.dtype != torch.float32
-    if exp2:
-        scale *= _LOG2E
+    # Apex reads the mask as bytes and masks the lanes whose byte is exactly 1.
+    m = _mask_as_bool(mask)
+
+    # Both supported dtypes are 16-bit, so the scale can always carry log2(e)
+    # into the exp2 path.
+    exp2 = True
+    scale *= _LOG2E
 
     x = inputs.contiguous()
-    m = mask.contiguous()
     out = torch.empty_like(x)
     n_rows = b * np_ * sq
 

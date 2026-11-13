@@ -272,8 +272,8 @@ RUN set -eux; \
 RUN set -eux; \
     pip install --no-cache-dir \
         "deepspeed==0.19.7" \
-        deepspeed-kernels \
-        "megatron-core==0.19.2" \
+        "deepspeed-kernels" \
+        "megatron-core==0.20.0" \
         pytest pyyaml sqlalchemy; \
     pip list --format=freeze | grep -iE '^(deepspeed|megatron-core|pytest|pyyaml|sqlalchemy|dskernels)'
 

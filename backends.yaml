@@ -14,6 +14,8 @@ mirror: "https://mirrors.aliyun.com/pypi/simple"
 # running environment (a value that still holds an unexpanded $VAR after that
 # is skipped with a warning rather than written out literally).
 backends:
+  # If there are updates to NV's environment dependencies, it is necessary to
+  # synchronize the update of the gpu-runner.Dockerfile
   nvidia-cuda133:
     python: "3.12"
     cmake_backend: CUDA
@@ -30,7 +32,7 @@ backends:
       - deepspeed-kernels==0.0.1
       - nvidia-cutlass==3.8.0.0
       - nvidia-resiliency-ext==0.6.0
-      - megatron-core==0.19.2
+      - megatron-core==0.20.0
 
   ascend-cann900:
     python: "3.11"
