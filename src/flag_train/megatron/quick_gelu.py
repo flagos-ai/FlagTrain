@@ -33,9 +33,6 @@ _QUICK_GELU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Megatron-LM ``quick_gelu`` multiplies the sigmoid argument by this.
 _ALPHA = 1.702
 
-# fp32 sigmoid is already 0 or 1 outside this range, and exp stays finite.
-_SIGMOID_CLAMP = 80.0
-
 
 def _check_input(tensor, name, dtypes):
     if tensor.dtype not in dtypes:
@@ -61,20 +58,22 @@ def _flatten(tensor):
 
 @libentry()
 @triton.jit
-def _quick_gelu_forward_kernel(x_ptr, y_ptr, n, alpha, clamp, BLOCK_SIZE: tl.constexpr):
+def _quick_gelu_forward_kernel(x_ptr, y_ptr, n, alpha, BLOCK_SIZE: tl.constexpr):
     """``y = x * sigmoid(alpha * x)``, Megatron-LM ``quick_gelu``.
 
-    The product is computed in fp32 and stored in the pointer dtype. ``alpha * x``
-    is clamped to ``[-clamp, clamp]`` first: beyond that, fp32 sigmoid is 0 or 1,
-    and ``exp`` of the unclamped value overflows.
+    The product is computed in fp32 and stored in the pointer dtype. The
+    sigmoid argument is deliberately not clamped: ``exp`` overflow in the
+    denominator lands on ``inf``, and ``1 / (1 + inf)`` is exactly 0, which
+    matches PyTorch. Clamping the argument would leave a ``1.8e-35`` floor on
+    the negative tail, and multiplying that floor by a large negative ``x`` is
+    not negligible.
     """
     pid = tle.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n
 
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    z = tl.minimum(tl.maximum(alpha * x, -clamp), clamp)
-    s = 1.0 / (1.0 + tl.exp(-z))
+    s = tl.sigmoid(alpha * x)
     tl.store(y_ptr + offsets, (x * s).to(y_ptr.dtype.element_ty), mask=mask)
 
 
@@ -85,7 +84,6 @@ def _launch(kernel, args, n, device):
             *args,
             n,
             _ALPHA,
-            _SIGMOID_CLAMP,
             BLOCK_SIZE=_BLOCK_SIZE,
             num_warps=_NUM_WARPS,
         )
