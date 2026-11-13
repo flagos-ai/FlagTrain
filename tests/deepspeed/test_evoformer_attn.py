@@ -943,11 +943,14 @@ def test_matches_deepspeed_oracle(shape, dtype):
 
 @pytest.mark.evoformer_attn
 def test_rejects_inputs_outside_the_contract():
-    """Every rejection names something upstream refuses too.
+    """Every rejection names a failure upstream also has, though not always as a
+    clean assertion.
 
-    None of these is this port inventing a limit: each is an assertion or a
-    ``TORCH_CHECK`` in the code being ported, and the point of raising here is
-    that the alternative is a Triton compile error or a silent wrong answer.
+    Most are an assertion or a ``TORCH_CHECK`` in the code being ported; the
+    dtype / device consistency and empty-axis checks are conditions upstream meets
+    through ``data_ptr<>`` or the launcher (or not at all), and the point of
+    raising here is that the alternative is a Triton compile error or a silent
+    wrong answer.
 
     What is *not* here is upstream's ``L > 16`` assert. That one is about the
     kernel being ported rather than about this one -- the tiles are masked, so a
@@ -965,6 +968,15 @@ def test_rejects_inputs_outside_the_contract():
     with pytest.raises(ValueError, match="same dtype"):
         _call(q, k, v, bias1.to(torch.float32), bias2)
 
+    # The key may not silently disagree with the query's dtype or device.
+    with pytest.raises(
+        ValueError, match="query, key and value must have the same dtype"
+    ):
+        _call(q, k.to(torch.float32), v)
+
+    with pytest.raises(ValueError, match="bias1 must be on the query's device"):
+        _call(q, k, v, bias1.cpu(), bias2)
+
     with pytest.raises(ValueError, match="bias1"):
         _call(q, k, v, bias1[:, :, 0], bias2)
 
@@ -974,10 +986,42 @@ def test_rejects_inputs_outside_the_contract():
     with pytest.raises(ValueError, match="device tensor"):
         _call(q.cpu(), k.cpu(), v.cpu())
 
+    # An empty sequence/head/head-size axis has no kernel to run; upstream's
+    # L > 16 assert covers the first, and the other two would divide by zero
+    # while the (batch, pair) count is flattened.
+    for shape in ((1, 4, 0, 2, 32), (1, 4, 64, 0, 32), (1, 4, 64, 2, 0)):
+        empty = [
+            torch.zeros(shape, dtype=dtype, device=flag_train.device)
+            for _ in range(3)
+        ]
+        with pytest.raises(ValueError, match="non-empty"):
+            _call(*empty)
+
     # A 3-D operand has no pair dimension for a bias to be indexed by.
     flat = q.reshape(-1, 64, 2, 32)
     with pytest.raises(ValueError, match="5-D"):
         _call(flat, flat, flat, bias1.reshape(-1, 64), bias2)
+
+
+@pytest.mark.evoformer_attn
+def test_rejects_operands_on_a_different_device():
+    """One attention runs on one device; a second one is an input error.
+
+    Upstream asserts every operand is on an accelerator but never compares the
+    indices, so a mixed-device set reaches the kernel and fails there. This port
+    says which operand disagrees instead.
+    """
+    if getattr(flag_train.runtime.torch_device_fn, "device_count", lambda: 1)() < 2:
+        pytest.skip("needs two accelerator devices")
+    dtype = torch.float16
+    q, k, v, bias1, bias2 = _inputs((1, 4, 64, 2, 32), dtype)
+    other = torch.device(f"{flag_train.device}:1")
+
+    with pytest.raises(ValueError, match="same device"):
+        _call(q, k.to(other), v)
+
+    with pytest.raises(ValueError, match="bias2 must be on the query's device"):
+        _call(q, k, v, bias1, bias2.to(other))
 
 
 @pytest.mark.evoformer_attn

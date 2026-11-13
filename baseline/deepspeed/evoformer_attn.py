@@ -118,3 +118,44 @@ def build_inputs(binding, dtype, device):
 def key_shape(binding):
     # First tensor: q [batch, pairs, seq_len, heads, head_size]; unique.
     return list(binding["shape"])
+
+
+def config(binding, dtype):
+    """Describe the real inputs/outputs for baseline matching.
+
+    The inputs follow the operator's own argument list,
+    ``DS4Sci_EvoformerAttention(Q, K, V, biases)``. ``biases`` is a list, which
+    a ``{"shape", "dtype"}`` entry cannot express, so -- as for the tensor
+    lists in ``multi_tensor_lion``/``multi_tensor_adam`` -- it is flattened to
+    its elements: ``biases_0`` is ``biases[0]``, the key-padding mask, and
+    ``biases_1`` is ``biases[1]``, the pair bias (upstream's order).
+    """
+    batch, pairs, seq_len, heads, head_size = binding["shape"]
+    dtype_str = str(dtype)
+    qkv_shape = [batch, pairs, seq_len, heads, head_size]
+    return {
+        "inputs": {
+            "q": {"shape": qkv_shape, "dtype": dtype_str},
+            "k": {"shape": qkv_shape, "dtype": dtype_str},
+            "v": {"shape": qkv_shape, "dtype": dtype_str},
+            "biases_0": {
+                "shape": [batch, pairs, 1, 1, seq_len],
+                "dtype": dtype_str,
+            },
+            "biases_1": {
+                "shape": [batch, 1, heads, seq_len, seq_len],
+                "dtype": dtype_str,
+            },
+        },
+        "outputs": {
+            "out": {"shape": qkv_shape, "dtype": dtype_str},
+        },
+        "dims": {
+            "batch": batch,
+            "pairs": pairs,
+            "seq_len": seq_len,
+            "heads": heads,
+            "head_size": head_size,
+            "shape": list(binding["shape"]),
+        },
+    }
