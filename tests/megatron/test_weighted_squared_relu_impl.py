@@ -91,7 +91,8 @@ def _hide_broken_flash_attn_3():
 _hide_broken_flash_attn_3()
 
 # Both ranks of the interface, a hidden size that is not a multiple of the
-# kernel block, and empty tensors.
+# kernel block, and the 2-D empty case.  A zero-token 3-D input is rejected by
+# Megatron's epilogue reshape and is covered separately.
 _SHAPES = [
     (1, 1),
     (17, 1000),
@@ -99,7 +100,6 @@ _SHAPES = [
     (4, 8, 64),
     (1024, 4096),
     (0, 8),
-    (2, 0, 8),
 ]
 
 _CLAMP_SCALE = 5.0
@@ -419,20 +419,31 @@ def test_weighted_squared_relu_noncontiguous(dtype):
     transposed = cube.transpose(0, 2)
     assert not transposed.is_contiguous()
     transposed_weights = _weights_for(transposed.shape, torch.float32, seed=8)
-    _check(transposed, transposed_weights, _CLAMP_SCALE)
+    # Megatron's `input.view(-1, hidden)` cannot flatten this layout, so its
+    # forward raises before any arithmetic; mirror that instead of copying.
+    with pytest.raises(RuntimeError):
+        flag_train.megatron.weighted_squared_relu_impl(
+            transposed, transposed_weights, _CLAMP_SCALE
+        )
 
 
 @pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_weighted_squared_relu_empty(dtype):
-    for shape in ((0, 8), (2, 0, 8)):
-        x = torch.empty(shape, dtype=dtype, device=flag_train.device)
-        weights = torch.empty(
-            (math.prod(shape[:-1]), 1), dtype=torch.float32, device=flag_train.device
-        )
-        y = _check(x, weights, None)
-        assert y.numel() == 0
-        _check(x, None, _CLAMP_SCALE)
+    shape = (0, 8)
+    x = torch.empty(shape, dtype=dtype, device=flag_train.device)
+    weights = torch.empty(
+        (math.prod(shape[:-1]), 1), dtype=torch.float32, device=flag_train.device
+    )
+    y = _check(x, weights, None)
+    assert y.numel() == 0
+    _check(x, None, _CLAMP_SCALE)
+
+    # Megatron's 3-D epilogue reshape fails for a zero-token 3-D input.
+    x = torch.empty((2, 0, 8), dtype=dtype, device=flag_train.device)
+    weights = torch.empty((0, 1), dtype=torch.float32, device=flag_train.device)
+    with pytest.raises(RuntimeError):
+        flag_train.megatron.weighted_squared_relu_impl(x, weights, None)
 
 
 @pytest.mark.weighted_squared_relu_impl
@@ -460,22 +471,77 @@ def test_weighted_squared_relu_rejects_bad_weights_shape():
     x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
     for shape in ((16,), (16, 2), (2, 64)):
         weights = torch.rand(shape, dtype=torch.float32, device=flag_train.device)
-        with pytest.raises(ValueError, match="broadcast"):
+        # Megatron leaves the failure to ordinary torch broadcasting.
+        with pytest.raises(RuntimeError):
             flag_train.megatron.weighted_squared_relu_impl(x, weights)
 
 
 @pytest.mark.weighted_squared_relu_impl
-def test_weighted_squared_relu_rejects_bad_input():
-    weights = torch.rand((16, 1), dtype=torch.float32, device=flag_train.device)
-    with pytest.raises(ValueError, match="tensor"):
-        flag_train.megatron.weighted_squared_relu_impl(
-            torch.zeros((16, 64), dtype=torch.int32, device=flag_train.device), weights
-        )
+def test_weighted_squared_relu_rejects_bad_rank():
     with pytest.raises(AssertionError):
         flag_train.megatron.weighted_squared_relu_impl(
             torch.randn((16,), dtype=torch.float32, device=flag_train.device),
             torch.rand((16, 1), dtype=torch.float32, device=flag_train.device),
         )
+
+
+@pytest.mark.weighted_squared_relu_impl
+@pytest.mark.parametrize("dtype", [torch.int32, torch.bool])
+def test_weighted_squared_relu_accepts_torch_input_dtypes(dtype):
+    """Megatron has no dtype gate; the fallback must keep that support."""
+    x = torch.randint(0, 4, (16, 64), dtype=torch.int32, device=flag_train.device)
+    if dtype is torch.bool:
+        x = x.bool()
+    else:
+        x = x.to(dtype)
+    weights = torch.rand((16, 1), dtype=torch.float32, device=flag_train.device)
+    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    relu_x = x if x.dtype == torch.bool else torch.relu(x)
+    expected = (torch.pow(relu_x, 2) * weights).to(x.dtype)
+    assert y.shape == x.shape and y.dtype == x.dtype
+    torch.testing.assert_close(y, expected)
+
+
+@pytest.mark.weighted_squared_relu_impl
+def test_weighted_squared_relu_accepts_cpu_input():
+    """Megatron is device-agnostic; CPU inputs use the torch fallback."""
+    x = torch.randn((16, 64), dtype=torch.float32, device="cpu")
+    weights = torch.rand((16, 1), dtype=torch.float32, device="cpu")
+    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
+    torch.testing.assert_close(y, expected)
+
+
+@pytest.mark.weighted_squared_relu_impl
+def test_weighted_squared_relu_accepts_complex_weights():
+    """Megatron multiplies then casts the complex product back to input dtype."""
+    x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
+    weights = torch.rand((16, 1), dtype=torch.complex64, device=flag_train.device)
+    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
+    torch.testing.assert_close(y, expected)
+
+
+@pytest.mark.weighted_squared_relu_impl
+@pytest.mark.parametrize(
+    ("shape", "weights_shape"),
+    [
+        ((2, 4), (1, 1, 4)),
+        ((2, 4), (1, 2, 4)),
+        ((2, 3, 4), (1, 1, 4)),
+        ((2, 3, 4), (1, 1, 6, 4)),
+    ],
+)
+def test_weighted_squared_relu_accepts_extra_weight_dims(shape, weights_shape):
+    """Megatron permits weights whose broadcast adds leading dimensions."""
+    x = torch.randn(shape, dtype=torch.float32, device=flag_train.device)
+    weights = torch.rand(weights_shape, dtype=torch.float32, device=flag_train.device)
+    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    expected = (torch.pow(torch.relu(x.view(-1, x.shape[-1])), 2) * weights).to(x.dtype)
+    if x.dim() == 3:
+        expected = expected.view(x.shape[0], x.shape[1], -1)
+    assert y.shape == expected.shape
+    torch.testing.assert_close(y, expected)
 
 
 @pytest.mark.weighted_squared_relu_impl
