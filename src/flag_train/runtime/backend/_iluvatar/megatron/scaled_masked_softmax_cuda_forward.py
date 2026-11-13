@@ -31,12 +31,15 @@ import triton
 import triton.language as tl
 
 from flag_train.megatron.scaled_masked_softmax_cuda_forward import (
+    _APEX_MAX_KEY_LEN,
     _I64_THRESHOLD,
     _LOG2E,
     _MAX_KEY_LEN,
+    _batches_per_block,
     _check_input,
     _check_mask,
     _check_scale,
+    _mask_as_bool,
 )
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
@@ -149,32 +152,38 @@ def scaled_masked_softmax_cuda_forward(inputs, mask, scale):
     """Fused scale + mask + softmax, Megatron's masked-attention forward.
 
     See the generic module for the contract; this backend only changes the
-    launch. ``inputs`` is ``[b, np, sq, sk]`` fp16/bf16/fp32, ``mask`` is the
-    bool ``[b or 1, 1, sq, sk]`` rejection mask, and ``scale`` is a real number
-    or a one-element tensor.
+    launch. ``inputs`` is ``[b, np, sq, sk]`` fp16/bf16, ``mask`` is the
+    ``[b or 1, 1, sq, sk]`` mask read as raw bytes, and ``scale`` is a real
+    number or a one-element tensor.
     """
     logger.debug("TRAIN_ILUVATAR SCALED_MASKED_SOFTMAX_CUDA_FORWARD")
     _check_input(inputs)
     _check_mask(mask, inputs)
     b, np_, sq, sk = inputs.shape
+    if sk > _APEX_MAX_KEY_LEN:
+        raise RuntimeError("key_seq_len <= 16384")
+    if sq <= 1:
+        raise RuntimeError("query_seq_len > 1")
     if sk > _MAX_KEY_LEN:
-        raise ValueError(
-            f"scaled masked softmax: key length {sk} exceeds Megatron's "
-            f"fused-softmax limit of {_MAX_KEY_LEN}"
-        )
-    if sk == 0:
-        raise ValueError("scaled masked softmax: key length must be positive")
+        raise RuntimeError("key_seq_len >= 0 && key_seq_len <= 4096")
     scale = _check_scale(scale)
+    if sk == 0:
+        return torch.empty_like(inputs, memory_format=torch.contiguous_format)
+    batches_per_block = _batches_per_block(sk)
+    if sq % batches_per_block != 0:
+        raise RuntimeError("query_seq_len % batches_per_block == 0")
     if inputs.numel() == 0:
         return torch.empty_like(inputs, memory_format=torch.contiguous_format)
 
-    # 16-bit kernels fold log2(e) into the scale and use exp2; fp32 keeps exp.
-    exp2 = inputs.dtype != torch.float32
-    if exp2:
-        scale *= _LOG2E
+    # Apex reads the mask as bytes and masks the lanes whose byte is exactly 1.
+    mask = _mask_as_bool(mask)
+
+    # Both supported dtypes are 16-bit, so the scale can always carry log2(e)
+    # into the exp2 path.
+    exp2 = True
+    scale *= _LOG2E
 
     x = inputs.contiguous()
-    mask = mask.contiguous()
     out = torch.empty_like(x)
     block_n = triton.next_power_of_2(sk)
     rows, num_warps = _tile(block_n, np_)

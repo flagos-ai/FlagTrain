@@ -32,9 +32,10 @@ the softmax is accumulated in fp32. Upstream pushes them to the finite sentinel
 ends up as an exact zero, and a row whose keys are all masked comes out as
 zeros rather than as the uniform distribution ``exp(0) / sk`` would give.
 
-The mask is a bool tensor of shape ``[b or 1, 1, sq, sk]`` where ``True`` marks
-a key that must not be attended to; a leading dimension of one is shared across
-the batch. Megatron only selects the fused kernels for ``16 < sk <= 4096``
+The mask has shape ``[b or 1, 1, sq, sk]``; as in Apex it is read as raw
+bytes, and a byte equal to 1 marks a key that must not be attended to. A
+leading dimension of one is shared across the batch. Megatron only selects the
+fused kernels for ``16 < sk <= 4096``
 (``FusedScaleMaskSoftmax.is_kernel_available``); the same upper bound is
 enforced here.
 
@@ -63,12 +64,14 @@ from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 # ``FusedScaleMaskSoftmax.is_kernel_available`` rejects ``sk > 4096``; above
 # that Megatron falls back to the torch path. One program reduces one row, so
-# the same cap keeps the register tile bounded.
+# the same cap keeps the register tile bounded. Apex additionally asserts the
+# wider 16384 bound before dispatching.
 _MAX_KEY_LEN = 4096
+_APEX_MAX_KEY_LEN = 16384
 
 # 32-bit index arithmetic halves the offset tile. It is only safe when no
 # addressed element can pass 2**31; above that the logical row count times the
@@ -78,6 +81,10 @@ _I64_THRESHOLD = 1 << 31
 # log2(e), folded into the scale for the 16-bit dtypes so the kernel exponentiates
 # with ``ex2``.
 _LOG2E = 1.4426950408889634
+
+# Apex's launch geometry, used to mirror its forward query-length gate.
+_WARP_SIZE = 32
+_THREADS_PER_BLOCK = 128
 
 
 # ``(max padded key length, heads per program, warps, pipeline stages)``. A
@@ -135,63 +142,81 @@ def _loop_depth(block_n: int, batch: int, sq: int, head_blocks: int) -> int:
     return loop
 
 
+def _batches_per_block(key_seq_len):
+    """Batch-per-block Apex uses when gating the forward query length."""
+    log2_elements = 0
+    while (1 << log2_elements) < key_seq_len:
+        log2_elements += 1
+    next_power_of_two = 1 << log2_elements
+    warp_size = min(next_power_of_two, _WARP_SIZE)
+    batches_per_warp = 2 if next_power_of_two <= 128 else 1
+    warps_per_block = _THREADS_PER_BLOCK // warp_size
+    return warps_per_block * batches_per_warp
+
+
 def _check_scale(scale):
-    """Accept the Python float or 0-dim tensor that Megatron passes."""
+    """Accept the Python float or one-element tensor Apex's binding accepts."""
     if isinstance(scale, torch.Tensor):
         if scale.numel() != 1:
-            raise ValueError(
-                f"fused softmax scale needs one element, got {tuple(scale.shape)}"
+            raise TypeError(
+                "scaled masked softmax scale must be a real number or a "
+                f"one-element tensor, got {tuple(scale.shape)}"
             )
         scale = scale.item()
-    return float(scale)
+    if isinstance(scale, (str, bytes)):
+        raise TypeError("scaled masked softmax scale must be a real number")
+    try:
+        return float(scale)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("scaled masked softmax scale must be a real number") from exc
 
 
 def _check_input(inputs):
     if inputs.ndim != 4:
-        raise ValueError(
-            f"scaled masked softmax needs a 4-D tensor, got {inputs.ndim}-D"
-        )
+        raise RuntimeError(f"expected 4D tensor, got {inputs.ndim}-D")
     if inputs.dtype not in _SUPPORTED_DTYPES:
-        wanted = " / ".join(str(dtype) for dtype in _SUPPORTED_DTYPES)
-        raise ValueError(
-            f"scaled masked softmax needs a {wanted} tensor, got {inputs.dtype}"
-        )
+        raise RuntimeError(f"Only fp16 and bf16 are supported, got {inputs.dtype}")
     if inputs.device.type == "cpu":
-        raise ValueError(
+        raise RuntimeError(
             "scaled masked softmax needs a device tensor, not one on the CPU"
         )
     if inputs.device.type != runtime_device.name:
-        raise ValueError(
+        raise RuntimeError(
             "scaled masked softmax needs a "
             f"{runtime_device.name} tensor, got {inputs.device.type}"
         )
 
 
 def _check_mask(mask, inputs):
-    """A bool ``[b or 1, 1, sq, sk]`` mask over the scores' batch and key axes."""
+    """Apex's mask shape contract; its dtype is read as raw bytes."""
     b, _, sq, sk = inputs.shape
     if mask.ndim != 4:
-        raise ValueError(
-            f"scaled masked softmax mask needs a 4-D tensor, got {mask.ndim}-D"
-        )
-    if mask.dtype != torch.bool:
-        raise ValueError(
-            f"scaled masked softmax mask needs a bool tensor, got {mask.dtype}"
-        )
-    if mask.shape[0] not in (1, b) or mask.shape[1] != 1:
-        raise ValueError(
-            "scaled masked softmax mask must be [b or 1, 1, sq, sk], got "
-            f"{tuple(mask.shape)}"
-        )
-    if mask.shape[2] != sq or mask.shape[3] != sk:
-        raise ValueError(
-            "scaled masked softmax mask must match the scores on the query and "
-            f"key axes, got {tuple(mask.shape[2:])} for scores {sq} x {sk}"
-        )
+        raise RuntimeError(f"expected 4D tensor, got {mask.ndim}-D mask")
+    if mask.shape[0] not in (1, b):
+        raise RuntimeError("pad_batches == 1 || pad_batches == batches")
+    if mask.shape[1] != 1:
+        raise RuntimeError("mask.size(1) == 1")
+    if mask.shape[2] != sq:
+        raise RuntimeError("mask.size(2) == query_seq_len")
+    if mask.shape[3] != sk:
+        raise RuntimeError("mask.size(3) == key_seq_len")
     if mask.device != inputs.device:
-        raise ValueError(
+        raise RuntimeError(
             "scaled masked softmax needs the scores and the mask on one device"
         )
+
+
+def _mask_as_bool(mask):
+    """Reproduce Apex's byte-wise mask read as a bool mask.
+
+    Apex casts the contiguous mask storage to ``uint8_t*`` and masks only
+    bytes equal to 1; every other byte, and every padding lane, is attended.
+    """
+    mask = mask.contiguous()
+    if mask.dtype == torch.bool:
+        return mask
+    raw = mask.view(torch.uint8).reshape(-1)[: mask.numel()]
+    return (raw == 1).view(mask.shape)
 
 
 @libentry()
@@ -273,11 +298,9 @@ def _scaled_masked_softmax_forward_kernel(
         # zero: its exponentials then underflow to zero and the row comes out as
         # zeros, which is what upstream answers, rather than as ``0 / 0`` NaNs.
         max_value = tl.where(max_value == -float("inf"), 0.0, max_value)
-        # ``scale`` arrives pre-folded with log2(e) in the exp2 path, which turns
-        # the exponential into the hardware ``ex2`` instruction instead of
-        # libdevice's ``exp``. fp32 keeps ``exp``: it is the dtype whose
-        # tolerance is tight enough for the extra rounding in the folded
-        # argument to matter.
+        # ``scale`` arrives pre-folded with log2(e), which turns the exponential
+        # into the hardware ``ex2`` instruction instead of libdevice's ``exp``.
+        # Both supported dtypes are 16-bit, matching Megatron's fused dispatch.
         if EXP2:
             numerator = tl.exp2(scores - max_value[:, None])
         else:
@@ -304,47 +327,58 @@ def scaled_masked_softmax_cuda_forward(inputs, mask, scale):
     ``scaled_masked_softmax_cuda.forward(inputs, mask, scale)``.
 
     Args:
-        inputs (Tensor): fp16, bf16 or fp32 scores of shape ``[b, np, sq, sk]``.
+        inputs (Tensor): fp16 or bf16 scores of shape ``[b, np, sq, sk]``.
             A non-contiguous tensor is copied.
-        mask (Tensor): bool mask of shape ``[b or 1, 1, sq, sk]`` where ``True``
-            marks a key that must not be attended to. A leading dimension of 1
-            is shared across the batch.
+        mask (Tensor): 4-D mask of shape ``[b or 1, 1, sq, sk]``. As in Apex,
+            its contiguous storage is read as bytes and a byte equal to 1
+            marks a key that must not be attended to. A leading dimension of
+            1 is shared across the batch.
         scale (float | Tensor): multiplier applied before the softmax; Megatron
             passes a 0-dim tensor (``scale_t[0]``).
 
     Returns:
         Tensor: contiguous softmax results with the input's shape and dtype.
         Masked keys, and every key of a row that masks all of them, are exactly
-        zero; every other row sums to one.
+        zero; every other row sums to one. An empty input, including a zero key
+        length, returns an empty tensor without a launch.
 
     Raises:
-        ValueError: if the operands are not a supported 4-D tensor and a
-            matching bool mask on the active device, or the key length exceeds
-            4096.
+        RuntimeError: when Apex would reject the call (wrong rank or dtype,
+            invalid mask shape, non-positive query length, non-divisible query
+            length, or key length over 4096/16384).
+        TypeError: when ``scale`` is not a real number or one-element tensor.
     """
     logger.debug("TRAIN SCALED_MASKED_SOFTMAX_CUDA_FORWARD")
     _check_input(inputs)
     _check_mask(mask, inputs)
     b, np_, sq, sk = inputs.shape
+    if sk > _APEX_MAX_KEY_LEN:
+        raise RuntimeError("key_seq_len <= 16384")
+    if sq <= 1:
+        raise RuntimeError("query_seq_len > 1")
     if sk > _MAX_KEY_LEN:
-        raise ValueError(
-            f"scaled masked softmax: key length {sk} exceeds Megatron's "
-            f"fused-softmax limit of {_MAX_KEY_LEN}"
-        )
-    if sk == 0:
-        raise ValueError("scaled masked softmax: key length must be positive")
+        raise RuntimeError("key_seq_len >= 0 && key_seq_len <= 4096")
     scale = _check_scale(scale)
+    if sk == 0:
+        # Apex allocates the output and returns before launching when sk == 0.
+        return torch.empty_like(inputs, memory_format=torch.contiguous_format)
+    batches_per_block = _batches_per_block(sk)
+    if sq % batches_per_block != 0:
+        raise RuntimeError("query_seq_len % batches_per_block == 0")
     if inputs.numel() == 0:
+        # b == 0: Apex allocates an empty output and its zero-sized grid is a
+        # no-op, so the empty tensor is the observable result.
         return torch.empty_like(inputs, memory_format=torch.contiguous_format)
 
-    # Fold log2(e) into the scale so the kernel can use ``ex2``; fp32 keeps the
-    # natural exponential (see the kernel).
-    exp2 = inputs.dtype != torch.float32
-    if exp2:
-        scale *= _LOG2E
+    # Apex reads the mask as bytes and masks the lanes whose byte is exactly 1.
+    mask = _mask_as_bool(mask)
+
+    # Fold log2(e) into the scale so the kernel can use ``ex2``. Both supported
+    # dtypes are 16-bit, matching Megatron's fused-softmax dispatch.
+    exp2 = True
+    scale *= _LOG2E
 
     x = inputs.contiguous()
-    mask = mask.contiguous()
     out = torch.empty_like(x)
     block_n = triton.next_power_of_2(sk)
     rows, num_warps, stages = _tile(block_n, np_)
