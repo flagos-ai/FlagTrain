@@ -13,28 +13,16 @@
 # limitations under the License.
 """Performance benchmark for bias_swiglu_impl.
 
-The baseline is Megatron-LM's own ``bias_swiglu_impl`` when it is installed.
-That function is a PyTorch composition decorated with ``@jit_fuser``, which is
-``torch.compile`` on torch >= 2.2, so the baseline is the compiled native
-implementation rather than eager PyTorch. When megatron-core is older than
-0.20 (the first release with the clamp / SiTU arguments), or is not installed,
-the main-branch implementation vendored in the appendix at the end of this file
-is used instead, so every case is still compared against a compiled baseline.
-The choice is made once at import from the installed version, and the
+The baseline is Megatron-LM's ``bias_swiglu_impl`` when megatron-core >= 0.20
+is installed. Older versions lack the clamp / SiTU arguments, so the
+main-branch implementation vendored at the end of this file is used instead and
+every variant stays compared against a compiled Megatron baseline. The
 ``Baseline:`` line printed by the test records which one ran.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the shapes
-below. One benchmark table covers the three activations: every row carries the
-variant label and ``--dtypes`` chooses the dtypes. The operator is
-forward-only, so there are no backward cases. The plain path adds a
-``[hidden]`` bias. The clamped and SiTU-GLU rows stay separate so their extra
-tanh/clamp work is visible instead of being folded into the plain numbers.
-
-``torch.compile`` recompiles per shape/dtype/requires-grad pattern. The
-default Dynamo recompile limit is smaller than this benchmark's case count, so
-the module raises it; otherwise the baseline silently falls back to eager and
-the comparison is meaningless.
+below. One table covers the three activations (plain, clamped, SiTU-GLU);
+``--dtypes`` chooses the dtypes. The operator is forward-only.
 """
 
 import importlib.metadata
@@ -50,7 +38,7 @@ import flag_train
 
 from .. import base, consts
 
-# Token counts and hidden widths used by a fused MLP activation. Last dim is even.
+# (tokens, 2 * hidden): the last dim is the concatenated [gate | linear].
 _CORE_SHAPES = [
     (64, 64),
     (1024, 1024),
@@ -62,28 +50,6 @@ _CORE_SHAPES = [
 ]
 
 
-def bias_swiglu_ref(
-    x,
-    bias=None,
-    clamp_value=None,
-    gate_clamp_scale=None,
-    linear_clamp_scale=None,
-):
-    y = x if bias is None else x + bias
-    gate, linear = torch.chunk(y, 2, dim=-1)
-    if gate_clamp_scale is not None:
-        gate_v = gate_clamp_scale * torch.tanh(gate / gate_clamp_scale)
-        gate_v = gate_v * torch.sigmoid(gate)
-        if linear_clamp_scale is not None:
-            linear = linear_clamp_scale * torch.tanh(linear / linear_clamp_scale)
-        return gate_v * linear
-    if clamp_value is not None and clamp_value > 0:
-        return torch.nn.functional.silu(gate.clamp(max=clamp_value)) * linear.clamp(
-            min=-clamp_value, max=clamp_value
-        )
-    return torch.nn.functional.silu(gate) * linear
-
-
 # Enough variants for 7 shapes x 3 activations x 3 dtypes of forward cases
 # without Dynamo falling back to eager halfway through the suite.
 _DYNAMO_RECOMPILE_LIMIT = 128
@@ -92,80 +58,70 @@ _DYNAMO_RECOMPILE_LIMIT = 128
 _MCORE_MIN_VERSION = (0, 20)
 
 
-def _mcore_version():
+def _megatron_version():
+    """Installed megatron-core version and ``(major, minor)``, or ``(None, None)``."""
     try:
-        return importlib.metadata.version("megatron-core")
+        version = importlib.metadata.version("megatron-core")
     except Exception:
-        return "not installed"
-
-
-_MCORE_VERSION = _mcore_version()
-
-
-def _version_tuple(version):
-    """``(major, minor)`` of a distribution version, or ``None`` without one."""
+        return None, None
     match = re.match(r"\s*(\d+)(?:\.(\d+))?", version)
-    return None if match is None else (int(match.group(1)), int(match.group(2) or 0))
+    parsed = None if match is None else (int(match.group(1)), int(match.group(2) or 0))
+    return version, parsed
 
 
-def _stabilize_megatron_compile():
-    """Keep the compiled Megatron baseline working on every backend.
+_MCORE_VERSION, _MCORE_VERSION_TUPLE = _megatron_version()
 
-    ``megatron.core.jit`` compiles the baseline per shape, dtype and
-    requires-grad pattern, so the default Dynamo limit is below this suite's
-    case count. Vendor Megatron builds may wrap ``torch.compile`` in their own
-    helper, so do not gate on an identity check against ``torch.compile``.
-    Inductor's async compile also has to pickle the compiled Triton kernel back
-    from its worker, which some vendor Triton builds cannot do.
-    """
-    try:
-        from megatron.core import jit
-    except ImportError:
-        return
 
-    # Inductor's async compile sends each Triton kernel to a worker process and
-    # pickles the compiled kernel back. Vendor Triton builds whose JITFunction
-    # cannot be pickled (it carries an RLock) fail there with
-    # "TypeError: cannot pickle '_thread.RLock' object" while compiling the
-    # Megatron baseline. One compile thread keeps compilation in-process; it
-    # changes compile time only, not the measured kernel time.
-    try:
-        import torch._inductor.config
+@pytest.fixture(scope="module", autouse=True)
+def _configure_torch_compile():
+    """Keep the compiled baseline working across this module's case count."""
+    import torch._dynamo
+    import torch._inductor.config as inductor_config
 
-        if getattr(torch._inductor.config, "compile_threads", 1) != 1:
-            torch._inductor.config.compile_threads = 1
-    except ImportError:
-        pass
+    # One compile thread keeps Inductor's compilation in-process; vendor Triton
+    # builds may fail to pickle the compiled kernel back from a worker.
+    saved_threads = inductor_config.compile_threads
+    inductor_config.compile_threads = 1
+    saved_autotune = inductor_config.triton.autotune_pointwise
+    # torch_musa's Inductor autotune timer imports
+    # triton.backends.mtgpu.musa_testing, which the FlagTree Triton build does
+    # not ship. Disable the pointwise config search on MUSA; the compiled
+    # baseline itself still runs.
+    if flag_train.vendor_name == "mthreads":
+        inductor_config.triton.autotune_pointwise = False
 
-    if jit.jit_fuser is getattr(jit, "noop_decorator", None):
-        return
+    dynamo = torch._dynamo.config
+    saved_suppress = dynamo.suppress_errors
+    # Hygon's installed torch and Triton disagree on Inductor's config format
+    # (``instance_descriptor`` vs dict), so the compiled baseline cannot build.
+    # Fall back to eager while the vendored baseline is in use; once
+    # megatron-core >= 0.20 provides it, keep the normal compiled path.
+    if flag_train.vendor_name == "hygon" and (
+        _MCORE_VERSION_TUPLE is None or _MCORE_VERSION_TUPLE < _MCORE_MIN_VERSION
+    ):
+        dynamo.suppress_errors = True
 
-    try:
-        import torch._dynamo
-    except ImportError:
-        return
-    if hasattr(torch._dynamo.config, "recompile_limit"):
-        current = torch._dynamo.config.recompile_limit
-    elif hasattr(torch._dynamo.config, "cache_size_limit"):
-        current = torch._dynamo.config.cache_size_limit
-    else:
-        return
-    if current >= _DYNAMO_RECOMPILE_LIMIT:
-        return
-    if hasattr(torch._dynamo.config, "recompile_limit"):
-        torch._dynamo.config.recompile_limit = _DYNAMO_RECOMPILE_LIMIT
-    else:
-        torch._dynamo.config.cache_size_limit = _DYNAMO_RECOMPILE_LIMIT
-    warnings.warn(
-        "raised the torch._dynamo recompile limit to "
-        f"{_DYNAMO_RECOMPILE_LIMIT} so the torch.compile baseline does not "
-        "silently fall back to eager",
-        RuntimeWarning,
-        stacklevel=2,
+    limit_name = next(
+        (
+            name
+            for name in ("recompile_limit", "cache_size_limit")
+            if hasattr(dynamo, name)
+        ),
+        None,
     )
+    saved_limit = getattr(dynamo, limit_name) if limit_name else None
+    if limit_name is not None:
+        setattr(dynamo, limit_name, max(saved_limit, _DYNAMO_RECOMPILE_LIMIT))
 
+    try:
+        yield
+    finally:
+        inductor_config.compile_threads = saved_threads
+        inductor_config.triton.autotune_pointwise = saved_autotune
+        dynamo.suppress_errors = saved_suppress
+        if limit_name is not None:
+            setattr(dynamo, limit_name, saved_limit)
 
-_stabilize_megatron_compile()
 
 _CLAMPED_KWARGS = {"clamp_value": 2.0}
 _SITU_KWARGS = {"gate_clamp_scale": 4.0, "linear_clamp_scale": 2.5}
@@ -192,7 +148,7 @@ class BiasSwigluImplBenchmark(base.GenericBenchmark):
 
 # Variant label -> operator kwargs. The label travels with each input row, so
 # one benchmark table covers all three activations.
-_VARIANTS = {
+_VARIANT_KWARGS = {
     "plain": {},
     "clamped": _CLAMPED_KWARGS,
     "situ": _SITU_KWARGS,
@@ -202,18 +158,18 @@ _VARIANTS = {
 def bias_swiglu_input_fn(shape, dtype, device):
     x = torch.randn(shape, dtype=dtype, device=device)
     bias = torch.randn((shape[-1],), dtype=dtype, device=device)
-    for variant in _VARIANTS:
+    for variant in _VARIANT_KWARGS:
         yield (x, bias, variant)
 
 
 def torch_op(x, bias, variant):
     """Installed Megatron >= 0.20, or the vendored main-branch copy."""
-    return _BASELINE_IMPL(x, bias, **_VARIANTS[variant])
+    return _baseline_op(x, bias, **_VARIANT_KWARGS[variant])
 
 
 def train_op(x, bias, variant):
     """The operator under test."""
-    return flag_train.megatron.bias_swiglu_impl(x, bias, **_VARIANTS[variant])
+    return flag_train.megatron.bias_swiglu_impl(x, bias, **_VARIANT_KWARGS[variant])
 
 
 @pytest.mark.bias_swiglu_impl
@@ -241,30 +197,17 @@ def test_bias_swiglu_impl_perf():
 # ===========================================================================
 # Appendix: vendored Megatron-LM baseline
 #
-# Source: NVIDIA Megatron-LM, **main branch**, fetched 2026-10-28 (no release
-# tag yet; these variants are expected to reach a release with 0.20.0).
+# Source: NVIDIA Megatron-LM main branch, fetched 2026-10-28:
 #   https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/fusions/fused_bias_swiglu.py
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. Apache-2.0.
 #
-# The megatron-core releases this file runs against on older machines
-# predate 0.20 and have no clamp / SiTU arguments, so those benchmark cases
-# would otherwise fall back to the eager composition; vendoring the
-# main-branch code keeps them compared against a compiled Megatron.
 # ``_load_baseline`` below picks this copy whenever megatron-core < 0.20 or is
-# not installed.
-#
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Licensed under the Apache License, Version 2.0.
-#
-# Changes from upstream: ``jit_fuser`` is replaced by ``torch.compile`` and
-# ``F.`` is expanded to ``torch.nn.functional.``. The backward functions, the
-# saved-tensor bookkeeping, and the Megatron-internal decorators are dropped
-# because this benchmark measures forward only. The forward math is verbatim,
-# which is why it sits under ``fmt: off``: black must not reformat it, so it
-# can be re-synced with upstream. Benchmark baseline only, never a correctness
-# oracle.
-#
-# Once every supported megatron-core is >= 0.20 this appendix can be deleted
-# together with ``_load_baseline`` and the ``_BASELINE_IMPL`` indirection.
+# not installed. The forward math is verbatim under ``fmt: off`` so it can be
+# re-synced with upstream; ``jit_fuser`` is replaced by ``torch.compile``,
+# ``F.`` is expanded to ``torch.nn.functional.``, and backward-only helpers are
+# omitted because this benchmark measures forward only. Benchmark baseline
+# only, never a correctness oracle. Delete this appendix once every supported
+# megatron-core is >= 0.20.
 # ===========================================================================
 
 jit_fuser = torch.compile
@@ -343,7 +286,7 @@ def bias_situ_glu(
     return situ_glu(y + bias, gate_clamp_scale, linear_clamp_scale)
 
 
-def _vendored_bias_swiglu_impl(
+def _vendored_baseline(
     input,
     bias,
     fp8_input_store=False,
@@ -376,8 +319,7 @@ def _vendored_bias_swiglu_impl(
 
 def _load_baseline():
     """Installed Megatron when it has the clamp/SiTU arguments, else vendored."""
-    version = _version_tuple(_MCORE_VERSION)
-    if version is not None and version >= _MCORE_MIN_VERSION:
+    if _MCORE_VERSION_TUPLE is not None and _MCORE_VERSION_TUPLE >= _MCORE_MIN_VERSION:
         try:
             from megatron.core.fusions.fused_bias_swiglu import (
                 bias_swiglu_impl as installed,
@@ -386,7 +328,7 @@ def _load_baseline():
             reason = f"megatron-core {_MCORE_VERSION} cannot import it: {exc}"
         else:
             return installed, f"megatron-core {_MCORE_VERSION}"
-    elif _MCORE_VERSION == "not installed":
+    elif _MCORE_VERSION is None:
         reason = "Megatron-LM is not installed"
     else:
         reason = (
@@ -400,7 +342,7 @@ def _load_baseline():
         RuntimeWarning,
         stacklevel=2,
     )
-    return _vendored_bias_swiglu_impl, "vendored main-branch implementation"
+    return _vendored_baseline, "vendored main-branch implementation"
 
 
-_BASELINE_IMPL, _BASELINE = _load_baseline()
+_baseline_op, _BASELINE = _load_baseline()
