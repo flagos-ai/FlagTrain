@@ -24,10 +24,12 @@ generic kernel's integer-to-bf16 conversion does not survive.
 
 from .blocked_flash import blocked_flash
 from .cuda_wf6af16_linear import cuda_wf6af16_linear
+from .loco_quantized_reduction import loco_quantized_reduction
 from .mixed_gemm import mixed_gemm
 
 __all__ = [
     "blocked_flash",
     "cuda_wf6af16_linear",
+    "loco_quantized_reduction",
     "mixed_gemm",
 ]
