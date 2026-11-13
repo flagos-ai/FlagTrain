@@ -107,7 +107,6 @@ _keep_compile_in_process()
 # Empty, unaligned (half = 3 and 17), and MLP-like ranks. The last dim is even.
 _SHAPES = [
     (0, 8),
-    (0, 4, 16),
     (1, 2),
     (8, 6),
     (5, 34),
@@ -168,8 +167,10 @@ def _reference(tensor):
     return utils.to_reference(tensor.detach(), upcast=True)
 
 
-def _assert_close(actual, expected, dtype):
-    utils.train_assert_close(utils.to_reference(actual), expected, dtype)
+def _assert_close(actual, expected, dtype, equal_nan=False):
+    utils.train_assert_close(
+        utils.to_reference(actual), expected, dtype, equal_nan=equal_nan
+    )
 
 
 def _expected_output(x, bias, **kwargs):
@@ -205,6 +206,23 @@ def test_bias_swiglu_impl(shape, dtype):
     utils.init_seed(0)
     x = torch.randn(shape, dtype=dtype, device=flag_train.device)
     _check_bias_swiglu(x, None)
+
+
+_EMPTY_3D_SHAPES = [(0, 4, 16), (2, 0, 16)]
+
+
+@pytest.mark.bias_swiglu_impl
+@pytest.mark.parametrize("shape", _EMPTY_3D_SHAPES)
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_bias_swiglu_impl_3d_empty_raises(shape, dtype):
+    """Match Megatron-LM, whose final ``view(..., -1)`` is ambiguous for 0 elements."""
+    x = torch.empty(shape, dtype=dtype, device=flag_train.device)
+    with pytest.raises(RuntimeError):
+        flag_train.megatron.bias_swiglu_impl(x, None)
+
+    if _megatron_impl is not None:
+        with pytest.raises(RuntimeError):
+            _megatron_impl(x, None)
 
 
 @pytest.mark.bias_swiglu_impl
@@ -266,6 +284,26 @@ def test_bias_swiglu_impl_clamp_boundary(dtype):
     x = values.view(1, -1)
     bias = torch.zeros((x.shape[-1],), dtype=dtype, device=flag_train.device)
     _check_bias_swiglu(x, bias, clamp_value=clamp)
+
+
+@pytest.mark.bias_swiglu_impl
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_bias_swiglu_impl_clamped_nan(dtype):
+    """torch.clamp propagates NaN; the kernel must not replace it with a bound."""
+    gate = torch.tensor(
+        [float("nan"), 1.0, -2.0, 2.0], dtype=torch.float32, device=flag_train.device
+    )
+    linear = torch.tensor(
+        [0.5, float("nan"), 3.0, -3.0], dtype=torch.float32, device=flag_train.device
+    )
+    x = torch.cat((gate, linear)).to(dtype).view(1, -1)
+
+    y = flag_train.megatron.bias_swiglu_impl(x, None, clamp_value=2.0)
+    assert torch.isnan(y[0, 0])  # gate is NaN
+    assert torch.isnan(y[0, 1])  # linear is NaN
+
+    expected = bias_swiglu_ref(_reference(x), None, clamp_value=2.0)
+    _assert_close(y, expected, dtype, equal_nan=True)
 
 
 @pytest.mark.bias_swiglu_impl
