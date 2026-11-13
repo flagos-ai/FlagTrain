@@ -35,7 +35,7 @@ import triton.language as tl
 
 from flag_train.megatron.scaled_masked_softmax_cuda_forward import (
     _APEX_MAX_KEY_LEN,
-    _batches_per_block,
+    _check_megatron_selection,
     _mask_as_bool,
 )
 from flag_train.runtime import device as runtime_device
@@ -239,13 +239,14 @@ def scaled_masked_softmax_cuda_forward(inputs, mask, scale):
 
     Returns:
         Tensor: contiguous softmax results with the input's shape and dtype.
-        Masked keys and fully masked rows are exactly zero. An empty input,
-        including a zero key length, returns an empty tensor without a launch.
+        Masked keys and fully masked rows are exactly zero. An empty batch or
+        head axis returns an empty tensor without a launch.
 
     Raises:
-        RuntimeError: when Apex would reject the call (wrong rank or dtype,
-            invalid mask shape, non-positive query length, non-divisible query
-            length, or key length over 4096/16384).
+        RuntimeError: when Apex/Megatron would reject the call (wrong rank or
+            dtype, invalid mask shape, ``16 < sk <= 4096`` or the ``% 4``
+            selection gates, non-divisible query length, or key length over
+            4096/16384).
         TypeError: when ``scale`` is not a real number or one-element tensor.
     """
     logger.debug("TRAIN_ASCEND SCALED_MASKED_SOFTMAX_CUDA_FORWARD")
@@ -259,11 +260,7 @@ def scaled_masked_softmax_cuda_forward(inputs, mask, scale):
     if sk > _MAX_KEY_LEN:
         raise RuntimeError("key_seq_len >= 0 && key_seq_len <= 4096")
     scale = _check_scale(scale)
-    if sk == 0:
-        return torch.empty_like(inputs, memory_format=torch.contiguous_format)
-    batches_per_block = _batches_per_block(sk)
-    if sq % batches_per_block != 0:
-        raise RuntimeError("query_seq_len % batches_per_block == 0")
+    _check_megatron_selection(b, np_, sq, sk)
     if inputs.numel() == 0:
         return torch.empty_like(inputs, memory_format=torch.contiguous_format)
 

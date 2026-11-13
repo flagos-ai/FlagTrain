@@ -35,9 +35,9 @@ from flag_train.megatron.scaled_masked_softmax_cuda_forward import (
     _I64_THRESHOLD,
     _LOG2E,
     _MAX_KEY_LEN,
-    _batches_per_block,
     _check_input,
     _check_mask,
+    _check_megatron_selection,
     _check_scale,
     _mask_as_bool,
 )
@@ -167,11 +167,7 @@ def scaled_masked_softmax_cuda_forward(inputs, mask, scale):
     if sk > _MAX_KEY_LEN:
         raise RuntimeError("key_seq_len >= 0 && key_seq_len <= 4096")
     scale = _check_scale(scale)
-    if sk == 0:
-        return torch.empty_like(inputs, memory_format=torch.contiguous_format)
-    batches_per_block = _batches_per_block(sk)
-    if sq % batches_per_block != 0:
-        raise RuntimeError("query_seq_len % batches_per_block == 0")
+    _check_megatron_selection(b, np_, sq, sk)
     if inputs.numel() == 0:
         return torch.empty_like(inputs, memory_format=torch.contiguous_format)
 
