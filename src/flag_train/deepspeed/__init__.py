@@ -8,6 +8,7 @@ from .lamb import lamb
 from .loco_quantized_reduction import loco_quantized_reduction
 from .mixed_gemm import mixed_gemm
 from .mixed_moe_gemm import mixed_moe_gemm
+from .moe_gemm import moe_gemm
 from .multi_tensor_adam import multi_tensor_adam
 from .multi_tensor_lion import multi_tensor_lion
 from .packbits import packbits
@@ -22,6 +23,7 @@ __all__ = [
     "loco_quantized_reduction",
     "mixed_gemm",
     "mixed_moe_gemm",
+    "moe_gemm",
     "multi_tensor_adam",
     "multi_tensor_lion",
     "packbits",
