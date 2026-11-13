@@ -55,7 +55,12 @@ from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-_WEIGHTED_SQUARED_RELU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_WEIGHTED_SQUARED_RELU_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+)
 
 # Lanes per program.  This is the measured plateau, and also the largest tile
 # that fits the clamp's live buffers in UB.
@@ -93,6 +98,21 @@ def _check_input(tensor, name):
     if tensor.device.type != runtime_device.name:
         raise ValueError(
             f"{name} needs a {runtime_device.name} tensor, got {tensor.device.type}"
+        )
+
+
+def _check_weights(weights):
+    """Weights may be any real numeric dtype; the kernel/fallback casts to fp32."""
+    if weights.dtype.is_complex:
+        raise ValueError("weighted_squared_relu_impl weights must be real-valued")
+    if weights.device.type == "cpu":
+        raise ValueError(
+            "weighted_squared_relu_impl weights needs a device tensor, not one on the CPU"
+        )
+    if weights.device.type != runtime_device.name:
+        raise ValueError(
+            "weighted_squared_relu_impl weights needs a "
+            f"{runtime_device.name} tensor, got {weights.device.type}"
         )
 
 
@@ -359,19 +379,33 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
     num_tokens = math.prod(input.shape[:-1])
 
     if weights is not None:
-        _check_input(weights, "weighted_squared_relu_impl weights")
-        expected = (num_tokens, 1)
-        if tuple(weights.shape) != expected:
-            raise ValueError(
-                "weighted_squared_relu_impl weights must be broadcast per token, "
-                f"i.e. shape {expected} for an input of shape "
-                f"{tuple(input.shape)}, got {tuple(weights.shape)}"
-            )
+        _check_weights(weights)
         if weights.device != input.device:
             raise ValueError(
                 "weighted_squared_relu_impl weights must be on the same device as the "
                 f"input, got {weights.device} and {input.device}"
             )
+        # Megatron broadcasts the weights against the flattened activation.
+        # Keep the same accepted shapes; the Ascend kernel below is specialised
+        # for one weight per row, so column/elementwise weights use the plain
+        # torch composition (still the same arithmetic).
+        try:
+            broadcast_shape = torch.broadcast_shapes(
+                tuple(weights.shape), (num_tokens, hidden)
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                "weighted_squared_relu_impl weights must be broadcastable to "
+                f"{(num_tokens, hidden)} (the flattened activation shape), got "
+                f"{tuple(weights.shape)}"
+            ) from exc
+        if broadcast_shape != (num_tokens, hidden):
+            raise ValueError(
+                "weighted_squared_relu_impl weights must broadcast to exactly "
+                f"{(num_tokens, hidden)} (the flattened activation shape), got "
+                f"{tuple(weights.shape)} -> {tuple(broadcast_shape)}"
+            )
+        weights = torch.broadcast_to(weights, (num_tokens, hidden))
 
     if input.numel() == 0:
         # No launch when there is nothing to activate.
@@ -381,13 +415,23 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
         clamp_scale = float(clamp_scale)
 
     flat = input.contiguous().view(-1, hidden)
+    if weights is not None and weights.stride(1) != 0:
+        if clamp_scale is None:
+            act = torch.pow(torch.relu(flat.float()), 2)
+        else:
+            act = torch.pow(
+                clamp_scale * torch.tanh(torch.relu(flat.float()) / clamp_scale), 2
+            )
+        return (act * weights).to(input.dtype).view(input.shape)
+
     out = torch.empty_like(flat)
     if weights is None:
         _launch_clamped(flat, out, flat.numel(), clamp_scale)
     else:
+        # A broadcast dimension has stride 0; materialise the per-row scalar.
         _launch_weighted(
             flat,
-            weights.contiguous().view(-1),
+            weights[:, 0].contiguous(),
             out,
             hidden,
             num_tokens,

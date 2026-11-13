@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-import math
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -31,19 +31,69 @@ _NUM_WARPS = 4
 _BLOCK_SIZE = 1024
 _BLOCK_SIZE_16BIT = 2048
 
-_WEIGHTED_SQUARED_RELU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_WEIGHTED_SQUARED_RELU_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+)
 
 
-def _check_input(tensor, name):
-    if tensor.dtype not in _WEIGHTED_SQUARED_RELU_DTYPES:
-        wanted = " / ".join(str(dtype) for dtype in _WEIGHTED_SQUARED_RELU_DTYPES)
-        raise ValueError(f"{name} needs a {wanted} tensor, got {tensor.dtype}")
-    if tensor.device.type == "cpu":
-        raise ValueError(f"{name} needs a device tensor, not one on the CPU")
-    if tensor.device.type != runtime_device.name:
-        raise ValueError(
-            f"{name} needs a {runtime_device.name} tensor, got {tensor.device.type}"
-        )
+def _scalar_clamp(clamp_scale):
+    """Return ``clamp_scale`` as a float when the Triton path can use it."""
+    if isinstance(clamp_scale, (str, bytes)):
+        return None
+    if isinstance(clamp_scale, torch.Tensor):
+        if clamp_scale.numel() != 1:
+            return None
+        try:
+            return float(clamp_scale.item())
+        except (TypeError, ValueError):
+            return None
+    try:
+        return float(clamp_scale)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fast_weights(weights, shape, input):
+    """A broadcast view of ``weights`` when the Triton kernel can read it."""
+    if weights is None:
+        return None
+    if not isinstance(weights, torch.Tensor):
+        return None
+    if weights.device != input.device:
+        return None
+    if weights.is_complex() or weights.dtype not in _WEIGHTED_SQUARED_RELU_DTYPES:
+        return None
+    try:
+        broadcast_shape = torch.broadcast_shapes(tuple(weights.shape), shape)
+    except RuntimeError:
+        return None
+    if broadcast_shape != shape:
+        return None
+    try:
+        return torch.broadcast_to(weights, shape)
+    except (RuntimeError, NotImplementedError):
+        return None
+
+
+def _torch_relu(x):
+    """ReLU for the fallback, including Megatron's compiled bool behaviour."""
+    # Eager torch.relu rejects bool, but Megatron's @jit_fuser path accepts it
+    # (bool values are already non-negative, so ReLU is the identity).
+    return x if x.dtype == torch.bool else F.relu(x)
+
+
+def _torch_forward(flat, weights, clamp_scale):
+    """Megatron's forward composition, for inputs the Triton path cannot take."""
+    if weights is None:
+        t = torch.tanh(F.relu(flat.float()) / clamp_scale)
+        return torch.pow(clamp_scale * t, 2).to(flat.dtype)
+    if clamp_scale is None:
+        return (torch.pow(_torch_relu(flat), 2) * weights).to(flat.dtype)
+    t = torch.tanh(F.relu(flat.float()) / clamp_scale)
+    return (torch.pow(clamp_scale * t, 2) * weights).to(flat.dtype)
 
 
 @triton.jit
@@ -67,17 +117,21 @@ def _weighted_forward_kernel(
     weight_ptr,
     y_ptr,
     hidden,
+    weight_stride_row,
+    weight_stride_col,
     abs_scale,
     neg_two_over_scale,
     HAS_CLAMP: tl.constexpr,
     EVEN_HIDDEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """``y = squared_relu(x) * weight[row]``, optionally tanh soft-clamped.
+    """``y = squared_relu(x) * weight[row, col]``, optionally clamped.
 
-    One program handles a ``BLOCK_SIZE`` slice of one row, so the per-token
-    weight is a scalar load. The activation is computed in fp32, matching the
-    reference; the bounds check is dropped when ``hidden`` is block-aligned.
+    One program handles a ``BLOCK_SIZE`` slice of one row.  ``weight`` is a
+    broadcast view of shape ``(num_tokens, hidden)``: a broadcast dimension has
+    stride 0, so the same load covers per-token, per-column and scalar weights.
+    The activation is computed in fp32, matching the reference; the bounds check
+    is dropped when ``hidden`` is block-aligned.
     """
     row = tle.program_id(0)
     base = row * hidden
@@ -85,10 +139,17 @@ def _weighted_forward_kernel(
 
     if EVEN_HIDDEN:
         x = tl.load(x_ptr + base + columns).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + row * weight_stride_row + columns * weight_stride_col
+        ).to(tl.float32)
     else:
         mask = columns < hidden
         x = tl.load(x_ptr + base + columns, mask=mask, other=0.0).to(tl.float32)
-    weight = tl.load(weight_ptr + row).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + row * weight_stride_row + columns * weight_stride_col,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
 
     if HAS_CLAMP:
         act = _clamped_square(x, abs_scale, neg_two_over_scale)
@@ -136,7 +197,10 @@ def _clamped_forward_kernel(
 
 def _launch_config(dtype):
     """Block/warp pair measured fastest for ``dtype`` on this device."""
-    if runtime_device.vendor_name == "nvidia" and dtype != torch.float32:
+    if runtime_device.vendor_name == "nvidia" and dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ):
         return _BLOCK_SIZE_16BIT, _NUM_WARPS
     return _BLOCK_SIZE, _NUM_WARPS
 
@@ -150,7 +214,16 @@ def _clamp_operands(clamp_scale):
     return abs_scale, neg_two_over_scale
 
 
-def _launch_weighted(x, weights, out, hidden, num_tokens, clamp_scale):
+def _launch_weighted(
+    x,
+    weights,
+    out,
+    hidden,
+    num_tokens,
+    weight_stride_row,
+    weight_stride_col,
+    clamp_scale,
+):
     block_size, num_warps = _launch_config(x.dtype)
     if clamp_scale is None:
         abs_scale, neg_two_over_scale = 0.0, 0.0
@@ -163,6 +236,8 @@ def _launch_weighted(x, weights, out, hidden, num_tokens, clamp_scale):
             weights,
             out,
             hidden,
+            weight_stride_row,
+            weight_stride_col,
             abs_scale,
             neg_two_over_scale,
             HAS_CLAMP=clamp_scale is not None,
@@ -190,72 +265,92 @@ def _launch_clamped(x, out, n, clamp_scale):
 
 
 def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
-    """Squared-ReLU with optional per-token weights and optional tanh soft clamp.
+    """Squared-ReLU with optional weights and optional tanh soft clamp.
 
     Forward-only port of ``megatron.core.fusions.fused_weighted_squared_relu
-    .weighted_squared_relu_impl``. The input is viewed as ``(num_tokens, hidden)``,
-    so ``weights`` is one scalar per row. With ``clamp_scale`` the pre-activation
-    is ``clamp_scale * tanh(relu(x) / clamp_scale)``; both arguments ``None`` is
-    not a fused case (mirrors the reference's assertion).
+    .weighted_squared_relu_impl``.  The public contract is Megatron's: the input
+    is viewed as ``(num_tokens, hidden)`` with ``view`` (so layouts Megatron
+    cannot flatten fail here too), ``weights`` is ordinary torch broadcasting,
+    and the 3-D epilogue reshapes the result back to ``(S, B, hidden)``.
+    Contiguous float tensors on the active device take the Triton path; every
+    other valid input (CPU, integer/bool dtypes, complex weights, broadcast
+    weights that add leading dimensions, non-contiguous views) uses the torch
+    composition so the externally visible behaviour matches Megatron.
 
     Args:
-        input (Tensor): fp16, bf16 or fp32 tensor of shape ``(B, hidden)`` or
-            ``(S, B, hidden)`` on the active device. Non-contiguous input is
-            copied; empty input is returned without a launch.
-        weights (Tensor, optional): per-token weights of shape ``(B, 1)``
-            (``(S * B, 1)`` for a 3-D input), usually fp32.
+        input (Tensor): 2-D or 3-D tensor.  The Triton path handles
+            fp16/bf16/fp32/fp64 on the active device; other dtypes and CPU
+            inputs use the torch fallback.
+        weights (Tensor, optional): any tensor broadcastable to the flattened
+            activation, with Megatron's ordinary broadcasting rules.
         clamp_scale (float, optional): the tanh soft-clamp scale.
 
     Returns:
-        Tensor: same shape and dtype as ``input``.
+        Tensor: the forward result, with the same shape/dtype rules as Megatron.
+
+    Raises:
+        AssertionError: when both ``weights`` and ``clamp_scale`` are ``None``,
+            or when the input is not 2-D/3-D.
+        RuntimeError: when Megatron's ``view``/broadcast operations reject the
+            inputs; those errors are left to the corresponding torch call.
     """
     logger.debug("TRAIN WEIGHTED_SQUARED_RELU_IMPL")
     assert weights is not None or clamp_scale is not None, (
         "weighted_squared_relu_impl needs weights and/or clamp_scale; "
         "use squared_relu directly otherwise."
     )
-    assert input.dim() in (
+    ori_shape = input.shape
+    assert len(ori_shape) in (
         2,
         3,
     ), f"weighted_squared_relu_impl expects a 2-D or 3-D input, got {input.dim()}-D"
-    _check_input(input, "weighted_squared_relu_impl")
 
-    hidden = input.shape[-1]
-    num_tokens = math.prod(input.shape[:-1])
+    # Match Megatron's `input.view(-1, hidden)`: layouts that cannot be viewed
+    # raise the same error before either implementation does any arithmetic.
+    flat = input.view(-1, ori_shape[-1])
 
-    if weights is not None:
-        _check_input(weights, "weighted_squared_relu_impl weights")
-        expected = (num_tokens, 1)
-        if tuple(weights.shape) != expected:
-            raise ValueError(
-                "weighted_squared_relu_impl weights must be broadcast per token, "
-                f"i.e. shape {expected} for an input of shape "
-                f"{tuple(input.shape)}, got {tuple(weights.shape)}"
-            )
-        if weights.device != input.device:
-            raise ValueError(
-                "weighted_squared_relu_impl weights must be on the same device as the "
-                f"input, got {weights.device} and {input.device}"
-            )
+    clamp_value = None if clamp_scale is None else _scalar_clamp(clamp_scale)
+    if isinstance(clamp_scale, torch.Tensor) and clamp_scale.device != input.device:
+        # Let the torch fallback reproduce Megatron's device rules for a
+        # tensor-valued clamp scale instead of silently treating it as a host
+        # float on the Triton path.
+        clamp_value = None
+    fast_weights = _fast_weights(weights, flat.shape, input)
+    use_triton = (
+        flat.is_contiguous()
+        and flat.dtype in _WEIGHTED_SQUARED_RELU_DTYPES
+        and flat.device.type == runtime_device.name
+        and (weights is None or fast_weights is not None)
+        and (clamp_scale is None or clamp_value is not None)
+    )
 
-    if input.numel() == 0:
-        # No launch when there is nothing to activate.
-        return torch.empty_like(input)
+    if not use_triton:
+        output = _torch_forward(flat, weights, clamp_scale)
+        if len(ori_shape) == 2:
+            return output
+        return output.view(ori_shape[0], ori_shape[1], -1)
 
-    if clamp_scale is not None:
-        clamp_scale = float(clamp_scale)
+    num_tokens, hidden = flat.shape
+    if flat.numel() == 0:
+        out = torch.empty_like(flat)
+        if len(ori_shape) == 2:
+            return out
+        # Megatron still reaches its 3-D epilogue reshape, which fails when
+        # the flattened result has zero elements.
+        return out.view(ori_shape[0], ori_shape[1], -1)
 
-    flat = input.contiguous().view(-1, hidden)
     out = torch.empty_like(flat)
     if weights is None:
-        _launch_clamped(flat, out, flat.numel(), clamp_scale)
+        _launch_clamped(flat, out, flat.numel(), clamp_value)
     else:
         _launch_weighted(
             flat,
-            weights.contiguous().view(-1),
+            fast_weights,
             out,
             hidden,
             num_tokens,
-            clamp_scale,
+            fast_weights.stride(0),
+            fast_weights.stride(1),
+            clamp_value,
         )
-    return out.view(input.shape)
+    return out.view(ori_shape)
