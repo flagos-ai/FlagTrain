@@ -35,9 +35,9 @@ zeros rather than as the uniform distribution ``exp(0) / sk`` would give.
 The mask has shape ``[b or 1, 1, sq, sk]``; as in Apex it is read as raw
 bytes, and a byte equal to 1 marks a key that must not be attended to. A
 leading dimension of one is shared across the batch. Megatron only selects the
-fused kernels for ``16 < sk <= 4096``
-(``FusedScaleMaskSoftmax.is_kernel_available``); the same upper bound is
-enforced here.
+fused kernels for ``16 < sk <= 4096``, ``sq % 4 == 0``, ``sk % 4 == 0`` and
+``(b * np) % 4 == 0`` (``FusedScaleMaskSoftmax.is_kernel_available``); the same
+gates are enforced here.
 
 One program reduces one query position for ``ROWS`` attention heads: the heads
 of a query share their mask row, so loading it once per program is what keeps
@@ -152,6 +152,21 @@ def _batches_per_block(key_seq_len):
     batches_per_warp = 2 if next_power_of_two <= 128 else 1
     warps_per_block = _THREADS_PER_BLOCK // warp_size
     return warps_per_block * batches_per_warp
+
+
+def _check_megatron_selection(b, np_, sq, sk):
+    """The shape gates Megatron's ``is_kernel_available`` applies."""
+    if sk <= 16:
+        raise RuntimeError("16 < sk <= 4096")
+    if sq % 4 != 0:
+        raise RuntimeError("sq % 4 == 0")
+    if sk % 4 != 0:
+        raise RuntimeError("sk % 4 == 0")
+    if (b * np_) % 4 != 0:
+        raise RuntimeError("attn_batches % 4 == 0")
+    batches_per_block = _batches_per_block(sk)
+    if sq % batches_per_block != 0:
+        raise RuntimeError("query_seq_len % batches_per_block == 0")
 
 
 def _check_scale(scale):
@@ -339,13 +354,14 @@ def scaled_masked_softmax_cuda_forward(inputs, mask, scale):
     Returns:
         Tensor: contiguous softmax results with the input's shape and dtype.
         Masked keys, and every key of a row that masks all of them, are exactly
-        zero; every other row sums to one. An empty input, including a zero key
-        length, returns an empty tensor without a launch.
+        zero; every other row sums to one. An empty batch or head axis returns
+        an empty tensor without a launch.
 
     Raises:
-        RuntimeError: when Apex would reject the call (wrong rank or dtype,
-            invalid mask shape, non-positive query length, non-divisible query
-            length, or key length over 4096/16384).
+        RuntimeError: when Apex/Megatron would reject the call (wrong rank or
+            dtype, invalid mask shape, ``16 < sk <= 4096`` or the ``% 4``
+            selection gates, non-divisible query length, or key length over
+            4096/16384).
         TypeError: when ``scale`` is not a real number or one-element tensor.
     """
     logger.debug("TRAIN SCALED_MASKED_SOFTMAX_CUDA_FORWARD")
@@ -359,15 +375,10 @@ def scaled_masked_softmax_cuda_forward(inputs, mask, scale):
     if sk > _MAX_KEY_LEN:
         raise RuntimeError("key_seq_len >= 0 && key_seq_len <= 4096")
     scale = _check_scale(scale)
-    if sk == 0:
-        # Apex allocates the output and returns before launching when sk == 0.
-        return torch.empty_like(inputs, memory_format=torch.contiguous_format)
-    batches_per_block = _batches_per_block(sk)
-    if sq % batches_per_block != 0:
-        raise RuntimeError("query_seq_len % batches_per_block == 0")
+    _check_megatron_selection(b, np_, sq, sk)
     if inputs.numel() == 0:
-        # b == 0: Apex allocates an empty output and its zero-sized grid is a
-        # no-op, so the empty tensor is the observable result.
+        # A zero batch or head axis has an empty zero-sized grid, so the empty
+        # tensor is the observable result.
         return torch.empty_like(inputs, memory_format=torch.contiguous_format)
 
     # Apex reads the mask as bytes and masks the lanes whose byte is exactly 1.
