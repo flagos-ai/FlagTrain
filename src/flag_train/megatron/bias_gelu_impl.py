@@ -19,6 +19,7 @@ The output is a plain tensor: this operator does not propagate gradients.
 
 from contextlib import nullcontext
 
+import logging
 import torch
 import triton
 import triton.language as tl
@@ -27,6 +28,8 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry, tl_extra_shim
 from flag_train.utils import triton_lang_extension as tle
+
+logger = logging.getLogger(__name__)
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BLOCK_SIZE = 256
@@ -154,6 +157,7 @@ def bias_gelu_impl(input, bias):
     The result is contiguous, with the broadcast shape and operand dtype.
     Invalid types raise TypeError; invalid dtype, device or shapes raise ValueError.
     """
+    logger.debug("TRAIN BIAS_GELU_IMPL")
     metadata = []
     for name, tensor in (("input", input), ("bias", bias)):
         if not isinstance(tensor, torch.Tensor):
