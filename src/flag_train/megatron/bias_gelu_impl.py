@@ -17,9 +17,9 @@ Bias addition rounds to the operand dtype before FP32 activation arithmetic.
 The output is a plain tensor: this operator does not propagate gradients.
 """
 
+import logging
 from contextlib import nullcontext
 
-import logging
 import torch
 import triton
 import triton.language as tl
