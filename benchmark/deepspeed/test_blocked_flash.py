@@ -50,6 +50,8 @@ from flag_train.deepspeed.blocked_flash import (
     _ATOM_Q_START,
     _ATOM_TOTAL_EXTENT,
     _ATOM_UNUSED,
+    get_kv_block_size,
+    get_q_block_size,
 )
 
 from .. import base
@@ -193,11 +195,9 @@ _BLOCKED_FLASH_SHAPES = [
     (4096, 128, 64, 8),
 ]
 
-# The geometry for the tiers that do not constrain it. On the DeepSpeed tier the
-# KV block size is fixed by the baseline's kernel, so `_cache_geometry` returns
-# that instead of `_KV_BLOCK_SIZE` -- see there for why it is not negotiable.
-_Q_BLOCK_SIZE = 128
-_KV_BLOCK_SIZE = 64
+# Both tiers now use the fixed DeepSpeed geometry. On the DeepSpeed tier the
+# baseline's helper is authoritative; elsewhere the port's helper evaluates the
+# same table with the portable cc-8.0 fallback.
 _SOFTMAX_SCALE = 1.0
 
 
@@ -289,7 +289,7 @@ def _cache_geometry(head_size):
     """
     if _deepspeed_blocked_flash is not None:
         return _deepspeed_geometry(head_size)
-    return _Q_BLOCK_SIZE, _KV_BLOCK_SIZE
+    return get_q_block_size(head_size), get_kv_block_size(head_size)
 
 
 def blocked_flash_input_fn(shape, dtype, device):
@@ -324,9 +324,16 @@ def blocked_flash_input_fn(shape, dtype, device):
     atoms, kv_block_idx = build_blocked_flash_atoms(
         [(n_tokens, 0)], q_block_size, kv_block_size, device
     )
+    pointer_atoms = atoms.clone()
+    addresses = kv_block_idx.data_ptr() + 4 * atoms[:, int(_ATOM_BLOCK_OFFSET)].to(
+        torch.int64
+    )
+    pointer_atoms[:, 0:2] = addresses.view(torch.int32).reshape(-1, 2)
 
-    # The DeepSpeed baseline reads atoms carrying host pointers instead; built
-    # here, outside the timed region.
+    # Only the DeepSpeed baseline consumes these atoms: it stores its block
+    # list in pinned host memory. Build them when that baseline is available.
+    # The operator under test uses the device pointer list above on every
+    # backend.
     if _deepspeed_blocked_flash is not None:
         deepspeed_atoms, deepspeed_pinned = _deepspeed_atoms(
             [(n_tokens, 0)], q_block_size, kv_block_size, device
@@ -339,11 +346,10 @@ def blocked_flash_input_fn(shape, dtype, device):
         q,
         k_cache,
         v_cache,
-        atoms,
+        pointer_atoms,
         kv_block_idx,
         deepspeed_atoms,
         deepspeed_pinned,
-        q_block_size,
     )
 
 
@@ -352,18 +358,16 @@ def _baseline(
     q,
     k,
     v,
-    atoms,
-    kv_block_idx,
+    _pointer_atoms,
+    _kv_block_idx,
     deepspeed_atoms,
-    deepspeed_pinned,
-    q_block_size,
+    _deepspeed_pinned,
 ):
-    """DeepSpeed's blocked-flash kernel. See the module docstring.
+    """DeepSpeed's blocked-flash kernel.
 
-    ``q_block_size`` is the operator under test's to use; the baseline works its
-    own geometry out, and the DeepSpeed kernel wants a different KV block size
-    for the same head size. It is taken and ignored rather than left out so that
-    both ops are handed the same tuple.
+    The leading-underscore arguments belong to the other tier; the pinned host
+    block list must stay alive while the kernel reads the atoms that point into
+    it, which is why it is part of the shared input tuple.
     """
     # Same paged tensors as the operator under test -- this baseline reads the
     # cache the way ours does -- plus the atoms that carry host pointers.
@@ -381,25 +385,17 @@ def train_op(
     q,
     k,
     v,
-    atoms,
-    kv_block_idx,
-    deepspeed_atoms,
-    deepspeed_pinned,
-    q_block_size,
+    pointer_atoms,
+    _kv_block_idx,
+    _deepspeed_atoms,
+    _deepspeed_pinned,
 ):
-    """The operator under test.
+    """The operator under test: the public pointer-atom interface on every backend.
 
-    ``q_block_size`` comes from ``input_fn``, which built these atoms with it:
-    knowing the bound lets the operator skip a per-call device sync (~50 us on an
-    A100) that would otherwise be charged against the kernel, which at the small
-    shapes here is several times the kernel's own time. It is read from the tuple
-    rather than taken from the module constant because on the DeepSpeed tier the
-    geometry is the baseline's to choose, and the atoms agree with whichever one
-    ``input_fn`` used.
+    ``_kv_block_idx`` is the device block list the pointer atoms address, so it
+    must stay alive for the duration of the call.
     """
-    return blocked_flash(
-        out, q, k, v, atoms, kv_block_idx, _SOFTMAX_SCALE, q_block_size=q_block_size
-    )
+    return blocked_flash(out, q, k, v, pointer_atoms, _SOFTMAX_SCALE)
 
 
 @pytest.mark.blocked_flash
@@ -477,7 +473,6 @@ class RaggedBatchWrapper:
 
     def __init__(self, seq_params, kv_block_size):
         self._seq_params = list(seq_params)
-        self._kv_block_size = kv_block_size
         self.current_sequences = len(self._seq_params)
         self.current_tokens = sum(q_len for q_len, _ in self._seq_params)
 
