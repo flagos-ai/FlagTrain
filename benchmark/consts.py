@@ -14,6 +14,7 @@
 
 import itertools
 import os
+from collections import Counter
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from typing import List, Optional, Tuple
@@ -311,7 +312,10 @@ def _all_scalars_from_record(shape_detail):
             stack[:0] = list(item)
         elif isinstance(item, bool):
             scalars.append(repr(item))
-        elif isinstance(item, (int, float, str)):
+        elif isinstance(item, int):
+            # IntEnum (e.g. QuantizationType) compares by its integer value.
+            scalars.append(repr(int(item)))
+        elif isinstance(item, (float, str)):
             scalars.append(repr(item))
     return tuple(sorted(scalars))
 
@@ -401,8 +405,9 @@ def _match_by_signature(base_data, op_name, dtype, shape_detail, variant=None):
             continue
         base_scalars = _base_scalars_from_config(rec.get("config"))
         # The baseline's scalars are normally a subset of the record's (which
-        # may carry extra ints such as strides).
-        if base_scalars and set(base_scalars) <= set(rec_scalars):
+        # may carry extra ints such as strides). Compare as multisets so one
+        # repeated value cannot stand in for two distinct baseline scalars.
+        if base_scalars and not (Counter(base_scalars) - Counter(rec_scalars)):
             return rec, key
     return None, None
 
