@@ -40,10 +40,8 @@ _BLOCK_SIZE = 1024
 _MIN_BLOCK_SIZE = 16
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# Provided by the platform layer. ``tl.sigmoid`` is a core Triton builtin;
 # ``tl_extra_shim.tanh`` maps to libdevice and falls back to an exp-based
 # form on backends without it.
-_sigmoid = tl.sigmoid
 _tanh = tl_extra_shim.tanh
 
 
@@ -56,54 +54,55 @@ _GELU_SQRT_2_OVER_PI = tl.constexpr(0.79788456)
 _GELU_COEFF = tl.constexpr(0.044715)
 
 
-def _check_input(tensor, name):
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} needs a tensor, got {type(tensor).__name__}")
-    if tensor.dtype not in _DTYPES:
-        wanted = " / ".join(str(dtype) for dtype in _DTYPES)
-        raise ValueError(f"{name} needs a {wanted} tensor, got {tensor.dtype}")
-    if tensor.device.type == "cpu":
-        raise ValueError(f"{name} needs a device tensor, not one on the CPU")
-    if tensor.device.type != runtime_device.name:
-        raise ValueError(
-            f"{name} needs a {runtime_device.name} tensor, got {tensor.device.type}"
-        )
-
-
 def _prepare_bias(bias, flat):
-    """Return a kernel bias tensor and a mode.
-
-    Mode vector is one row of ``hidden`` values shared by every token, which
-    is the ``bias`` produced by ``skip_bias_add``. Mode full is a different
-    bias per element and is only used when the tensor really depends on the
-    token index.
-    """
+    """Prepare a bias for the validated Triton fast path."""
     if bias is None:
         return None, _BIAS_NONE
-    _check_input(bias, "bias_geglu bias")
-    if bias.device != flat.device:
-        raise ValueError(f"bias_geglu bias is on {bias.device}, expected {flat.device}")
-    if bias.dtype != flat.dtype:
-        raise ValueError(
-            "bias_geglu bias must have the input dtype, got "
-            f"{bias.dtype} for {flat.dtype}"
-        )
 
     n_rows, hidden = flat.shape
-    flat_shape = (n_rows, hidden)
-    try:
-        expanded = torch.broadcast_to(bias, flat_shape)
-    except RuntimeError:
-        raise ValueError(
-            "bias_geglu bias must broadcast with the flattened input "
-            f"{flat_shape}, got {tuple(bias.shape)}"
-        ) from None
+    expanded = torch.broadcast_to(bias, (n_rows, hidden))
     if n_rows == 0 or hidden == 0:
         return bias, _BIAS_VECTOR
     if expanded.stride(0) == 0:
-        # Same values on every token. Copy one row, not the whole broadcast.
+        # All tokens share one row; do not materialize the full broadcast.
         return expanded[0].contiguous(), _BIAS_VECTOR
     return expanded.contiguous(), _BIAS_FULL
+
+
+def _eager_forward(flat, bias):
+    """Match Megatron's PyTorch forward for cases outside the Triton domain."""
+    y = flat if bias is None else flat + bias
+    gate, linear = torch.chunk(y, 2, dim=-1)
+    return (
+        gate
+        * 0.5
+        * (1.0 + torch.tanh(0.79788456 * gate * (1 + 0.044715 * gate * gate)))
+    ) * linear
+
+
+def _can_use_triton(flat, bias):
+    """Return whether the input belongs to the optimized Triton domain."""
+    if flat.device.type != runtime_device.name:
+        return False
+    if flat.dtype not in _DTYPES:
+        return False
+    if not flat.is_contiguous():
+        return False
+    if flat.shape[-1] % 2 != 0:
+        return False
+
+    if bias is None:
+        return True
+    if not isinstance(bias, torch.Tensor):
+        return False
+    if bias.device != flat.device or bias.dtype != flat.dtype:
+        return False
+
+    try:
+        torch.broadcast_to(bias, flat.shape)
+    except RuntimeError:
+        return False
+    return True
 
 
 @triton.jit
@@ -161,20 +160,10 @@ def _launch_config(n_cols):
 
 
 def _flatten_input(x):
-    _check_input(x, "bias_geglu")
-    if x.ndim not in (2, 3):
-        raise ValueError(
-            f"bias_geglu input must have rank 2 or 3, got rank {x.ndim} "
-            f"shape {tuple(x.shape)}"
-        )
-    hidden = x.shape[-1]
-    if hidden % 2 != 0:
-        raise ValueError(
-            f"bias_geglu input's last dimension must be even, got {hidden}"
-        )
-    flat = x.contiguous().view(-1, hidden)
-    out_shape = (*x.shape[:-1], hidden // 2)
-    return flat, out_shape
+    """Use Megatron's rank check and view semantics exactly."""
+    ori_shape = x.shape
+    assert len(ori_shape) in [2, 3]
+    return x.view(-1, ori_shape[-1]), ori_shape
 
 
 def _forward(flat, bias):
@@ -203,26 +192,21 @@ def _forward(flat, bias):
 
 
 def bias_geglu_impl(input, bias):
-    """Bias plus GeGLU.
+    """Apply Megatron-compatible bias + GEGLU forward.
 
-    Forward only: the backward is a separate operator.
-
-    Args:
-        input (Tensor): rank-2 or rank-3 fp16, bf16 or fp32 tensor on the
-            active device. The last dimension is ``[gate | linear]`` and must
-            be even. A non-contiguous input is copied.
-        bias (Tensor or None): added to ``input`` before the activation.
-            ``None`` skips the add. A bias of shape ``[hidden]`` is the
-            ``skip_bias_add`` case. It must have the same dtype as ``input``.
-
-    Returns:
-        Tensor: same rank and dtype as ``input``, with the last dimension halved.
+    Contiguous active-device fp16/bf16/fp32 inputs use the fused Triton
+    kernel. Other inputs use the equivalent PyTorch formula so that dtype
+    promotion, broadcasting, device behavior, and exceptions stay aligned
+    with the native implementation.
     """
     logger.debug("TRAIN BIAS_GEGLU_IMPL")
-    if bias is not None and not isinstance(bias, torch.Tensor):
-        raise TypeError(
-            f"bias_geglu bias needs a tensor or None, got {type(bias).__name__}"
-        )
+    flat, ori_shape = _flatten_input(input)
 
-    flat, out_shape = _flatten_input(input)
-    return _forward(flat, bias).view(out_shape)
+    if _can_use_triton(flat, bias):
+        output = _forward(flat, bias)
+    else:
+        output = _eager_forward(flat, bias)
+
+    return (
+        output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+    )

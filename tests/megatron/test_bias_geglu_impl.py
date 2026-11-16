@@ -22,7 +22,9 @@ comparison is against a higher-precision CPU result. Tolerances are
 ``train_assert_close``'s defaults.
 
 Only the forward output is checked: the backward is a separate operator.
-``bias`` must have the same dtype as ``input``.
+The Triton fast path is supplemented by an eager fallback so CPU inputs,
+additional dtypes, scalar or mixed-dtype bias, broadcasting, and non-
+contiguous inputs follow Megatron's native forward behavior.
 """
 
 import pytest
@@ -123,6 +125,40 @@ def _assert_close(actual, expected, dtype):
     utils.train_assert_close(utils.to_reference(actual), expected, dtype)
 
 
+def _native_public_ref(x, bias):
+    """Megatron's public forward flow using the eager mathematical formula."""
+    ori_shape = x.shape
+    assert len(ori_shape) in [2, 3]
+    flat = x.view(-1, ori_shape[-1])
+    output = bias_geglu_ref(flat, bias)
+    return (
+        output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+    )
+
+
+def _assert_native_equivalence(x, bias=None):
+    """Compare values, metadata, layout, errors, and input immutability."""
+    x_before = x.clone()
+    bias_before = bias.clone() if isinstance(bias, torch.Tensor) else None
+
+    try:
+        expected = _native_public_ref(x, bias)
+    except Exception as expected_error:
+        with pytest.raises(type(expected_error)):
+            flag_train.megatron.bias_geglu_impl(x, bias)
+    else:
+        actual = flag_train.megatron.bias_geglu_impl(x, bias)
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        assert actual.device == expected.device
+        assert actual.stride() == expected.stride()
+        _assert_close(actual, expected, expected.dtype)
+
+    assert torch.equal(x, x_before)
+    if isinstance(bias, torch.Tensor):
+        assert torch.equal(bias, bias_before)
+
+
 def _expected_output(x, bias):
     """Use Megatron-LM when available, otherwise use the eager formula.
 
@@ -140,6 +176,12 @@ def _expected_output(x, bias):
 
 
 def _check_bias_geglu(x, bias):
+    # Every empty rank-3 input follows Megatron's ambiguous view(..., -1)
+    # behavior, regardless of which leading dimension is zero.
+    if x.ndim == 3 and x.numel() == 0:
+        _assert_native_equivalence(x, bias)
+        return
+
     dtype = x.dtype
     y = flag_train.megatron.bias_geglu_impl(x, bias)
     assert y.shape[-1] * 2 == x.shape[-1]
@@ -202,47 +244,88 @@ def test_bias_geglu_impl_noncontiguous(dtype):
     bias = torch.randn((64,), dtype=dtype, device=flag_train.device)[::2]
     assert bias.shape == (32,)
     assert not bias.is_contiguous()
-    _check_bias_geglu(x, bias)
+
+    # Compare against native same-dtype behavior, including output layout.
+    _assert_native_equivalence(x, bias)
 
     cube = torch.randn((4, 8, 16), dtype=dtype, device=flag_train.device)
     transposed = cube.transpose(0, 2)
     assert not transposed.is_contiguous()
     assert transposed.shape[-1] % 2 == 0
-    _check_bias_geglu(transposed, None)
+
+    # Native Megatron rejects this layout at input.view(-1, hidden).
+    _assert_native_equivalence(transposed, None)
 
 
 @pytest.mark.bias_geglu_impl
-def test_bias_geglu_impl_rejects_bad_arguments():
+def test_bias_geglu_impl_matches_native_errors():
     device = flag_train.device
     x = torch.randn((4, 8), device=device)
-    with pytest.raises(ValueError, match="rank 2 or 3"):
-        flag_train.megatron.bias_geglu_impl(torch.randn((8,), device=device), None)
-    with pytest.raises(ValueError, match="rank 2 or 3"):
-        flag_train.megatron.bias_geglu_impl(
-            torch.randn((1, 1, 2, 4), device=device), None
-        )
-    with pytest.raises(ValueError, match="even"):
-        flag_train.megatron.bias_geglu_impl(torch.randn((4, 7), device=device), None)
-    with pytest.raises(ValueError, match="CPU"):
-        flag_train.megatron.bias_geglu_impl(torch.randn((4, 8)), None)
-    with pytest.raises(ValueError, match="broadcast"):
-        flag_train.megatron.bias_geglu_impl(x, torch.randn((3,), device=device))
-    # An empty input must not skip the bias checks.
-    with pytest.raises(ValueError, match="broadcast"):
-        flag_train.megatron.bias_geglu_impl(
-            torch.empty((0, 8), device=device), torch.randn((3,), device=device)
-        )
+
+    # Megatron uses an assertion for the public rank check.
+    _assert_native_equivalence(torch.randn((8,), device=device), None)
+    _assert_native_equivalence(torch.randn((1, 1, 2, 4), device=device), None)
+
+    # Invalid broadcasts are rejected by ordinary PyTorch addition.
+    _assert_native_equivalence(x, torch.randn((3,), device=device))
+    _assert_native_equivalence(
+        torch.empty((0, 8), device=device),
+        torch.randn((3,), device=device),
+    )
 
 
 @pytest.mark.bias_geglu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_bias_geglu_impl_requires_matching_bias_dtype(dtype):
-    """The kernel computes the add in fp32; a mixed-dtype bias would silently
-    change the promoted dtype eager PyTorch produces, so it is rejected."""
+def test_bias_geglu_impl_bias_dtype_promotion(dtype):
+    """Mixed-dtype bias follows ordinary PyTorch type promotion."""
     device = flag_train.device
     other = torch.float32 if dtype != torch.float32 else torch.float16
     x = torch.randn((4, 8), dtype=dtype, device=device)
-    with pytest.raises(ValueError, match="input dtype"):
-        flag_train.megatron.bias_geglu_impl(
-            x, torch.randn((8,), dtype=other, device=device)
-        )
+    bias = torch.randn((8,), dtype=other, device=device)
+    _assert_native_equivalence(x, bias)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_native_cpu_and_additional_dtypes():
+    """CPU and non-Triton dtypes follow the native eager behavior."""
+    for device in ("cpu", flag_train.device):
+        for dtype in (torch.float64, torch.int32, torch.bool, torch.complex64):
+            if dtype == torch.bool:
+                x = torch.rand((4, 8), device=device) > 0.5
+            else:
+                x = torch.randn((4, 8), device=device).to(dtype)
+            _assert_native_equivalence(x, None)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_native_leading_broadcast():
+    x = torch.randn((4, 8), device=flag_train.device)
+    bias = torch.randn((1, 1, 8), device=flag_train.device)
+    _assert_native_equivalence(x, bias)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_native_scalar_bias():
+    x = torch.randn((4, 8), dtype=torch.float16, device=flag_train.device)
+    _assert_native_equivalence(x, 0.5)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_native_odd_last_dimension():
+    x = torch.randn((4, 7), device=flag_train.device)
+    _assert_native_equivalence(x, None)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_native_empty_3d_error():
+    x = torch.empty((2, 0, 8), device=flag_train.device)
+    _assert_native_equivalence(x, None)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_native_bias_device_error():
+    if flag_train.device == "cpu":
+        pytest.skip("requires distinct CPU and active devices")
+    x = torch.randn((4, 8), device=flag_train.device)
+    bias = torch.randn((8,), device="cpu")
+    _assert_native_equivalence(x, bias)
