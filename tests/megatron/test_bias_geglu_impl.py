@@ -152,7 +152,7 @@ def _assert_native_equivalence(x, bias=None):
         assert actual.dtype == expected.dtype
         assert actual.device == expected.device
         assert actual.stride() == expected.stride()
-        _assert_close(actual, expected, expected.dtype)
+        _assert_close(actual, utils.to_reference(expected), expected.dtype)
 
     assert torch.equal(x, x_before)
     if isinstance(bias, torch.Tensor):
