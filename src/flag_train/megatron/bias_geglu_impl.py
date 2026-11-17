@@ -69,40 +69,32 @@ def _prepare_bias(bias, flat):
     return expanded.contiguous(), _BIAS_FULL
 
 
-def _eager_forward(flat, bias):
-    """Match Megatron's PyTorch forward for cases outside the Triton domain."""
-    y = flat if bias is None else flat + bias
-    gate, linear = torch.chunk(y, 2, dim=-1)
-    return (
-        gate
-        * 0.5
-        * (1.0 + torch.tanh(0.79788456 * gate * (1 + 0.044715 * gate * gate)))
-    ) * linear
-
-
-def _can_use_triton(flat, bias):
-    """Return whether the input belongs to the optimized Triton domain."""
+def _validate_inputs(flat, bias):
+    """Validate operands supported by the fused Triton forward kernel."""
     if flat.device.type != runtime_device.name:
-        return False
+        raise ValueError("bias_geglu input must be on the active device")
     if flat.dtype not in _DTYPES:
-        return False
+        raise ValueError("bias_geglu input must have dtype fp16, bf16, or fp32")
     if not flat.is_contiguous():
-        return False
+        raise ValueError("bias_geglu input must be contiguous")
     if flat.shape[-1] % 2 != 0:
-        return False
+        raise ValueError("bias_geglu input's last dimension must be even")
 
     if bias is None:
-        return True
+        return
     if not isinstance(bias, torch.Tensor):
-        return False
-    if bias.device != flat.device or bias.dtype != flat.dtype:
-        return False
+        raise TypeError("bias_geglu bias must be a Tensor or None")
+    if bias.device != flat.device:
+        raise ValueError("bias_geglu bias must be on the input device")
+    if bias.dtype != flat.dtype:
+        raise ValueError("bias_geglu bias must have the input dtype")
 
     try:
         torch.broadcast_to(bias, flat.shape)
-    except RuntimeError:
-        return False
-    return True
+    except RuntimeError as exc:
+        raise ValueError(
+            "bias_geglu bias must be broadcastable to the flattened input"
+        ) from exc
 
 
 @triton.jit
@@ -194,18 +186,15 @@ def _forward(flat, bias):
 def bias_geglu_impl(input, bias):
     """Apply Megatron-compatible bias + GEGLU forward.
 
-    Contiguous active-device fp16/bf16/fp32 inputs use the fused Triton
-    kernel. Other inputs use the equivalent PyTorch formula so that dtype
-    promotion, broadcasting, device behavior, and exceptions stay aligned
-    with the native implementation.
+    The input must be a contiguous active-device fp16/bf16/fp32 tensor.
+    Bias must be None or a same-device, same-dtype tensor broadcastable to
+    the flattened input. All activation arithmetic runs in the Triton kernel.
     """
     logger.debug("TRAIN BIAS_GEGLU_IMPL")
     flat, ori_shape = _flatten_input(input)
 
-    if _can_use_triton(flat, bias):
-        output = _forward(flat, bias)
-    else:
-        output = _eager_forward(flat, bias)
+    _validate_inputs(flat, bias)
+    output = _forward(flat, bias)
 
     return (
         output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
