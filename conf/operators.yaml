@@ -339,6 +339,20 @@ ops:
   - MoE
   stages:
   - beta: '0.0.0'
+- id: multi_modal_rotary_embedding
+  description: Generates non-interleaved multimodal rotary frequencies with optional sequence interpolation.
+  for:
+  - MultimodalRotaryEmbedding
+  labels:
+  - megatron
+  - attention
+  from:
+  - megatron
+  kind:
+  - Attention
+  source: megatron.core.models.common.embeddings.rotary_pos_embedding
+  stages:
+  - beta: '0.0.0'
 - id: multi_tensor_adam
   description: Fused Adam/AdamW optimizer update over multiple parameter tensors.
   for:
