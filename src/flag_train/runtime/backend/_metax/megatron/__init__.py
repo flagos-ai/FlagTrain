@@ -24,4 +24,8 @@ To specialise an operator, define it under this package, re-export it here
 overrides.
 """
 
-__all__ = []
+from .weighted_swiglu_funciton import weighted_swiglu_funciton
+
+__all__ = [
+    "weighted_swiglu_funciton",
+]
