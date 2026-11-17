@@ -35,7 +35,7 @@ def make_inputs(shape, dtype, device, scale=LOSS_SCALE):
     )
 
 
-class _Reference(torch.autograd.Function):
+class _MTPLossAutoScalerReference(torch.autograd.Function):
     @staticmethod
     def forward(ctx, output, mtp_loss, loss_scale):
         ctx.save_for_backward(mtp_loss)
@@ -50,4 +50,4 @@ class _Reference(torch.autograd.Function):
 
 
 def reference(output, mtp_loss, loss_scale):
-    return _Reference.apply(output, mtp_loss, loss_scale)
+    return _MTPLossAutoScalerReference.apply(output, mtp_loss, loss_scale)
