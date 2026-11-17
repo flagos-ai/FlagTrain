@@ -51,17 +51,3 @@ class _Reference(torch.autograd.Function):
 
 def reference(output, mtp_loss, loss_scale):
     return _Reference.apply(output, mtp_loss, loss_scale)
-
-
-class _SmokeCandidate(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, output, mtp_loss, loss_scale):
-        ctx.save_for_backward(mtp_loss)
-        ctx.loss_scale = loss_scale
-        return output.view_as(output)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (mtp_loss,) = ctx.saved_tensors
-        grad_mtp_loss = torch.empty_like(mtp_loss).copy_(ctx.loss_scale)
-        return grad_output, grad_mtp_loss, None
