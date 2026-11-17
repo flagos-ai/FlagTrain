@@ -23,9 +23,8 @@ are used, because they fail differently:
 * DeepSpeed's ``BlockedFlashAttn`` -- the kernel this port replaces, checked on
   the same paged cache and atoms when the compiled op is available.
 
-The DeepSpeed oracle and atom-builder plumbing used here are CUDA-only, so the
-file skips on other backends; the operator itself is also implemented by the
-vendor overrides.
+The DeepSpeed oracle is CUDA-only and is skipped on other backends; the torch
+reference and the operator's own output checks run on every backend.
 """
 
 import importlib
@@ -40,14 +39,6 @@ from flag_train.deepspeed.blocked_flash import get_kv_block_size, get_q_block_si
 
 from .. import accuracy_utils as utils
 from ..conftest import TO_CPU
-
-pytestmark = [
-    pytest.mark.blocked_flash,
-    pytest.mark.skipif(
-        flag_train.vendor_name != "nvidia",
-        reason="the DeepSpeed-compatible blocked_flash surface is NVIDIA-only",
-    ),
-]
 
 # The external reference's atol. The local testing helper supplies the
 # dtype-wise rtol and the CPU fallback.
@@ -257,6 +248,7 @@ def _run_case(
     dtype=torch.float16,
     permute_blocks=False,
     out_pad_columns=0,
+    v_row_padding=0,
 ):
     device = flag_train.device
     torch.manual_seed(0)
@@ -324,6 +316,18 @@ def _run_case(
         v_cache = v_cache[permutation].contiguous()
         block_ids = torch.argsort(permutation).to(torch.int32)
 
+    if v_row_padding:
+        row_stride = n_heads_kv * head_size + v_row_padding
+        storage = torch.zeros(
+            n_blocks * kv_block_size * row_stride, dtype=dtype, device=device
+        )
+        padded_v = storage.as_strided(
+            v_cache.shape,
+            (kv_block_size * row_stride, row_stride, head_size, 1),
+        )
+        padded_v.copy_(v_cache)
+        v_cache = padded_v
+
     offset_atoms, pointer_atoms, block_ids = build_atoms(
         seq_params, q_block_size, kv_block_size, device, block_ids=block_ids
     )
@@ -390,6 +394,7 @@ def _run_case(
 
 
 @pytest.mark.parametrize("n_tokens", [1, 2, 33, 65, 128, 256, 2037])
+@pytest.mark.blocked_flash
 def test_single_prompt(n_tokens):
     _run_case([(n_tokens, 0)])
 
@@ -397,6 +402,7 @@ def test_single_prompt(n_tokens):
 @pytest.mark.parametrize(
     "prompt_lengths", [(128, 128), (192, 38), (514, 713), (83, 312, 610)]
 )
+@pytest.mark.blocked_flash
 def test_multiple_prompts(prompt_lengths):
     _run_case([(length, 0) for length in prompt_lengths])
 
@@ -404,21 +410,25 @@ def test_multiple_prompts(prompt_lengths):
 @pytest.mark.parametrize(
     "seq_params", [(1, 34), (43, 40), (1, 144), (64, 128), (332, 628)]
 )
+@pytest.mark.blocked_flash
 def test_continuation(seq_params):
     _run_case([seq_params], n_heads_q=32, n_heads_kv=32)
 
 
 @pytest.mark.parametrize("head_size", [64, 128, 256], ids=["64", "128", "256"])
+@pytest.mark.blocked_flash
 def test_head_size(head_size):
     _run_case([(128, 128), (192, 38), (1, 814)], head_size=head_size)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.blocked_flash
 def test_dtype(dtype):
     _run_case([(128, 128), (192, 38), (1, 814)], dtype=dtype)
 
 
 @pytest.mark.parametrize("head_config", [(32, 8), (64, 16), (40, 8), (16, 1)])
+@pytest.mark.blocked_flash
 def test_gqa(head_config):
     n_heads_q, n_heads_kv = head_config
     _run_case(
@@ -429,6 +439,7 @@ def test_gqa(head_config):
     )
 
 
+@pytest.mark.blocked_flash
 def test_fully_composed():
     _run_case([(332, 628), (1, 718), (1, 323), (180, 5), (224, 0)])
 
@@ -438,19 +449,28 @@ def test_fully_composed():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.blocked_flash
 def test_kv_blocks_need_not_be_contiguous():
     _run_case([(300, 0), (1, 128), (128, 256)], permute_blocks=True)
 
 
+@pytest.mark.blocked_flash
 def test_out_may_be_a_view_with_a_wider_row_stride():
     _run_case([(300, 0), (1, 128)], out_pad_columns=256)
 
 
+@pytest.mark.blocked_flash
+def test_value_row_stride_is_honored():
+    _run_case([(257, 31), (128, 128)], v_row_padding=64)
+
+
 @pytest.mark.parametrize("scale", [1.0, 0.125], ids=["unit", "1/sqrt(d)"])
+@pytest.mark.blocked_flash
 def test_softmax_scale_is_applied(scale):
     _run_case([(128, 128), (192, 38)], softmax_scale=scale)
 
 
+@pytest.mark.blocked_flash
 def test_many_uneven_sequences():
     lengths = [1, 2, 63, 64, 65, 127, 128, 129, 200, 257, 300, 511, 512, 700, 1000, 3]
     _run_case([(length, 0) for length in lengths])
@@ -487,6 +507,7 @@ def _single_inputs(n_tokens=128, head_size=_HEAD_SIZE, dtype=torch.float16):
     return q, k, v, offset_atoms, pointer_atoms, block_ids
 
 
+@pytest.mark.blocked_flash
 def test_output_is_overwritten_not_accumulated():
     q, k, v, _, atoms, _ = _single_inputs()
     out = torch.zeros_like(q)
@@ -499,6 +520,7 @@ def test_output_is_overwritten_not_accumulated():
     _assert_equal(out, first)
 
 
+@pytest.mark.blocked_flash
 def test_atom_order_does_not_matter():
     q, k, v, _, atoms, _ = _single_inputs()
     out = torch.zeros_like(q)
@@ -511,6 +533,7 @@ def test_atom_order_does_not_matter():
     _assert_equal(shuffled, reference)
 
 
+@pytest.mark.blocked_flash
 def test_large_logits_stay_finite():
     q, k, v, _, atoms, _ = _single_inputs(n_tokens=256)
     q = q * 30.0
@@ -527,6 +550,11 @@ def test_large_logits_stay_finite():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    flag_train.vendor_name != "nvidia",
+    reason="pinned host atom pointers are a CUDA/UVA path",
+)
+@pytest.mark.blocked_flash
 def test_pinned_host_block_list():
     head_size = 128  # two KV blocks, so the pinned list is walked past its first entry
     q, k, v, _, device_atoms, block_ids = _single_inputs(head_size=head_size)
@@ -548,6 +576,7 @@ def test_pinned_host_block_list():
     _assert_equal(device_out, pinned_out)
 
 
+@pytest.mark.blocked_flash
 def test_infers_head_size_and_dtype():
     q, k, v, _, atoms, _ = _single_inputs(head_size=128)
     inferred = torch.zeros_like(q)
@@ -567,8 +596,13 @@ def test_infers_head_size_and_dtype():
     _assert_equal(inferred, explicit)
 
 
+@pytest.mark.skipif(
+    flag_train.vendor_name != "nvidia",
+    reason="DeepSpeed's geometry table is CUDA-specific",
+)
+@pytest.mark.blocked_flash
 def test_geometry_matches_deepspeed():
-    module = importlib.import_module(
+    module = pytest.importorskip(
         "deepspeed.inference.v2.kernels.ragged_ops.blocked_flash.blocked_flash"
     )
     for head_size in range(8, 257, 8):
@@ -586,15 +620,17 @@ def test_geometry_matches_deepspeed():
         (64, torch.float16, {"dtype": torch.bfloat16}, "does not match"),
     ],
 )
+@pytest.mark.blocked_flash
 def test_argument_validation(head_size, tensor_dtype, kwargs, message):
     q, k, v, _, atoms, _ = _single_inputs(head_size=head_size, dtype=tensor_dtype)
     with pytest.raises(ValueError, match=message):
         blocked_flash(torch.zeros_like(q), q, k, v, atoms, 1.0, **kwargs)
 
 
+@pytest.mark.blocked_flash
 def test_rejects_cpu_tensors():
     q, k, v, _, atoms, _ = _single_inputs()
-    with pytest.raises(RuntimeError, match="CUDA"):
+    with pytest.raises((RuntimeError, ValueError), match="device"):
         blocked_flash(
             torch.zeros_like(q).cpu(),
             q.cpu(),
@@ -605,6 +641,7 @@ def test_rejects_cpu_tensors():
         )
 
 
+@pytest.mark.blocked_flash
 def test_only_blocked_flash_is_public():
     from flag_train import deepspeed
 

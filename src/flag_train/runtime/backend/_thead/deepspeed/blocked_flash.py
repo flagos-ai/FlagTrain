@@ -59,6 +59,7 @@ def _blocked_flash_fwd_body(
     q_row_stride,
     o_row_stride,
     k_row_stride,
+    v_row_stride,
     h_h_k_ratio,
     n_heads_q,
     KV_BLOCK_SIZE: tl.constexpr,
@@ -74,9 +75,11 @@ def _blocked_flash_fwd_body(
     # --- atom metadata -----------------------------------------------------
     atom_base = atoms_ptr + atom * _ATOM_STRIDE
     # Slots [0:2] are the 64-bit address of the sequence's block-id list.
-    block_ptr = tl.load(atoms_ptr.to(tl.pointer_type(tl.int64)) + atom * 4).to(
-        tl.pointer_type(tl.int32)
-    )
+    # Assemble it from two int32 loads: the tensor only guarantees int32
+    # alignment, so an int64 load would fault on a 4-byte-offset view.
+    ptr_lo = tl.load(atom_base).to(tl.uint32).to(tl.uint64)
+    ptr_hi = tl.load(atom_base + 1).to(tl.uint32).to(tl.uint64)
+    block_ptr = (ptr_lo | (ptr_hi << 32)).to(tl.pointer_type(tl.int32))
     q_start = tl.load(atom_base + _ATOM_Q_START)
     q_len = tl.load(atom_base + _ATOM_Q_LEN)
     kv_blocks = tl.load(atom_base + _ATOM_KV_BLOCKS)
@@ -109,12 +112,13 @@ def _blocked_flash_fwd_body(
         b = t // tiles_per_block
         t0 = (t % tiles_per_block) * BLOCK_N
         block = tl.load(block_ptr + b)
-        block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        k_block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        v_block_row_base = block * v_row_stride * KV_BLOCK_SIZE
         offs_n = t0 + tl.arange(0, BLOCK_N)
 
         k_ptrs = (
             k_ptr
-            + block_row_base
+            + k_block_row_base
             + offs_n[:, None] * k_row_stride
             + hk * HEAD_SIZE
             + offs_d[None, :]
@@ -129,8 +133,8 @@ def _blocked_flash_fwd_body(
 
         v_ptrs = (
             v_ptr
-            + block_row_base
-            + offs_n[:, None] * k_row_stride
+            + v_block_row_base
+            + offs_n[:, None] * v_row_stride
             + hk * HEAD_SIZE
             + offs_d[None, :]
         )
@@ -144,14 +148,15 @@ def _blocked_flash_fwd_body(
         b = t // tiles_per_block
         t0 = (t % tiles_per_block) * BLOCK_N
         block = tl.load(block_ptr + b)
-        block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        k_block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        v_block_row_base = block * v_row_stride * KV_BLOCK_SIZE
         offs_n = t0 + tl.arange(0, BLOCK_N)
         kv_pos = t * BLOCK_N + tl.arange(0, BLOCK_N)
         n_mask = kv_pos < total_extent
 
         k_ptrs = (
             k_ptr
-            + block_row_base
+            + k_block_row_base
             + offs_n[:, None] * k_row_stride
             + hk * HEAD_SIZE
             + offs_d[None, :]
@@ -169,8 +174,8 @@ def _blocked_flash_fwd_body(
 
         v_ptrs = (
             v_ptr
-            + block_row_base
-            + offs_n[:, None] * k_row_stride
+            + v_block_row_base
+            + offs_n[:, None] * v_row_stride
             + hk * HEAD_SIZE
             + offs_d[None, :]
         )
@@ -202,6 +207,7 @@ def _blocked_flash_fwd_kernel(
     q_row_stride,
     o_row_stride,
     k_row_stride,
+    v_row_stride,
     h_h_k_ratio,
     n_heads_q,
     KV_BLOCK_SIZE: tl.constexpr,
@@ -221,6 +227,7 @@ def _blocked_flash_fwd_kernel(
         q_row_stride,
         o_row_stride,
         k_row_stride,
+        v_row_stride,
         h_h_k_ratio,
         n_heads_q,
         KV_BLOCK_SIZE=KV_BLOCK_SIZE,
@@ -243,6 +250,7 @@ def _blocked_flash_fwd_kernel_wide(
     q_row_stride,
     o_row_stride,
     k_row_stride,
+    v_row_stride,
     h_h_k_ratio,
     n_heads_q,
     KV_BLOCK_SIZE: tl.constexpr,
@@ -262,6 +270,7 @@ def _blocked_flash_fwd_kernel_wide(
         q_row_stride,
         o_row_stride,
         k_row_stride,
+        v_row_stride,
         h_h_k_ratio,
         n_heads_q,
         KV_BLOCK_SIZE=KV_BLOCK_SIZE,
@@ -371,6 +380,7 @@ def blocked_flash(
         q.stride(0),
         out.stride(0),
         k.stride(1),
+        v.stride(1),
         num_heads_q // num_heads_kv,
         num_heads_q,
         KV_BLOCK_SIZE=kv_block_size,

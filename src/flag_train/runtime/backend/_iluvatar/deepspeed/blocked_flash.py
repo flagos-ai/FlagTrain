@@ -19,7 +19,6 @@ limit; the kernel uses a single masked loop, the shape this backend's Triton
 compiles reliably."""
 
 import functools
-import importlib
 import logging
 
 import triton
@@ -40,10 +39,6 @@ from flag_train.deepspeed.blocked_flash import (
 from flag_train.utils import libentry
 
 logger = logging.getLogger(__name__)
-
-_generic_module = importlib.import_module("flag_train.deepspeed.blocked_flash")
-
-_READER_AS_IMPORTED = _generic_module._device_capability
 
 _BLOCK_N_MAX = 64
 
@@ -122,6 +117,7 @@ def _allocated_shared_memory(
         q.stride(0),
         out.stride(0),
         k.stride(1),
+        v.stride(1),
         h_h_k_ratio,
         num_heads_q,
         grid=(1,),
@@ -183,6 +179,7 @@ def _blocked_flash_fwd_kernel(
     q_row_stride,
     o_row_stride,
     k_row_stride,
+    v_row_stride,
     h_h_k_ratio,
     n_heads_q,
     KV_BLOCK_SIZE: tl.constexpr,
@@ -198,9 +195,11 @@ def _blocked_flash_fwd_kernel(
     # --- atom metadata -----------------------------------------------------
     atom_base = atoms_ptr + atom * _ATOM_STRIDE
     # Slots [0:2] are the 64-bit address of the sequence's block-id list.
-    block_ptr = tl.load(atoms_ptr.to(tl.pointer_type(tl.int64)) + atom * 4).to(
-        tl.pointer_type(tl.int32)
-    )
+    # Assemble it from two int32 loads: the tensor only guarantees int32
+    # alignment, so an int64 load would fault on a 4-byte-offset view.
+    ptr_lo = tl.load(atom_base).to(tl.uint32).to(tl.uint64)
+    ptr_hi = tl.load(atom_base + 1).to(tl.uint32).to(tl.uint64)
+    block_ptr = (ptr_lo | (ptr_hi << 32)).to(tl.pointer_type(tl.int32))
     q_start = tl.load(atom_base + _ATOM_Q_START)
     q_len = tl.load(atom_base + _ATOM_Q_LEN)
     kv_blocks = tl.load(atom_base + _ATOM_KV_BLOCKS)
@@ -230,7 +229,8 @@ def _blocked_flash_fwd_kernel(
         b = i // TILES_PER_BLOCK
         t0 = (i % TILES_PER_BLOCK) * BLOCK_N
         block = tl.load(block_ptr + b)
-        block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        k_block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        v_block_row_base = block * v_row_stride * KV_BLOCK_SIZE
 
         offs_n = t0 + tl.arange(0, BLOCK_N)
         kv_pos = b * KV_BLOCK_SIZE + offs_n
@@ -238,8 +238,8 @@ def _blocked_flash_fwd_kernel(
 
         v_ptrs = (
             v_ptr
-            + block_row_base
-            + offs_n[:, None] * k_row_stride
+            + v_block_row_base
+            + offs_n[:, None] * v_row_stride
             + hk * HEAD_SIZE
             + offs_d[None, :]
         )
@@ -247,7 +247,7 @@ def _blocked_flash_fwd_kernel(
 
         kt_ptrs = (
             k_ptr
-            + block_row_base
+            + k_block_row_base
             + hk * HEAD_SIZE
             + offs_d[:, None]
             + offs_n[None, :] * k_row_stride
@@ -277,17 +277,6 @@ def _blocked_flash_fwd_kernel(
     )
 
 
-def _no_capability_reported():
-    """What ``_device_capability`` answers on this backend. See ``_capability_gate``."""
-    return None
-
-
-def _capability_gate():
-    """Leave the generic launcher's capability gate to the device."""
-    if _generic_module._device_capability is _READER_AS_IMPORTED:
-        _generic_module._device_capability = _no_capability_reported
-
-
 def blocked_flash(
     out,
     q,
@@ -313,7 +302,6 @@ def blocked_flash(
     num_heads_kv = k.size(-2)
     num_atoms = attention_atoms.size(0)
 
-    _capability_gate()
     _check_launch_arguments(q, k, v, head_size, num_heads_q, num_heads_kv)
     q_len_max = get_q_block_size(head_size)
 
@@ -361,6 +349,7 @@ def blocked_flash(
         q.stride(0),
         out.stride(0),
         k.stride(1),
+        v.stride(1),
         num_heads_q // num_heads_kv,
         num_heads_q,
         KV_BLOCK_SIZE=kv_block_size,

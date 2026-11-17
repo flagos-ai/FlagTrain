@@ -51,7 +51,8 @@ def _kv_tile(
     q,
     k_ptr,
     v_ptr,
-    block_row_base,
+    k_block_row_base,
+    v_block_row_base,
     offs_n,
     kv_pos,
     total_extent,
@@ -61,6 +62,7 @@ def _kv_tile(
     l_i,
     acc,
     k_row_stride,
+    v_row_stride,
     hk,
     offs_d,
     d_mask,
@@ -76,7 +78,7 @@ def _kv_tile(
     if TRANSPOSED:
         k = tl.load(
             k_ptr
-            + block_row_base
+            + k_block_row_base
             + hk * HEAD_SIZE
             + offs_d[:, None]
             + offs_n[None, :] * k_row_stride,
@@ -86,7 +88,7 @@ def _kv_tile(
     elif MASKED:
         k = tl.load(
             k_ptr
-            + block_row_base
+            + k_block_row_base
             + offs_n[:, None] * k_row_stride
             + hk * HEAD_SIZE
             + offs_d[None, :],
@@ -96,7 +98,7 @@ def _kv_tile(
     else:
         k = tl.load(
             k_ptr
-            + block_row_base
+            + k_block_row_base
             + offs_n[:, None] * k_row_stride
             + hk * HEAD_SIZE
             + offs_d[None, :],
@@ -122,10 +124,10 @@ def _kv_tile(
     if TRANSPOSED:
         v = tl.load(
             v_ptr
-            + block_row_base
+            + v_block_row_base
             + hk * HEAD_SIZE
             + offs_d[:, None]
-            + offs_n[None, :] * k_row_stride,
+            + offs_n[None, :] * v_row_stride,
             mask=d_mask[:, None] & n_mask[None, :] if MASKED else d_mask[:, None],
             other=0.0,
         )
@@ -133,8 +135,8 @@ def _kv_tile(
     elif MASKED:
         v = tl.load(
             v_ptr
-            + block_row_base
-            + offs_n[:, None] * k_row_stride
+            + v_block_row_base
+            + offs_n[:, None] * v_row_stride
             + hk * HEAD_SIZE
             + offs_d[None, :],
             mask=n_mask[:, None] & d_mask[None, :],
@@ -143,8 +145,8 @@ def _kv_tile(
     else:
         v = tl.load(
             v_ptr
-            + block_row_base
-            + offs_n[:, None] * k_row_stride
+            + v_block_row_base
+            + offs_n[:, None] * v_row_stride
             + hk * HEAD_SIZE
             + offs_d[None, :],
             mask=d_mask[None, :],
@@ -169,6 +171,7 @@ def _blocked_flash_fwd_kernel(
     q_row_stride,
     o_row_stride,
     k_row_stride,
+    v_row_stride,
     h_h_k_ratio,
     KV_BLOCK_SIZE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
@@ -182,9 +185,11 @@ def _blocked_flash_fwd_kernel(
     # --- atom metadata -----------------------------------------------------
     atom_base = atoms_ptr + atom * _ATOM_STRIDE
     # Slots [0:2] are the 64-bit address of the sequence's block-id list.
-    block_ptr = tl.load(atoms_ptr.to(tl.pointer_type(tl.int64)) + atom * 4).to(
-        tl.pointer_type(tl.int32)
-    )
+    # Assemble it from two int32 loads: the tensor only guarantees int32
+    # alignment, so an int64 load would fault on a 4-byte-offset view.
+    ptr_lo = tl.load(atom_base).to(tl.uint32).to(tl.uint64)
+    ptr_hi = tl.load(atom_base + 1).to(tl.uint32).to(tl.uint64)
+    block_ptr = (ptr_lo | (ptr_hi << 32)).to(tl.pointer_type(tl.int32))
     q_start = tl.load(atom_base + _ATOM_Q_START)
     q_len = tl.load(atom_base + _ATOM_Q_LEN)
     kv_blocks = tl.load(atom_base + _ATOM_KV_BLOCKS)
@@ -215,7 +220,8 @@ def _blocked_flash_fwd_kernel(
 
     for b in range(0, peeled):
         block = tl.load(block_ptr + b)
-        block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        k_block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        v_block_row_base = block * v_row_stride * KV_BLOCK_SIZE
         for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
             offs_n = t0 + tl.arange(0, BLOCK_N)
             kv_pos = b * KV_BLOCK_SIZE + offs_n
@@ -223,7 +229,8 @@ def _blocked_flash_fwd_kernel(
                 q,
                 k_ptr,
                 v_ptr,
-                block_row_base,
+                k_block_row_base,
+                v_block_row_base,
                 offs_n,
                 kv_pos,
                 total_extent,
@@ -233,6 +240,7 @@ def _blocked_flash_fwd_kernel(
                 l_i,
                 acc,
                 k_row_stride,
+                v_row_stride,
                 hk,
                 offs_d,
                 d_mask,
@@ -244,7 +252,8 @@ def _blocked_flash_fwd_kernel(
 
     for b in range(peeled, kv_blocks):
         block = tl.load(block_ptr + b)
-        block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        k_block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        v_block_row_base = block * v_row_stride * KV_BLOCK_SIZE
         for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
             offs_n = t0 + tl.arange(0, BLOCK_N)
             kv_pos = b * KV_BLOCK_SIZE + offs_n
@@ -252,7 +261,8 @@ def _blocked_flash_fwd_kernel(
                 q,
                 k_ptr,
                 v_ptr,
-                block_row_base,
+                k_block_row_base,
+                v_block_row_base,
                 offs_n,
                 kv_pos,
                 total_extent,
@@ -262,6 +272,7 @@ def _blocked_flash_fwd_kernel(
                 l_i,
                 acc,
                 k_row_stride,
+                v_row_stride,
                 hk,
                 offs_d,
                 d_mask,
@@ -359,6 +370,8 @@ def _blocked_flash_launch(
     kv_block_size = k.stride(0) // k.stride(1)
     if kv_block_size * k.stride(1) != k.stride(0):
         raise ValueError("key cache must be contiguous across the block dimension")
+    if v.stride(1) == 0 or kv_block_size * v.stride(1) != v.stride(0):
+        raise ValueError("value cache must be contiguous across the block dimension")
 
     BLOCK_M = max(triton.next_power_of_2(q_block_size), 16)
     BLOCK_N = min(1 << (int(kv_block_size).bit_length() - 1), _BLOCK_N_MAX)
@@ -376,6 +389,7 @@ def _blocked_flash_launch(
         q.stride(0),
         out.stride(0),
         k.stride(1),
+        v.stride(1),
         num_heads_q // num_heads_kv,
         KV_BLOCK_SIZE=kv_block_size,
         HEAD_SIZE=head_size,
@@ -542,6 +556,10 @@ def _resolve_compat_call(out, q, k, v, attention_atoms, head_size, dtype):
     kv_block_size = k.stride(0) // k.stride(1)
     if kv_block_size * k.stride(1) != k.stride(0):
         raise ValueError("key cache must be contiguous across the block dimension")
+    if v.stride(1) == 0:
+        raise ValueError("value cache row stride must be non-zero")
+    if kv_block_size * v.stride(1) != v.stride(0):
+        raise ValueError("value cache must be contiguous across the block dimension")
     expected_kv_block_size = get_kv_block_size(resolved_head_size)
     if kv_block_size != expected_kv_block_size:
         raise ValueError(
@@ -562,17 +580,12 @@ def flash_attn_by_atoms(
     softmax_scale,
 ):
     """Flash attention forward over the blocked KV-cache (DeepSpeed atom layout)."""
-    if device.vendor_name != "nvidia":
-        raise NotImplementedError(
-            "the DeepSpeed-compatible blocked_flash interface is only supported "
-            "on NVIDIA"
-        )
-
-    capability = _compat_device_capability()
-    is_sm8x = capability[0] == 8 and capability[1] >= 0
-    is_sm90 = capability[0] == 9 and capability[1] == 0
-    if not (is_sm8x or is_sm90):
-        raise RuntimeError("FlashAttention only supports Ampere GPUs or newer.")
+    if device.vendor_name == "nvidia":
+        capability = _compat_device_capability()
+        is_sm8x = capability[0] == 8 and capability[1] >= 0
+        is_sm90 = capability[0] == 9 and capability[1] == 0
+        if not (is_sm8x or is_sm90):
+            raise RuntimeError("FlashAttention only supports Ampere GPUs or newer.")
 
     q_dtype = q.dtype
     if q_dtype not in (torch.float16, torch.bfloat16):
@@ -583,8 +596,8 @@ def flash_attn_by_atoms(
         raise RuntimeError("query and value must have the same dtype")
 
     for tensor in (q, k, v):
-        if not tensor.is_cuda:
-            raise RuntimeError("Input tensor must be on CUDA device")
+        if tensor.device.type == "cpu":
+            raise RuntimeError("Input tensor must be on a device")
 
     for tensor in (q, k, v):
         if tensor.stride(-1) != 1:
@@ -631,6 +644,10 @@ def flash_attn_by_atoms(
     kv_block_size = k.stride(0) // k.stride(1)
     if kv_block_size * k.stride(1) != k.stride(0):
         raise ValueError("key cache must be contiguous across the block dimension")
+    if v.stride(1) == 0:
+        raise ValueError("value cache row stride must be non-zero")
+    if kv_block_size * v.stride(1) != v.stride(0):
+        raise ValueError("value cache must be contiguous across the block dimension")
 
     expected_kv_block_size = get_kv_block_size(head_size)
     if kv_block_size != expected_kv_block_size:
@@ -662,13 +679,13 @@ def blocked_flash(
     head_size=None,
     dtype=None,
 ):
-    """Blocked flash attention with DeepSpeed's atom layout."""
-    if device.vendor_name != "nvidia":
-        raise NotImplementedError(
-            "the DeepSpeed-compatible blocked_flash interface is only supported "
-            "on NVIDIA"
-        )
+    """Blocked flash attention with DeepSpeed's atom layout.
 
+    ``attention_atoms`` must be built with ``get_q_block_size(head_size)`` --
+    the same bound DeepSpeed's ``AtomBuilder`` uses. An atom whose ``q_len``
+    exceeds that bound is outside the contract and its extra query rows are not
+    covered by the fixed launch tile.
+    """
     _resolve_compat_call(out, q, k, v, attention_atoms, head_size, dtype)
     flash_attn_by_atoms(out, q, k, v, attention_atoms, softmax_scale)
     return out

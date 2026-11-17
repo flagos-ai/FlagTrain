@@ -40,11 +40,13 @@ from flag_train.utils import libentry
 logger = logging.getLogger(__name__)
 
 
-def _shared_memory_for(block_m, block_n, block_d, element_size):
+_NUM_STAGES = 3
+
+
+def _shared_memory_for(block_m, block_n, block_d, element_size, num_stages=_NUM_STAGES):
     """Shared memory one program needs, in bytes, for a given tiling."""
-    return (
-        max(block_m * block_d, 2 * block_n * block_d + block_m * block_n) * element_size
-    )
+    kv_bytes = 2 * num_stages * block_n * block_d
+    return max(block_m * block_d, kv_bytes + block_m * block_n) * element_size
 
 
 def _widest_query_tile(block_d, element_size, limit):
@@ -116,6 +118,7 @@ def _blocked_flash_fwd_kernel(
     q_row_stride,
     o_row_stride,
     k_row_stride,
+    v_row_stride,
     h_h_k_ratio,
     n_heads_q,
     KV_BLOCK_SIZE: tl.constexpr,
@@ -131,9 +134,11 @@ def _blocked_flash_fwd_kernel(
     # --- atom metadata -----------------------------------------------------
     atom_base = atoms_ptr + atom * _ATOM_STRIDE
     # Slots [0:2] are the 64-bit address of the sequence's block-id list.
-    block_ptr = tl.load(atoms_ptr.to(tl.pointer_type(tl.int64)) + atom * 4).to(
-        tl.pointer_type(tl.int32)
-    )
+    # Assemble it from two int32 loads: the tensor only guarantees int32
+    # alignment, so an int64 load would fault on a 4-byte-offset view.
+    ptr_lo = tl.load(atom_base).to(tl.uint32).to(tl.uint64)
+    ptr_hi = tl.load(atom_base + 1).to(tl.uint32).to(tl.uint64)
+    block_ptr = (ptr_lo | (ptr_hi << 32)).to(tl.pointer_type(tl.int32))
     q_start = tl.load(atom_base + _ATOM_Q_START)
     q_len = tl.load(atom_base + _ATOM_Q_LEN)
     kv_blocks = tl.load(atom_base + _ATOM_KV_BLOCKS)
@@ -160,7 +165,8 @@ def _blocked_flash_fwd_kernel(
 
     for b in range(0, kv_blocks):
         block = tl.load(block_ptr + b)
-        block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        k_block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        v_block_row_base = block * v_row_stride * KV_BLOCK_SIZE
 
         for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
             offs_n = t0 + tl.arange(0, BLOCK_N)
@@ -169,7 +175,7 @@ def _blocked_flash_fwd_kernel(
 
             k_ptrs = (
                 k_ptr
-                + block_row_base
+                + k_block_row_base
                 + hk * HEAD_SIZE
                 + offs_d[:, None]
                 + offs_n[None, :] * k_row_stride
@@ -187,8 +193,8 @@ def _blocked_flash_fwd_kernel(
 
             v_ptrs = (
                 v_ptr
-                + block_row_base
-                + offs_n[:, None] * k_row_stride
+                + v_block_row_base
+                + offs_n[:, None] * v_row_stride
                 + hk * HEAD_SIZE
                 + offs_d[None, :]
             )
@@ -278,11 +284,13 @@ def blocked_flash(
         q.stride(0),
         out.stride(0),
         k.stride(1),
+        v.stride(1),
         num_heads_q // num_heads_kv,
         num_heads_q,
         KV_BLOCK_SIZE=kv_block_size,
         HEAD_SIZE=head_size,
         num_warps=num_warps,
+        num_stages=_NUM_STAGES,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
