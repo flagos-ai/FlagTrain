@@ -283,6 +283,20 @@ ops:
   source: megatron.core.transformer.hyper_connection
   stages:
   - beta: '0.0.0'
+- id: l2_normalization_backward
+  description: Input gradient for L2 normalization using the saved inverse norm.
+  for:
+  - l2normalization_backward_fused
+  labels:
+  - transformer_engine
+  - normalization
+  from:
+  - transformer_engine
+  kind:
+  - Normalization
+  source: transformer_engine.pytorch.jit
+  stages:
+  - beta: '0.0.0'
 - id: lamb
   description: Fused LAMB optimizer update.
   for:
