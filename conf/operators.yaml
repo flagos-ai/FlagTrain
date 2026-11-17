@@ -339,6 +339,20 @@ ops:
   - MoE
   stages:
   - beta: '0.0.0'
+- id: mtp_loss_auto_scaler
+  description: Scales the MTP loss gradient using an explicit scale buffer per autograd graph.
+  for:
+  - MTPLossAutoScaler
+  labels:
+  - megatron
+  - tensor
+  from:
+  - megatron
+  kind:
+  - Tensor
+  source: megatron.core.transformer.multi_token_prediction
+  stages:
+  - beta: '0.0.0'
 - id: multi_tensor_adam
   description: Fused Adam/AdamW optimizer update over multiple parameter tensors.
   for:
