@@ -39,7 +39,7 @@ def make_inputs(shape, dtype, device):
     return y, weights
 
 
-class _WeightedSwiGLU(torch.autograd.Function):
+class _WeightedSwiGLUReference(torch.autograd.Function):
     @staticmethod
     def forward(ctx, y, weights):
         ctx.save_for_backward(y, weights)
@@ -64,4 +64,4 @@ class _WeightedSwiGLU(torch.autograd.Function):
 
 
 def reference(y, weights):
-    return _WeightedSwiGLU.apply(y, weights)
+    return _WeightedSwiGLUReference.apply(y, weights)
