@@ -23,7 +23,7 @@ OP_NAME = "multi_modal_rotary_embedding"
 OVERRIDE_KEY = f"megatron.{OP_NAME}"
 
 
-class Workload(NamedTuple):
+class _MRoPEWorkload(NamedTuple):
     batch: int
     length: int
     sections: tuple[int, int, int]
@@ -34,32 +34,38 @@ class Workload(NamedTuple):
 
 
 WORKLOADS = (
-    Workload(2, 7, (1, 1, 2)),
-    Workload(1, 128, (3, 5, 8), 2.5),
-    Workload(4, 257, (6, 10, 16)),
-    Workload(1, 1, (1, 1, 1)),
-    Workload(2, 512, (8, 12, 12), 1.5),
-    Workload(8, 1025, (11, 11, 10)),
-    Workload(1, 4096, (16, 24, 24), 4.0),
+    _MRoPEWorkload(2, 7, (1, 1, 2)),
+    _MRoPEWorkload(1, 128, (3, 5, 8), 2.5),
+    _MRoPEWorkload(4, 257, (6, 10, 16)),
+    _MRoPEWorkload(1, 1, (1, 1, 1)),
+    _MRoPEWorkload(2, 512, (8, 12, 12), 1.5),
+    _MRoPEWorkload(8, 1025, (11, 11, 10)),
+    _MRoPEWorkload(1, 4096, (16, 24, 24), 4.0),
 )
 
 TIMING_WORKLOADS = WORKLOADS + (
-    Workload(1, 1, (8, 12, 12)),  # Single-token decode with D=32
-    Workload(32, 1, (16, 24, 24)),  # Batched decode
-    Workload(16, 32, (8, 11, 14), 1.75),
-    Workload(2, 8192, (15, 24, 24)),
-    Workload(1, 16384, (16, 24, 25), 3.5),
+    _MRoPEWorkload(1, 1, (8, 12, 12)),  # Single-token decode with D=32
+    _MRoPEWorkload(32, 1, (16, 24, 24)),  # Batched decode
+    _MRoPEWorkload(16, 32, (8, 11, 14), 1.75),
+    _MRoPEWorkload(2, 8192, (15, 24, 24)),
+    _MRoPEWorkload(1, 16384, (16, 24, 25), 3.5),
 )
 
 CORRECTNESS_WORKLOADS = TIMING_WORKLOADS + (
-    Workload(3, 9, (1, 1, 29), strided_positions=True),
-    Workload(2, 17, (30, 1, 1), strided_frequency=True),
-    Workload(3, 17, (1, 31, 1), 2.5, strided_positions=True, strided_frequency=True),
-    Workload(2, 13, (1, 1, 61), repeated_positions=True),
-    Workload(3, 7, (62, 1, 1), 1.2, repeated_positions=True),
-    Workload(2, 19, (1, 63, 1), 3.7, strided_positions=True, repeated_positions=True),
-    Workload(4, 11, (9, 11, 11), 1.5, strided_frequency=True, repeated_positions=True),
-    Workload(
+    _MRoPEWorkload(3, 9, (1, 1, 29), strided_positions=True),
+    _MRoPEWorkload(2, 17, (30, 1, 1), strided_frequency=True),
+    _MRoPEWorkload(
+        3, 17, (1, 31, 1), 2.5, strided_positions=True, strided_frequency=True
+    ),
+    _MRoPEWorkload(2, 13, (1, 1, 61), repeated_positions=True),
+    _MRoPEWorkload(3, 7, (62, 1, 1), 1.2, repeated_positions=True),
+    _MRoPEWorkload(
+        2, 19, (1, 63, 1), 3.7, strided_positions=True, repeated_positions=True
+    ),
+    _MRoPEWorkload(
+        4, 11, (9, 11, 11), 1.5, strided_frequency=True, repeated_positions=True
+    ),
+    _MRoPEWorkload(
         5,
         23,
         (4, 15, 13),
@@ -68,10 +74,10 @@ CORRECTNESS_WORKLOADS = TIMING_WORKLOADS + (
         strided_frequency=True,
         repeated_positions=True,
     ),
-    Workload(2, 31, (11, 11, 11)),
-    Workload(2, 31, (20, 21, 23), 2.0),
-    Workload(2, 31, (20, 21, 24), strided_positions=True, strided_frequency=True),
-    Workload(2, 5, (128, 256, 129)),  # D=513 crosses one output tile
+    _MRoPEWorkload(2, 31, (11, 11, 11)),
+    _MRoPEWorkload(2, 31, (20, 21, 23), 2.0),
+    _MRoPEWorkload(2, 31, (20, 21, 24), strided_positions=True, strided_frequency=True),
+    _MRoPEWorkload(2, 5, (128, 256, 129)),  # D=513 crosses one output tile
 )
 
 
