@@ -23,8 +23,9 @@ comparison is against a higher-precision CPU result. Tolerances are
 
 Only the forward output is checked: the backward is a separate operator.
 The Triton implementation accepts contiguous active-device fp16/bf16/fp32
-inputs and optional same-dtype bias broadcastable to the flattened input.
-Unsupported operands are rejected instead of using an eager PyTorch fallback.
+inputs, plus fp64 on devices with FP64 support, and optional same-dtype bias
+broadcastable to the flattened input. Unsupported operands are rejected
+instead of using an eager PyTorch fallback.
 """
 
 import pytest
@@ -138,7 +139,12 @@ def _expected_output(x, bias):
             x.contiguous(),
             None if bias is None else bias.contiguous(),
         )
-    return bias_geglu_ref(x, bias)
+    ori_shape = x.shape
+    flat = x.view(-1, ori_shape[-1])
+    output = bias_geglu_ref(flat, bias)
+    return (
+        output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+    )
 
 
 def _check_bias_geglu(x, bias):
@@ -249,11 +255,36 @@ def test_bias_geglu_impl_bias_dtype_validation(dtype):
 
 
 @pytest.mark.bias_geglu_impl
+@pytest.mark.parametrize("shape", [(4, 16), (2, 3, 16)])
+@pytest.mark.parametrize("bias_mode", ["none", "vector", "full"])
+def test_bias_geglu_impl_fp64(shape, bias_mode):
+    """FP64 inputs use FP64 arithmetic throughout the Triton kernel."""
+    if not flag_train.runtime.device.support_fp64:
+        pytest.skip("the active device does not support FP64")
+
+    utils.init_seed(6)
+    x = torch.randn(shape, dtype=torch.float64, device=flag_train.device)
+    flat = x.view(-1, shape[-1])
+    if bias_mode == "none":
+        bias = None
+    elif bias_mode == "vector":
+        bias = torch.randn(shape[-1], dtype=torch.float64, device=flag_train.device)
+    else:
+        bias = torch.randn_like(flat)
+
+    _check_bias_geglu(x, bias)
+
+
+@pytest.mark.bias_geglu_impl
 def test_bias_geglu_impl_additional_dtype_validation():
     """Unsupported dtypes are rejected rather than evaluated with PyTorch."""
-    for dtype in (torch.float64, torch.int32, torch.bool, torch.complex64):
+    unsupported = [torch.int32, torch.bool, torch.complex64]
+    if not flag_train.runtime.device.support_fp64:
+        unsupported.insert(0, torch.float64)
+
+    for dtype in unsupported:
         x = torch.zeros((4, 8), dtype=dtype, device=flag_train.device)
-        with pytest.raises(ValueError, match="dtype fp16, bf16, or fp32"):
+        with pytest.raises(ValueError, match="unsupported dtype"):
             flag_train.megatron.bias_geglu_impl(x, None)
 
 

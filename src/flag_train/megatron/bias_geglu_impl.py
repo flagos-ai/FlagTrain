@@ -73,8 +73,11 @@ def _validate_inputs(flat, bias):
     """Validate operands supported by the fused Triton forward kernel."""
     if flat.device.type != runtime_device.name:
         raise ValueError("bias_geglu input must be on the active device")
-    if flat.dtype not in _DTYPES:
-        raise ValueError("bias_geglu input must have dtype fp16, bf16, or fp32")
+    supported_dtype = flat.dtype in _DTYPES or (
+        flat.dtype == torch.float64 and runtime_device.support_fp64
+    )
+    if not supported_dtype:
+        raise ValueError("bias_geglu input has an unsupported dtype")
     if not flat.is_contiguous():
         raise ValueError("bias_geglu input must be contiguous")
     if flat.shape[-1] % 2 != 0:
@@ -99,7 +102,7 @@ def _validate_inputs(flat, bias):
 
 @triton.jit
 def _activate(gate, linear):
-    """Forward value of one gate/linear pair, in fp32."""
+    """Forward value of one gate/linear pair, in fp32 or fp64."""
     # tanh approximation of GELU:
     # 0.5 * x * (1 + tanh(sqrt(2/pi) * x * (1 + 0.044715 * x^2)))
     t = _tanh(_GELU_SQRT_2_OVER_PI * gate * (1.0 + _GELU_COEFF * gate * gate))
@@ -114,8 +117,10 @@ def _bias_geglu_forward_kernel(
     y_ptr,
     n_cols,
     BIAS_MODE: tl.constexpr,
+    IS_FP64: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    COMPUTE_DTYPE: tl.constexpr = tl.float64 if IS_FP64 else tl.float32
     row = tle.program_id(0)
     hidden = n_cols * 2
     x_row = x_ptr + row * hidden
@@ -125,17 +130,17 @@ def _bias_geglu_forward_kernel(
     for start in tl.range(0, n_cols, BLOCK):
         cols = start + tl.arange(0, BLOCK)
         mask = cols < n_cols
-        gate = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
-        linear = tl.load(x_row + n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(x_row + cols, mask=mask, other=0.0).to(COMPUTE_DTYPE)
+        linear = tl.load(x_row + n_cols + cols, mask=mask, other=0.0).to(COMPUTE_DTYPE)
         if BIAS_MODE == 1:
-            gate += tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            gate += tl.load(bias_ptr + cols, mask=mask, other=0.0).to(COMPUTE_DTYPE)
             linear += tl.load(bias_ptr + n_cols + cols, mask=mask, other=0.0).to(
-                tl.float32
+                COMPUTE_DTYPE
             )
         elif BIAS_MODE == 2:
-            gate += tl.load(bias_row + cols, mask=mask, other=0.0).to(tl.float32)
+            gate += tl.load(bias_row + cols, mask=mask, other=0.0).to(COMPUTE_DTYPE)
             linear += tl.load(bias_row + n_cols + cols, mask=mask, other=0.0).to(
-                tl.float32
+                COMPUTE_DTYPE
             )
         out = _activate(gate, linear)
         tl.store(y_row + cols, out.to(y_ptr.dtype.element_ty), mask=mask)
@@ -177,6 +182,7 @@ def _forward(flat, bias):
             y,
             n_cols,
             BIAS_MODE=bias_mode,
+            IS_FP64=flat.dtype == torch.float64,
             BLOCK=block,
             num_warps=num_warps,
         )
@@ -186,9 +192,10 @@ def _forward(flat, bias):
 def bias_geglu_impl(input, bias):
     """Apply Megatron-compatible bias + GEGLU forward.
 
-    The input must be a contiguous active-device fp16/bf16/fp32 tensor.
-    Bias must be None or a same-device, same-dtype tensor broadcastable to
-    the flattened input. All activation arithmetic runs in the Triton kernel.
+    The input must be contiguous and on the active device. Supported dtypes
+    are fp16/bf16/fp32, plus fp64 on devices with FP64 support. Bias must be
+    None or a same-device, same-dtype tensor broadcastable to the flattened
+    input. All activation arithmetic runs in the Triton kernel.
     """
     logger.debug("TRAIN BIAS_GEGLU_IMPL")
     flat, ori_shape = _flatten_input(input)
