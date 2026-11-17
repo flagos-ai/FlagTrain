@@ -497,3 +497,17 @@ ops:
   source: megatron.core.fusions.fused_weighted_squared_relu
   stages:
   - beta: '0.0.0'
+- id: weighted_swiglu_funciton
+  description: Weighted SwiGLU activation with per-token weights and first-order gradients.
+  for:
+  - WeightedSwiGLUFunction
+  labels:
+  - megatron
+  - activation
+  from:
+  - megatron
+  kind:
+  - Activation
+  source: megatron.core.fusions.fused_bias_swiglu
+  stages:
+  - beta: '0.0.0'
