@@ -92,9 +92,6 @@ _EVOFORMER_SHAPES = [
     (1, 4, 2048, 4, 32),
 ]
 
-# The head size has to be a multiple of 8 and at most 64 (upstream's kMaxK), so
-# 32 and 64 are the interesting widths and 8 is the narrow end where the dot
-# product is mostly bias arithmetic.
 _DTYPES = [torch.float16, torch.bfloat16]
 
 

@@ -52,16 +52,17 @@ softmax -- not to the output.
 **This port is not bit-identical to upstream**, and does not try to be: upstream
 accumulates in CUTLASS tensor-core fragments and broadcasts biases through shared
 memory, while this is a Triton online-softmax kernel. What it does match is the
-arithmetic contract -- the same fp32 score accumulation, the same ``exp2``-based
-softmax, the same ``lse`` definition -- so results agree to the tolerance upstream's
-own test asserts (``1e-2`` fp16, ``5e-2`` bf16; see ``evoformer_attn.md``).
+arithmetic contract -- the same fp32 score accumulation and the same
+``exp2``-based softmax -- so results agree to the tolerance upstream's own test
+asserts (``1e-2`` fp16, ``5e-2`` bf16; see ``evoformer_attn.md``).
 
 What upstream's public entry does around the kernel is mirrored too. The public
 ``evoformer_attn(Q, K, V, biases)`` takes the same 0-2-entry bias list, pads that
 list in place exactly as upstream does, calls ``.contiguous()`` on the operands
 and the biases, and returns only the output tensor. The internal
-``_attention(q, k, v, bias1, bias2)`` is the layer that returns ``(out, lse)``;
-the public entry discards ``lse``, as upstream's does.
+``_attention(q, k, v, bias1, bias2)`` returns that output alone: upstream also
+produces ``lse`` there for its backward, but this port has no backward and the
+public entry never returned it, so computing and storing it would be dead work.
 """
 
 import logging
@@ -76,7 +77,7 @@ from flag_train.utils import libentry
 logger = logging.getLogger(__name__)
 
 # log2(e): the softmax runs on exp2, so this converts the natural-log domain the
-# scores and ``lse`` live in into the exponent the hardware has an instruction for.
+# scores live in into the exponent the hardware has an instruction for.
 #
 # ``tl.constexpr`` rather than a plain float because the kernels read it too:
 # Triton resolves a global inside ``@triton.jit`` only when it was instantiated as
@@ -94,9 +95,7 @@ _LOG2E = tl.constexpr(1.4426950408889634)
 # whether it can do better (see evoformer_attn.md §5).
 _BLOCK_N = 64
 
-# The query tile, at the upstream kernel's ``kQueriesPerBlock`` -- which is also
-# the alignment its ``lse`` padding is defined against (``kAlignLSE = 32``, and 64
-# is a multiple of it, so the last query tile always covers the padding).
+# The query tile, at the upstream kernel's ``kQueriesPerBlock``.
 _BLOCK_M = 64
 
 
@@ -164,10 +163,8 @@ def _evoformer_fwd_kernel(
     v_ptr,
     bias1_ptr,
     bias2_ptr,
-    lse_ptr,
     qk_scale,
     seq_len,
-    lse_dim,
     n_pairs,
     q_stride_bn,
     q_stride_l,
@@ -177,8 +174,6 @@ def _evoformer_fwd_kernel(
     o_stride_h,
     bias2_stride_b,
     bias2_stride_h,
-    lse_stride_bn,
-    lse_stride_h,
     HAS_BIAS1: tl.constexpr,
     HAS_BIAS2: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
@@ -265,19 +260,6 @@ def _evoformer_fwd_kernel(
         mask=m_mask[:, None] & d_mask[None, :],
     )
 
-    # lse is the log-sum-exp of the row's scores, in nats and in fp32, at the same
-    # ``m + log(sum exp(s - m))`` that upstream computes from its running max and
-    # running sum. Rows from ``seq_len`` up to ``lse_dim`` (the next multiple of 32)
-    # are written as +inf: upstream pads the buffer that way, and the padding is
-    # what its backward reads instead of bounding every load.
-    # Rows at or past ``lse_dim`` are never written -- the buffer stops there.
-    lse_ptrs = lse_ptr + bn * lse_stride_bn + head * lse_stride_h + offs_m
-    tl.store(
-        lse_ptrs,
-        tl.where(offs_m < seq_len, m_i + tl.log(l_safe), float("inf")),
-        mask=(offs_m < seq_len) | (offs_m < lse_dim),
-    )
-
 
 # Vendors whose ``torch_device_fn`` answers with a *CUDA* compute capability.
 # The threshold below is written in sm_XX, so it is only a statement about a
@@ -350,7 +332,7 @@ def _check_launch_arguments(q, k, v, bias1, bias2, max_slices=_GRID_Z_MAX):
 
     # A zero-length sequence, head or head-size axis has no kernel to run: the
     # flattened (batch, pair) count divides by the last three dimensions, and the
-    # lse/tile shapes collapse. Upstream refuses L <= 16 outright; this port
+    # tile shapes collapse. Upstream refuses L <= 16 outright; this port
     # serves short sequences, but an empty axis is not a short sequence.
     if q.shape[-3] < 1 or q.shape[-2] < 1 or q.shape[-1] < 1:
         raise ValueError(
@@ -496,24 +478,14 @@ def _normalize_biases(biases):
     return biases[0], biases[1]
 
 
-def _lse_shape(batch, heads, seq_len):
-    """``[B*N, H, ceil(L/32)*32]`` -- upstream pads lse to a multiple of 32.
-
-    ``kAlignLSE = 32`` is the block size of its backward, which reads the padding
-    instead of bounding every load; the padded rows carry +inf so that
-    ``exp(s - lse)`` is 0 there.
-    """
-    return (batch, heads, triton.cdiv(seq_len, 32) * 32)
-
-
 def _attention(q, k, v, bias1=None, bias2=None):
-    """Internal Evoformer attention forward, returning ``(out, lse)``.
+    """Internal Evoformer attention forward, returning ``out``.
 
-    This mirrors upstream's private ``_attention`` and is the layer the public
-    ``evoformer_attn`` calls.  The public entry returns only ``out``; ``lse`` is
-    kept here because it is the second half of the kernel's contract and what a
-    gradient would need.  Inputs must already be contiguous (the public entry
-    makes them so).
+    This is the layer the public ``evoformer_attn`` calls.  Inputs must already
+    be contiguous (the public entry makes them so).  Unlike upstream's private
+    ``_attention`` it does not produce ``lse``: that value exists for the
+    backward, which this port does not have, and the public entry never
+    returned it.
 
     Args:
         q (Tensor): queries ``[..., L, H, D]``, contiguous.
@@ -525,8 +497,7 @@ def _attention(q, k, v, bias1=None, bias2=None):
             ``None``/an empty tensor for no such bias.
 
     Returns:
-        ``(out, lse)``: the attention output, shaped like ``q``, and the fp32
-        log-sum-exp of each query row's scores, shaped ``[B*N, H, ceil(L/32)*32]``.
+        Tensor: the attention output, shaped like ``q``.
 
     Requires ``D <= 64``, which is upstream's own limit: its forward is compiled
     for it. ``L`` is *not* bounded below here. Upstream asserts ``L > 16``, but
@@ -557,9 +528,6 @@ def _attention(q, k, v, bias1=None, bias2=None):
     n_pairs = _pairs_of(q)
 
     out = torch.empty_like(q)
-    lse = torch.empty(
-        _lse_shape(batch, heads, seq_len), dtype=torch.float32, device=q.device
-    )
 
     # bias1 is [B, N, 1, 1, L]: contiguous, that is one L-row per (batch, pair).
     # bias2 is [B, 1, H, L, L]: one L x L matrix per (batch, head).
@@ -581,12 +549,10 @@ def _attention(q, k, v, bias1=None, bias2=None):
             # the query's -- never dereferenced under HAS_BIAS* = False.
             bias1 if has_bias1 else q,
             bias2 if has_bias2 else q,
-            lse,
             # The scores are scaled before the softmax, in fp32; upstream applies
             # the same 1/sqrt(head_dim) in its epilogue.
             head_size**-0.5,
             seq_len,
-            lse.shape[-1],
             n_pairs,
             _stride_bn(q),
             q.stride(-3),
@@ -596,8 +562,6 @@ def _attention(q, k, v, bias1=None, bias2=None):
             out.stride(-2),
             bias2_stride_b,
             bias2_stride_h,
-            lse.stride(-3),
-            lse.stride(-2),
             HAS_BIAS1=has_bias1,
             HAS_BIAS2=has_bias2,
             HEAD_SIZE=head_size,
@@ -606,7 +570,7 @@ def _attention(q, k, v, bias1=None, bias2=None):
             BLOCK_D=block_d,
             num_warps=num_warps,
         )
-    return out, lse
+    return out
 
 
 def evoformer_attn(Q, K, V, biases):
@@ -628,9 +592,7 @@ def evoformer_attn(Q, K, V, biases):
             an empty tensor.
 
     Returns:
-        Tensor: the attention output, shaped like ``Q``.  The log-sum-exp is
-        still produced by the internal ``_attention`` layer but, as in
-        upstream's public entry, is not returned here.
+        Tensor: the attention output, shaped like ``Q``.
     """
     logger.debug("TRAIN EVOFORMER_ATTN")
     bias1, bias2 = _normalize_biases(biases)
@@ -645,5 +607,4 @@ def evoformer_attn(Q, K, V, biases):
     if bias2 is not None:
         bias2 = bias2.contiguous()
 
-    out, _ = _attention(q, k, v, bias1, bias2)
-    return out
+    return _attention(q, k, v, bias1, bias2)
