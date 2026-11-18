@@ -19,11 +19,13 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.runtime import torch_device_fn
+
 
 @triton.jit
 def _l2_bwd_small(G, X, RN, DX, M: tl.constexpr, BLOCK_N: tl.constexpr):
     """Register-resident single pass: M fits in BLOCK_N, one row per program."""
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     r = tl.load(RN + row).to(tl.float32)
     offs = tl.arange(0, BLOCK_N)
     mask = offs < M
@@ -49,7 +51,7 @@ def _l2_bwd_gen(
     BLOCK_N: tl.constexpr,
 ):
     """Generic fallback: explicit strides, streaming two-pass over the last dim."""
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     r = tl.load(RN + row * stride_rn).to(tl.float32)
     g_row = G + row * stride_g_row
     x_row = X + row * stride_x_row
@@ -77,29 +79,36 @@ def _l2_bwd_gen(
 
 def l2_normalization_backward(grad_output, x, rsqrt_norm, eps):
     """Compute the input gradient from the inverse norm saved in forward."""
+    if x.ndim == 0 or grad_output.shape != x.shape or grad_output.dtype != x.dtype:
+        raise ValueError("grad_output and x must have the same tensor shape and dtype")
+    if grad_output.device != x.device or rsqrt_norm.device != x.device:
+        raise ValueError("grad_output, x and rsqrt_norm must be on the same device")
     if not x.numel():
         return torch.empty_like(x)
     width = x.shape[-1]
     rows = x.numel() // width
+    if rsqrt_norm.numel() != rows or rsqrt_norm.dtype != torch.float32:
+        raise ValueError("rsqrt_norm must contain one FP32 inverse norm per row")
     x = x.contiguous()
     grad_output = grad_output.contiguous()
     rsqrt_norm = rsqrt_norm.contiguous()
     grad_x = torch.empty_like(x)
-    if width <= 2048:
-        _l2_bwd_small[(rows,)](
-            grad_output, x, rsqrt_norm, grad_x, width, triton.next_power_of_2(width)
-        )
-    else:
-        _l2_bwd_gen[(rows,)](
-            grad_output,
-            x,
-            rsqrt_norm,
-            grad_x,
-            width,
-            width,
-            width,
-            width,
-            1,
-            BLOCK_N=1024,
-        )
+    with torch_device_fn.device(x.device):
+        if width <= 2048:
+            _l2_bwd_small[(rows,)](
+                grad_output, x, rsqrt_norm, grad_x, width, triton.next_power_of_2(width)
+            )
+        else:
+            _l2_bwd_gen[(rows,)](
+                grad_output,
+                x,
+                rsqrt_norm,
+                grad_x,
+                width,
+                width,
+                width,
+                width,
+                1,
+                BLOCK_N=1024,
+            )
     return grad_x
