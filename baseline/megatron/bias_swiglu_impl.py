@@ -40,6 +40,8 @@ fuser. Megatron is imported lazily on the first ``native()`` call, so ops
 discovery does not trigger it.
 """
 
+import math
+
 import torch
 
 OP_NAME = "bias_swiglu_impl"
@@ -115,3 +117,30 @@ def build_inputs(binding, dtype, device):
 def key_shape(binding):
     # First tensor: the [tokens, 2 * hidden] input; unique per deployment.
     return list(binding["shape"])
+
+
+def config(binding, dtype):
+    """Describe the real inputs/outputs for baseline matching."""
+    shape = list(binding["shape"])
+    width = shape[-1]
+    dtype_str = str(dtype)
+    return {
+        "inputs": {
+            "input": {"shape": shape, "dtype": dtype_str},
+            # One [2 * d] bias vector is shared by all rows.
+            "bias": {"shape": [width], "dtype": dtype_str},
+        },
+        "outputs": {
+            # The forward splits the last dimension in half: 2 * d -> d.
+            "out": {
+                "shape": shape[:-1] + [width // 2],
+                "dtype": dtype_str,
+            },
+        },
+        "dims": {
+            "num_tokens": math.prod(shape[:-1]),
+            "hidden": width,
+            "d": width // 2,
+            "shape": shape,
+        },
+    }
