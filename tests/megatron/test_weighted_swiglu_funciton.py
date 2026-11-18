@@ -56,3 +56,12 @@ def test_weighted_swiglu_funciton(shape, dtype):
     torch.testing.assert_close(actual_grads, expected_grads)
     for actual_input, original in zip(candidate_inputs, inputs):
         torch.testing.assert_close(actual_input, original, rtol=0, atol=0)
+
+
+def test_weighted_swiglu_rejects_incompatible_shapes():
+    call = flag_train.megatron.weighted_swiglu_funciton
+    weights = torch.empty((2, 1), device=flag_train.device)
+    with pytest.raises(ValueError, match="even final dimension"):
+        call(torch.empty((2, 3), device=flag_train.device), weights)
+    with pytest.raises(ValueError, match="one value per token"):
+        call(torch.empty((2, 4), device=flag_train.device), weights[:1])

@@ -25,6 +25,8 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
+from flag_train.runtime import torch_device_fn
+
 # ---------------------------------------------------------------------------
 # tunables
 # ---------------------------------------------------------------------------
@@ -213,6 +215,12 @@ def _staged(dtype):
 
 
 def _weighted_swiglu(y, weights, use_libdevice):
+    if y.ndim == 0 or y.shape[-1] % 2:
+        raise ValueError("y must have an even final dimension")
+    if weights.shape != (*y.shape[:-1], 1):
+        raise ValueError("weights must contain one value per token")
+    if weights.device != y.device:
+        raise ValueError("weights and y must be on the same device")
     if not y.is_contiguous():
         y = y.contiguous()
     if not weights.is_contiguous():
@@ -232,21 +240,22 @@ class _WeightedSwiGLU(torch.autograd.Function):
         if M > 0:
             BLOCK, ROWS, NSPLIT, EVEN, warps = _plan(D, M, ctx.use_libdevice)
             grid = (_cdiv(M, ROWS), NSPLIT)
-            _fwd_kernel[grid](
-                y,
-                weights.view(-1),
-                out,
-                D,
-                M,
-                NSPLIT=NSPLIT,
-                ROWS=ROWS,
-                BLOCK=BLOCK,
-                EVEN=EVEN,
-                STAGED=_staged(y.dtype),
-                INTERLEAVED=_INTERLEAVED,
-                USE_LIBDEVICE=ctx.use_libdevice,
-                num_warps=warps,
-            )
+            with torch_device_fn.device(y.device):
+                _fwd_kernel[grid](
+                    y,
+                    weights.view(-1),
+                    out,
+                    D,
+                    M,
+                    NSPLIT=NSPLIT,
+                    ROWS=ROWS,
+                    BLOCK=BLOCK,
+                    EVEN=EVEN,
+                    STAGED=_staged(y.dtype),
+                    INTERLEAVED=_INTERLEAVED,
+                    USE_LIBDEVICE=ctx.use_libdevice,
+                    num_warps=warps,
+                )
         ctx.save_for_backward(y, weights)
         return out
 
@@ -280,27 +289,28 @@ class _WeightedSwiGLU(torch.autograd.Function):
             grad_w = torch.empty(1, dtype=torch.float32, device=y.device)
         if M > 0:
             grid = (_cdiv(M, ROWS), NSPLIT)
-            _bwd_kernel[grid](
-                y,
-                weights.view(-1),
-                go,
-                grad_y,
-                grad_w,
-                D,
-                M,
-                NSPLIT=NSPLIT,
-                ROWS=ROWS,
-                BLOCK=BLOCK,
-                EVEN=EVEN,
-                STAGED=_staged(y.dtype),
-                INTERLEAVED=_INTERLEAVED,
-                USE_LIBDEVICE=ctx.use_libdevice,
-                DO_DX=need_y,
-                DO_DW=need_w,
-                ATOMIC_DW=atomic,
-                num_warps=warps,
-                enable_fp_fusion=False,
-            )
+            with torch_device_fn.device(y.device):
+                _bwd_kernel[grid](
+                    y,
+                    weights.view(-1),
+                    go,
+                    grad_y,
+                    grad_w,
+                    D,
+                    M,
+                    NSPLIT=NSPLIT,
+                    ROWS=ROWS,
+                    BLOCK=BLOCK,
+                    EVEN=EVEN,
+                    STAGED=_staged(y.dtype),
+                    INTERLEAVED=_INTERLEAVED,
+                    USE_LIBDEVICE=ctx.use_libdevice,
+                    DO_DX=need_y,
+                    DO_DW=need_w,
+                    ATOMIC_DW=atomic,
+                    num_warps=warps,
+                    enable_fp_fusion=False,
+                )
         if need_w:
             grad_w = grad_w.view(weights.shape)
         else:

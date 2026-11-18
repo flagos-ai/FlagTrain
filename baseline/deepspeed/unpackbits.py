@@ -86,3 +86,26 @@ def key_shape(binding):
     shape = binding["shape"]
     n_bytes = (shape[-1] + 7) // 8
     return [*shape[:-1], n_bytes]
+
+
+def config(binding, dtype):
+    """Describe the real inputs/outputs for baseline matching."""
+    shape = list(binding["shape"])
+    last = shape[-1]
+    n_bytes = (last + 7) // 8
+    return {
+        "inputs": {
+            "packed": {
+                "shape": [*shape[:-1], n_bytes],
+                "dtype": "torch.uint8",
+            },
+        },
+        "outputs": {
+            # Unpacking emits eight values per packed byte.
+            "out": {
+                "shape": [*shape[:-1], n_bytes * 8],
+                "dtype": str(dtype),
+            },
+        },
+        "dims": {"shape": shape, "last_dim": last, "n_bytes": n_bytes},
+    }

@@ -14,9 +14,8 @@
 
 ops:
 - id: bias_geglu_impl
-  description: 'Bias plus GeGLU fusion: bias add, gate/linear split, and GELU or
-    QuickGELU gating in one kernel. Forward only; the activation variant is selected
-    by arguments.'
+  description: 'Bias plus GeGLU fusion: bias add, gate/linear split, and GELU
+    gating in one kernel. Forward only.'
   for:
   - bias_geglu_impl
   labels:
@@ -27,6 +26,21 @@ ops:
   kind:
   - Activation
   source: megatron.core.fusions.fused_bias_geglu
+  stages:
+  - beta: '0.0.0'
+- id: bias_gelu_impl
+  description: 'Fused bias addition and tanh-approximate GELU. Forward only; bias
+    addition rounds to the input dtype before FP32 activation arithmetic.'
+  for:
+  - bias_gelu_impl
+  labels:
+  - megatron
+  - activation
+  from:
+  - megatron
+  kind:
+  - Activation
+  source: megatron.core.fusions.fused_bias_gelu
   stages:
   - beta: '0.0.0'
 - id: bias_swiglu_impl
