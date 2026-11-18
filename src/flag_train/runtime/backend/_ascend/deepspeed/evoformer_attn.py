@@ -300,7 +300,6 @@ def _attention(q, k, v, bias1=None, bias2=None):
     and the grid differ -- see this module's docstring.  The public
     ``evoformer_attn`` below wraps this with DeepSpeed's interface.
     """
-    logger.debug("TRAIN_ASCEND EVOFORMER_ATTN")
 
     bias1 = _normalize_bias(bias1, q)
     bias2 = _normalize_bias(bias2, q)
@@ -410,6 +409,7 @@ def evoformer_attn(Q, K, V, biases):
     internal ``_attention`` above is the Ascend kernel and still returns
     ``(out, lse)``.
     """
+    logger.debug("TRAIN_ASCEND EVOFORMER_ATTN")
     bias1, bias2 = _normalize_biases(biases)
     q = Q.contiguous()
     k = K.contiguous()
