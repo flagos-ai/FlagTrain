@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused bias + GeGLU, including the quick_gelu variant.
+"""Fused bias + GeGLU.
 
 Forward only. One token is one row; the last dimension is the concatenated
 ``[gate | linear]`` and the output keeps the gated half. Bias is added inside
@@ -20,14 +20,9 @@ the kernel.
 
 The backward is a separate operator with its own implementation file, so this
 module saves nothing for autograd and defines no ``torch.autograd.Function``.
-``fp8_input_store`` and ``cpu_offload_input`` stay in the public signature for
-Megatron-LM compatibility, but they only ever affected the activations saved
-for the backward; passing either one raises ``NotImplementedError``.
 """
 
 import logging
-import math
-import numbers
 
 import torch
 import triton
@@ -45,86 +40,73 @@ _BLOCK_SIZE = 1024
 _MIN_BLOCK_SIZE = 16
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# Provided by the platform layer. ``tl.sigmoid`` is a core Triton builtin;
 # ``tl_extra_shim.tanh`` maps to libdevice and falls back to an exp-based
 # form on backends without it.
-_sigmoid = tl.sigmoid
 _tanh = tl_extra_shim.tanh
 
-_MODE_GELU = 0
-_MODE_QUICK = 1
 
 _BIAS_NONE = 0
 _BIAS_VECTOR = 1
 _BIAS_FULL = 2
 
-# sqrt(2/pi) and the cubic coefficient of the tanh GELU approximation;
-# 1.702 is the quick_gelu sigmoid scale. All match Megatron-LM exactly.
+# sqrt(2/pi) and the cubic coefficient of the tanh GELU approximation.
 _GELU_SQRT_2_OVER_PI = tl.constexpr(0.79788456)
 _GELU_COEFF = tl.constexpr(0.044715)
-_QUICK_GELU_SCALE = tl.constexpr(1.702)
-
-
-def _check_input(tensor, name):
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} needs a tensor, got {type(tensor).__name__}")
-    if tensor.dtype not in _DTYPES:
-        wanted = " / ".join(str(dtype) for dtype in _DTYPES)
-        raise ValueError(f"{name} needs a {wanted} tensor, got {tensor.dtype}")
-    if tensor.device.type == "cpu":
-        raise ValueError(f"{name} needs a device tensor, not one on the CPU")
-    if tensor.device.type != runtime_device.name:
-        raise ValueError(
-            f"{name} needs a {runtime_device.name} tensor, got {tensor.device.type}"
-        )
 
 
 def _prepare_bias(bias, flat):
-    """Return a kernel bias tensor and a mode.
-
-    Mode vector is one row of ``hidden`` values shared by every token, which
-    is the ``bias`` produced by ``skip_bias_add``. Mode full is a different
-    bias per element and is only used when the tensor really depends on the
-    token index.
-    """
+    """Prepare a bias for the validated Triton fast path."""
     if bias is None:
         return None, _BIAS_NONE
-    _check_input(bias, "bias_geglu bias")
-    if bias.device != flat.device:
-        raise ValueError(f"bias_geglu bias is on {bias.device}, expected {flat.device}")
-    if bias.dtype != flat.dtype:
-        raise ValueError(
-            "bias_geglu bias must have the input dtype, got "
-            f"{bias.dtype} for {flat.dtype}"
-        )
 
     n_rows, hidden = flat.shape
-    flat_shape = (n_rows, hidden)
-    try:
-        expanded = torch.broadcast_to(bias, flat_shape)
-    except RuntimeError:
-        raise ValueError(
-            "bias_geglu bias must broadcast with the flattened input "
-            f"{flat_shape}, got {tuple(bias.shape)}"
-        ) from None
+    expanded = torch.broadcast_to(bias, (n_rows, hidden))
     if n_rows == 0 or hidden == 0:
         return bias, _BIAS_VECTOR
     if expanded.stride(0) == 0:
-        # Same values on every token. Copy one row, not the whole broadcast.
+        # All tokens share one row; do not materialize the full broadcast.
         return expanded[0].contiguous(), _BIAS_VECTOR
     return expanded.contiguous(), _BIAS_FULL
 
 
+def _validate_inputs(flat, bias):
+    """Validate operands supported by the fused Triton forward kernel."""
+    if flat.device.type != runtime_device.name:
+        raise ValueError("bias_geglu input must be on the active device")
+    supported_dtype = flat.dtype in _DTYPES or (
+        flat.dtype == torch.float64 and runtime_device.support_fp64
+    )
+    if not supported_dtype:
+        raise ValueError("bias_geglu input has an unsupported dtype")
+    if not flat.is_contiguous():
+        raise ValueError("bias_geglu input must be contiguous")
+    if flat.shape[-1] % 2 != 0:
+        raise ValueError("bias_geglu input's last dimension must be even")
+
+    if bias is None:
+        return
+    if not isinstance(bias, torch.Tensor):
+        raise TypeError("bias_geglu bias must be a Tensor or None")
+    if bias.device != flat.device:
+        raise ValueError("bias_geglu bias must be on the input device")
+    if bias.dtype != flat.dtype:
+        raise ValueError("bias_geglu bias must have the input dtype")
+
+    try:
+        torch.broadcast_to(bias, flat.shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            "bias_geglu bias must be broadcastable to the flattened input"
+        ) from exc
+
+
 @triton.jit
-def _activate(gate, linear, linear_offset, MODE: tl.constexpr):
-    """Forward value of one gate/linear pair, in fp32."""
-    if MODE == 0:
-        # tanh approximation of GELU:
-        # 0.5 * x * (1 + tanh(sqrt(2/pi) * x * (1 + 0.044715 * x^2)))
-        t = _tanh(_GELU_SQRT_2_OVER_PI * gate * (1.0 + _GELU_COEFF * gate * gate))
-        return 0.5 * gate * (1.0 + t) * linear
-    # quick_gelu: x * sigmoid(1.702 * x); the linear half takes linear_offset.
-    return gate * _sigmoid(_QUICK_GELU_SCALE * gate) * (linear + linear_offset)
+def _activate(gate, linear):
+    """Forward value of one gate/linear pair, in fp32 or fp64."""
+    # tanh approximation of GELU:
+    # 0.5 * x * (1 + tanh(sqrt(2/pi) * x * (1 + 0.044715 * x^2)))
+    t = _tanh(_GELU_SQRT_2_OVER_PI * gate * (1.0 + _GELU_COEFF * gate * gate))
+    return 0.5 * gate * (1.0 + t) * linear
 
 
 @libentry()
@@ -134,11 +116,11 @@ def _bias_geglu_forward_kernel(
     bias_ptr,
     y_ptr,
     n_cols,
-    linear_offset,
     BIAS_MODE: tl.constexpr,
-    MODE: tl.constexpr,
+    IS_FP64: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    COMPUTE_DTYPE: tl.constexpr = tl.float64 if IS_FP64 else tl.float32
     row = tle.program_id(0)
     hidden = n_cols * 2
     x_row = x_ptr + row * hidden
@@ -148,19 +130,19 @@ def _bias_geglu_forward_kernel(
     for start in tl.range(0, n_cols, BLOCK):
         cols = start + tl.arange(0, BLOCK)
         mask = cols < n_cols
-        gate = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
-        linear = tl.load(x_row + n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(x_row + cols, mask=mask, other=0.0).to(COMPUTE_DTYPE)
+        linear = tl.load(x_row + n_cols + cols, mask=mask, other=0.0).to(COMPUTE_DTYPE)
         if BIAS_MODE == 1:
-            gate += tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            gate += tl.load(bias_ptr + cols, mask=mask, other=0.0).to(COMPUTE_DTYPE)
             linear += tl.load(bias_ptr + n_cols + cols, mask=mask, other=0.0).to(
-                tl.float32
+                COMPUTE_DTYPE
             )
         elif BIAS_MODE == 2:
-            gate += tl.load(bias_row + cols, mask=mask, other=0.0).to(tl.float32)
+            gate += tl.load(bias_row + cols, mask=mask, other=0.0).to(COMPUTE_DTYPE)
             linear += tl.load(bias_row + n_cols + cols, mask=mask, other=0.0).to(
-                tl.float32
+                COMPUTE_DTYPE
             )
-        out = _activate(gate, linear, linear_offset, MODE)
+        out = _activate(gate, linear)
         tl.store(y_row + cols, out.to(y_ptr.dtype.element_ty), mask=mask)
 
 
@@ -175,23 +157,13 @@ def _launch_config(n_cols):
 
 
 def _flatten_input(x):
-    _check_input(x, "bias_geglu")
-    if x.ndim not in (2, 3):
-        raise ValueError(
-            f"bias_geglu input must have rank 2 or 3, got rank {x.ndim} "
-            f"shape {tuple(x.shape)}"
-        )
-    hidden = x.shape[-1]
-    if hidden % 2 != 0:
-        raise ValueError(
-            f"bias_geglu input's last dimension must be even, got {hidden}"
-        )
-    flat = x.contiguous().view(-1, hidden)
-    out_shape = (*x.shape[:-1], hidden // 2)
-    return flat, out_shape
+    """Use Megatron's rank check and view semantics exactly."""
+    ori_shape = x.shape
+    assert len(ori_shape) in [2, 3]
+    return x.view(-1, ori_shape[-1]), ori_shape
 
 
-def _forward(flat, bias, mode, linear_offset):
+def _forward(flat, bias):
     """Run the kernel over a flattened ``[rows, hidden]`` view."""
     n_rows, hidden = flat.shape
     n_cols = hidden // 2
@@ -209,74 +181,28 @@ def _forward(flat, bias, mode, linear_offset):
             flat if bias_tensor is None else bias_tensor,
             y,
             n_cols,
-            linear_offset,
             BIAS_MODE=bias_mode,
-            MODE=mode,
+            IS_FP64=flat.dtype == torch.float64,
             BLOCK=block,
             num_warps=num_warps,
         )
     return y
 
 
-def bias_geglu_impl(
-    input,
-    bias,
-    fp8_input_store=False,
-    cpu_offload_input=False,
-    activation="gelu",
-    linear_offset=0.0,
-):
-    """Bias plus GeGLU, with the quick_gelu variant.
+def bias_geglu_impl(input, bias):
+    """Apply Megatron-compatible bias + GEGLU forward.
 
-    Forward only: the backward is a separate operator.
-
-    Args:
-        input (Tensor): rank-2 or rank-3 fp16, bf16 or fp32 tensor on the
-            active device. The last dimension is ``[gate | linear]`` and must
-            be even. A non-contiguous input is copied.
-        bias (Tensor or None): added to ``input`` before the activation.
-            ``None`` skips the add. A bias of shape ``[hidden]`` is the
-            ``skip_bias_add`` case. It must have the same dtype as ``input``.
-        fp8_input_store (bool): accepted for Megatron-LM signature
-            compatibility only. It affected the saved activations, so passing
-            ``True`` raises ``NotImplementedError``.
-        cpu_offload_input (bool): same as ``fp8_input_store``.
-        activation (str): ``"gelu"`` for the tanh-approximated GELU,
-            ``"quick_gelu"`` for ``x * sigmoid(1.702 * x)``.
-        linear_offset (float): offset added to the linear half before
-            gating. Only valid with ``activation="quick_gelu"``.
-
-    Returns:
-        Tensor: same rank and dtype as ``input``, with the last dimension halved.
+    The input must be contiguous and on the active device. Supported dtypes
+    are fp16/bf16/fp32, plus fp64 on devices with FP64 support. Bias must be
+    None or a same-device, same-dtype tensor broadcastable to the flattened
+    input. All activation arithmetic runs in the Triton kernel.
     """
     logger.debug("TRAIN BIAS_GEGLU_IMPL")
-    if bias is not None and not isinstance(bias, torch.Tensor):
-        raise TypeError(
-            f"bias_geglu bias needs a tensor or None, got {type(bias).__name__}"
-        )
-    if fp8_input_store or cpu_offload_input:
-        raise NotImplementedError(
-            "bias_geglu_impl is forward-only; fp8_input_store and "
-            "cpu_offload_input only affected the activations saved for the "
-            "backward"
-        )
-    if activation == "gelu":
-        if linear_offset != 0.0:
-            raise ValueError("linear_offset is only used by quick_gelu")
-        mode = _MODE_GELU
-    elif activation == "quick_gelu":
-        mode = _MODE_QUICK
-    else:
-        raise ValueError(
-            f"activation must be 'gelu' or 'quick_gelu', got {activation!r}"
-        )
-    if isinstance(linear_offset, bool) or not isinstance(linear_offset, numbers.Real):
-        raise TypeError(
-            f"linear_offset needs a finite float, got {type(linear_offset).__name__}"
-        )
-    linear_offset = float(linear_offset)
-    if not math.isfinite(linear_offset):
-        raise ValueError(f"linear_offset must be finite, got {linear_offset}")
+    flat, ori_shape = _flatten_input(input)
 
-    flat, out_shape = _flatten_input(input)
-    return _forward(flat, bias, mode, linear_offset).view(out_shape)
+    _validate_inputs(flat, bias)
+    output = _forward(flat, bias)
+
+    return (
+        output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+    )
