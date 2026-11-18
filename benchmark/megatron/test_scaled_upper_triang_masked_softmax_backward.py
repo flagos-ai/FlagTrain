@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import types
+import warnings
 
 import pytest
 import torch
@@ -19,25 +19,6 @@ import torch
 import flag_train
 
 from .. import base
-
-# Megatron's class imports its Apex extension inside forward/backward, so probe
-# the two independently.
-try:
-    import megatron.core.fusions.fused_softmax
-
-    _HAS_MEGATRON = True
-except ImportError:
-    _HAS_MEGATRON = False
-
-try:
-    import scaled_upper_triang_masked_softmax_cuda  # noqa: F401
-
-    _HAS_APEX = True
-except ImportError:
-    _HAS_APEX = False
-
-# Megatron's CUDA fused kernel rejects fp32.
-_DTYPES = [torch.float16, torch.bfloat16]
 
 # Scales are not comparable across runs if they differ, so the 1/sqrt(d) used
 # for attention scores is fixed here.
@@ -58,103 +39,151 @@ _SHAPES = [
     (8, 8192, 8192),
 ]
 
-# On Ascend the reference runs on torch_npu.npu_scaled_masked_softmax: it takes
-# fp32, and its ``apply`` is differentiable where the Apex-backed ``backward``
-# is not importable.
-_ASCEND_AUTOGRAD = False
+# Megatron's CUDA fused kernel rejects fp32.
+_DTYPES = [torch.float16, torch.bfloat16]
+
+# On Ascend the reference runs on torch_npu.npu_scaled_masked_softmax, which
+# supports fp32.
 if flag_train.vendor_name == "ascend":
     _DTYPES.append(torch.float32)
-    _ASCEND_AUTOGRAD = _HAS_MEGATRON
+
+_EXTENSION = "scaled_upper_triang_masked_softmax_cuda"
+
+_NO_BASELINE = "none (no on-machine baseline; --base-data is the only comparison)"
 
 
-def _mask(x):
-    """True above the diagonal of each ``sq x sk`` matrix."""
-    rows = torch.arange(x.shape[-2], device=x.device).unsqueeze(-1)
-    cols = torch.arange(x.shape[-1], device=x.device).unsqueeze(0)
-    return cols > rows
+class _SavedForBackward:
+    """Stand-in for the context ``ScaledUpperTriangMaskedSoftmax.backward`` takes.
 
-
-def scaled_upper_triang_masked_softmax_forward_ref(x, scale):
-    """Forward composition, the same one the forward suite falls back to."""
-    scores = x.to(torch.float32) * scale
-    masked = _mask(x)
-    scores = scores.masked_fill(masked, float("-inf"))
-    probs = torch.softmax(scores, dim=-1)
-    return probs.masked_fill(masked, 0.0).to(x.dtype)
-
-
-def scaled_upper_triang_masked_softmax_backward_ref(grad_output, output, scale):
-    """``scale * y * (dy - rowsum(dy * y))`` over the kept prefix, zero above it."""
-    masked = _mask(output)
-    dy = grad_output.to(torch.float32)
-    # Masked entries are zero already; fill anyway in case they are not.
-    y = output.to(torch.float32).masked_fill(masked, 0.0)
-    total = (dy * y).sum(dim=-1, keepdim=True)
-    dx = scale * y * (dy - total)
-    return dx.masked_fill(masked, 0.0).to(grad_output.dtype)
-
-
-def _forward(x, scale):
-    """The forward output the case hands to the operator."""
-    if _ASCEND_AUTOGRAD or (_HAS_MEGATRON and _HAS_APEX):
-        return megatron.core.fusions.fused_softmax.ScaledUpperTriangMaskedSoftmax.apply(
-            x.contiguous(), scale
-        )
-    return scaled_upper_triang_masked_softmax_forward_ref(x, scale)
-
-
-if _ASCEND_AUTOGRAD:
-    _BASELINE = (
-        "megatron-core ScaledUpperTriangMaskedSoftmax.apply + torch.autograd "
-        "(Ascend)"
-    )
-elif _HAS_MEGATRON and _HAS_APEX:
-    _BASELINE = "megatron-core ScaledUpperTriangMaskedSoftmax.backward"
-else:
-    _BASELINE = "scaled_upper_triang_masked_softmax_backward_ref (torch)"
-
-
-class _BaselineBackward:
-    """Megatron's backward, or the torch composition without the Apex kernels.
-
-    With Apex the static ``backward`` runs behind a stand-in ctx and overwrites
-    ``grad_output``, so repeats see the previous result; only shape and dtype
-    reach the timing. On Ascend it is not importable, so the gradient comes from
-    ``apply`` + ``torch.autograd``, graphed once per case. ``_source`` keeps that
-    case's ``output`` alive.
+    Megatron's forward saves ``(softmax_results, scale_t)``; the backward only
+    reads ``ctx.saved_tensors``, so a two-attribute object runs the installed
+    body without a forward pass in the timed region.
     """
 
-    def __init__(self):
+    def __init__(self, softmax_results, scale):
+        self.saved_tensors = (softmax_results, torch.tensor([scale]))
+
+
+def _vendored_backward(grad_output, output, scale):
+    """``ScaledUpperTriangMaskedSoftmax.backward``'s body, minus the ``ctx``."""
+    import scaled_upper_triang_masked_softmax_cuda
+
+    return scaled_upper_triang_masked_softmax_cuda.backward(grad_output, output, scale)
+
+
+class _MegatronClassBackward:
+    """Megatron's static ``backward`` behind a saved-tensor ctx.
+
+    The ctx is built once per case: ``torch.tensor([scale])`` inside the timed
+    region would charge the baseline for work Megatron does in its forward.
+    Megatron's CUDA backward overwrites ``grad_output``, so repeats run on the
+    previous result; only shape and dtype reach the timing.
+    """
+
+    def __init__(self, cls):
+        self._cls = cls
+        self._source = None
+        self._ctx = None
+
+    def __call__(self, grad_output, output, scale):
+        if output is not self._source:
+            self._source = output
+            self._ctx = _SavedForBackward(output, scale)
+        return self._cls.backward(self._ctx, grad_output)[0]
+
+
+class _MegatronAutogradBackward:
+    """``torch.autograd`` through Megatron's Ascend ``apply``, graphed once per case.
+
+    The graph is built outside the timed region and re-run with
+    ``retain_graph=True``.
+    """
+
+    def __init__(self, apply):
+        self._apply = apply
         self._source = None
 
     def __call__(self, grad_output, output, scale):
-        if _ASCEND_AUTOGRAD:
-            if output is not self._source:
-                self._source = output
-                self._leaf = torch.randn(
-                    output.shape, dtype=output.dtype, device=output.device
-                ).requires_grad_(True)
-                self._output = megatron.core.fusions.fused_softmax.ScaledUpperTriangMaskedSoftmax.apply(
-                    self._leaf, scale
-                )
-            return torch.autograd.grad(
-                self._output, self._leaf, grad_output, retain_graph=True
-            )[0]
-
-        if not (_HAS_MEGATRON and _HAS_APEX):
-            return scaled_upper_triang_masked_softmax_backward_ref(
-                grad_output, output, scale
-            )
         if output is not self._source:
             self._source = output
-            self._ctx = types.SimpleNamespace(
-                saved_tensors=(output, torch.tensor([scale]))
+            self._leaf = torch.randn(
+                output.shape, dtype=output.dtype, device=output.device
+            ).requires_grad_(True)
+            self._output = self._apply(self._leaf, scale)
+        return torch.autograd.grad(
+            self._output, self._leaf, grad_output, retain_graph=True
+        )[0]
+
+
+def _warn_missing_baseline(reason):
+    """Report a missing on-machine baseline: no torch composition stands in."""
+    warnings.warn(
+        f"{reason} This run has no on-machine baseline; a torch composition is "
+        "not timed, so --base-data is the only comparison.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def _resolve_megatron_baseline():
+    """``(op, label)``: Megatron's backward, or ``None`` when this machine has none."""
+    try:
+        from megatron.core.fusions.fused_softmax import ScaledUpperTriangMaskedSoftmax
+    except Exception as exc:  # pragma: no cover - depends on the installation
+        cls = None
+        import_error = exc
+    else:
+        cls = ScaledUpperTriangMaskedSoftmax
+        import_error = None
+
+    if flag_train.vendor_name == "ascend":
+        if cls is None:
+            _warn_missing_baseline(
+                "Megatron-LM's ScaledUpperTriangMaskedSoftmax could not be "
+                f"imported ({import_error!r})."
             )
+            return None, _NO_BASELINE
+        # Megatron's ``backward`` imports the Apex extension, which Ascend does
+        # not ship; its NPU plugin points ``apply`` at
+        # ``torch_npu.npu_scaled_masked_softmax``, which is differentiable.
         return (
-            megatron.core.fusions.fused_softmax.ScaledUpperTriangMaskedSoftmax.backward(
-                self._ctx, grad_output
-            )[0]
+            _MegatronAutogradBackward(cls.apply),
+            "megatron-core ScaledUpperTriangMaskedSoftmax.apply + torch.autograd "
+            "(Ascend)",
         )
+
+    try:
+        import scaled_upper_triang_masked_softmax_cuda  # noqa: F401
+    except ImportError:
+        _warn_missing_baseline(
+            "Megatron-LM's fused upper-triangular softmax needs the Apex CUDA "
+            f"extension {_EXTENSION!r}, which is not installed."
+        )
+        return None, _NO_BASELINE
+
+    if cls is not None:
+        return (
+            _MegatronClassBackward(cls),
+            "megatron-core ScaledUpperTriangMaskedSoftmax.backward",
+        )
+
+    warnings.warn(
+        "megatron.core.fusions.fused_softmax.ScaledUpperTriangMaskedSoftmax "
+        f"could not be imported ({import_error!r}); using its vendored body "
+        f"against the same Apex extension {_EXTENSION!r}.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return (
+        _vendored_backward,
+        "Megatron-LM ScaledUpperTriangMaskedSoftmax.backward (vendored body)",
+    )
+
+
+# Resolved once, so the first-use import is not counted in the measurement.
+# ``None`` is the benchmark harness's "no on-machine baseline" sentinel; the
+# harness checks ``torch_op is not None`` before timing anything.
+torch_op, _BASELINE = _resolve_megatron_baseline()
 
 
 class _ScaledUpperTriangMaskedSoftmaxBackwardBenchmark(base.GenericBenchmark):
@@ -166,10 +195,19 @@ class _ScaledUpperTriangMaskedSoftmaxBackwardBenchmark(base.GenericBenchmark):
 
 
 def scaled_upper_triang_masked_softmax_backward_input_fn(shape, dtype, device):
-    """``(grad_output, output, scale)``; ``output`` is the reference's forward."""
-    x = torch.randn(shape, dtype=dtype, device=device)
+    """``(grad_output, output, scale)`` for one ``[attn_batches, sq, sk]`` case.
+
+    ``output`` is a plausible forward result: non-negative rows that sum to one
+    over the kept prefix and are zero above the diagonal. The kernels' latency
+    does not depend on the values, so no forward pass is needed here.
+    """
+    rows = torch.arange(shape[-2], device=device).unsqueeze(-1)
+    cols = torch.arange(shape[-1], device=device).unsqueeze(0)
     grad_output = torch.randn(shape, dtype=dtype, device=device)
-    yield grad_output, _forward(x, _SCALE), _SCALE
+    output = torch.rand(shape, dtype=dtype, device=device)
+    output = output.masked_fill(cols > rows, 0.0)
+    output = output / output.sum(dim=-1, keepdim=True)
+    yield grad_output, output, _SCALE
 
 
 @pytest.mark.scaled_upper_triang_masked_softmax_backward
@@ -178,7 +216,7 @@ def test_scaled_upper_triang_masked_softmax_backward():
     bench = _ScaledUpperTriangMaskedSoftmaxBackwardBenchmark(
         input_fn=scaled_upper_triang_masked_softmax_backward_input_fn,
         op_name="scaled_upper_triang_masked_softmax_backward",
-        torch_op=_BaselineBackward(),
+        torch_op=torch_op,
         dtypes=_DTYPES,
     )
     bench.set_train(flag_train.megatron.scaled_upper_triang_masked_softmax_backward)

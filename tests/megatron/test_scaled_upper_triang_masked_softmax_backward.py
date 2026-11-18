@@ -75,6 +75,14 @@ elif _HAS_MEGATRON and _HAS_APEX:
 else:
     _BASELINE = "scaled_upper_triang_masked_softmax_backward_ref (torch)"
 
+# Where Megatron's fused path is available, the fallback composition is held to
+# it; elsewhere the comparison has no native side and is skipped.
+_HAVE_NATIVE = _ASCEND_AUTOGRAD or (_HAS_MEGATRON and _HAS_APEX)
+needs_native = pytest.mark.skipif(
+    not _HAVE_NATIVE,
+    reason="Megatron's fused upper-triangular softmax is not available here",
+)
+
 
 def _mask(x):
     """True above the diagonal of each ``sq x sk`` matrix."""
@@ -181,6 +189,28 @@ def test_scaled_upper_triang_masked_softmax_backward_zero_grad(dtype):
         ref = utils.to_reference(ref)
 
     utils.train_assert_close(res, ref, dtype)
+
+
+@needs_native
+@pytest.mark.scaled_upper_triang_masked_softmax_backward
+@pytest.mark.parametrize("shape", _SHAPES)
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("scale", _SCALES)
+def test_torch_composition_matches_megatron(shape, dtype, scale):
+    """The fallback composition must reproduce the native interface.
+
+    ``scaled_upper_triang_masked_softmax_backward_ref`` is the oracle where
+    Megatron's fused path cannot run; pinning it here keeps that fallback from
+    drifting away from the operator it stands in for.
+    """
+    utils.init_seed(3)
+    x = torch.randn(shape, dtype=dtype, device=flag_train.device)
+    grad_output = torch.randn(shape, dtype=dtype, device=flag_train.device)
+
+    output, expected = _reference(x, grad_output, scale)
+    actual = scaled_upper_triang_masked_softmax_backward_ref(grad_output, output, scale)
+
+    utils.train_assert_close(actual, utils.to_reference(expected), dtype)
 
 
 @pytest.mark.scaled_upper_triang_masked_softmax_backward
