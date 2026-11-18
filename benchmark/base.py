@@ -655,6 +655,13 @@ class Benchmark:
         Config.executed_case_ids.update(executed)
         return results
 
+    def _warmup_profile_case(self, case):
+        args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
+        warmup, _ = self._prepare_call(self.train_op, args, kwargs)
+        for _ in range(Config.profile_warmup):
+            warmup()
+        torch_device_fn.synchronize()
+
     def _run_profile_case(self, case_id):
         if not self.supports_cases():
             raise ValueError(
@@ -673,10 +680,7 @@ class Benchmark:
             )
 
         if Config.profile_warmup:
-            args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
-            warmup, _ = self._prepare_call(self.train_op, args, kwargs)
-            for _ in range(Config.profile_warmup):
-                warmup()
+            self._warmup_profile_case(case)
         args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
         capture, _ = self._prepare_call(self.train_op, args, kwargs)
         torch_device_fn.synchronize()

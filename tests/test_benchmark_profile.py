@@ -77,6 +77,7 @@ def candidate(x):
 """,
     )
     (benchmark / "test_probe.py").write_text("""
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -88,6 +89,8 @@ from events import record
 from flag_train.reference_candidate import get_candidate
 
 class ProbeBenchmark(base.GenericBenchmark):
+    prepared_input = None
+
     def set_shapes(self, shape_file=None):
         self.shapes = [(1,), (2,)]
 
@@ -96,6 +99,15 @@ class ProbeBenchmark(base.GenericBenchmark):
 
     def get_latency(self, *args, **kwargs):
         pytest.fail("Profile must bypass the timer")
+
+    def build_inputs(self, case):
+        if self.prepared_input is not None:
+            assert self.prepared_input() is None, "Warmup input is still live"
+        return super().build_inputs(case)
+
+    def _prepare_call(self, op, args, kwargs):
+        self.prepared_input = weakref.ref(args[0])
+        return super()._prepare_call(op, args, kwargs)
 
 def baseline(*args, **kwargs):
     pytest.fail("Profile must bypass the baseline")
@@ -182,6 +194,7 @@ def test_profile_warms_up_with_separate_inputs_and_closes_scope(
         "build:2",
         "call:0",
         "call:1",
+        "sync",
         "build:2",
         "sync",
         f"enter:{FORWARD_CASE}",
@@ -193,11 +206,13 @@ def test_profile_warms_up_with_separate_inputs_and_closes_scope(
     assert not (suite.path / "accuracy_result.json").exists()
 
 
-def test_profile_captures_backward_after_building_graph(suite):
+@pytest.mark.parametrize("warmup", [0, 1])
+def test_profile_captures_backward_after_building_graph(suite, warmup):
     run_profile(
-        suite, "--case-id", BACKWARD_CASE, "--profile-warmup", "0"
+        suite, "--case-id", BACKWARD_CASE, "--profile-warmup", str(warmup)
     ).assert_outcomes(passed=1)
     assert (suite.path / "events.txt").read_text().splitlines() == [
+        *(["build:2", "forward", "backward", "sync"] if warmup else []),
         "build:2",
         "forward",
         "sync",
@@ -212,7 +227,25 @@ def test_profile_rejects_unknown_workload(suite):
     result = run_profile(suite, "--case-id", f"{NODE}[forward]::core::float32::99")
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result.stdout.fnmatch_lines(["*case selection failed: unknown=*99*"])
+    assert "Traceback" not in result.stderr.str()
+    assert "candidate implementation was never invoked" not in result.stderr.str()
     assert not (suite.path / "events.txt").exists()
+
+
+def test_profile_checks_unused_overrides_after_successful_replay(suite):
+    result = run_profile(
+        suite,
+        "--case-id",
+        FORWARD_CASE,
+        "--profile-warmup",
+        "0",
+        "--override",
+        "megatron.unused_profile_probe:candidate.py:candidate",
+    )
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.stderr.fnmatch_lines(
+        ["*unused_profile_probe*its candidate implementation was never invoked*"]
+    )
 
 
 @pytest.mark.parametrize(

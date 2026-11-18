@@ -180,6 +180,8 @@ def pytest_sessionfinish(session, exitstatus):
 
 def pytest_unconfigure(config):
     """Cleanup: restore all overridden operators."""
+    if config.getoption("profile_only", False):
+        return
     if hasattr(config, "_override_registry"):
         config._override_registry.restore_all()
 
