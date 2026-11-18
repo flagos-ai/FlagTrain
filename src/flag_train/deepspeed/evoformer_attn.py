@@ -544,7 +544,6 @@ def _attention(q, k, v, bias1=None, bias2=None):
     when ``flag_train.deepspeed`` is imported.  Import the public operator from
     ``flag_train.deepspeed``, not from this module.
     """
-    logger.debug("TRAIN EVOFORMER_ATTN")
 
     bias1 = _normalize_bias(bias1, q)
     bias2 = _normalize_bias(bias2, q)
@@ -633,6 +632,7 @@ def evoformer_attn(Q, K, V, biases):
         still produced by the internal ``_attention`` layer but, as in
         upstream's public entry, is not returned here.
     """
+    logger.debug("TRAIN EVOFORMER_ATTN")
     bias1, bias2 = _normalize_biases(biases)
 
     # Upstream's public entry reaches the kernel through a wrapper that makes
