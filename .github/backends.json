@@ -17,7 +17,7 @@
   {
     "backend": "ascend-cann900",
     "vendor": "ascend",
-    "runner_label": "cann9",
+    "runner_label": "flagcicd-910c",
     "command_aliases": [
       "ascend",
       "cann9"
@@ -25,9 +25,14 @@
     "label": "vendor/Ascend",
     "gpu_check": "tools/gpu_check_ascend.sh",
     "label_gated": true,
-    "prebuilt_env": false,
-    "enabled": true,
-    "note": "Native, like FlagGems' ascend job: the cann9 runner's own process cannot reach /var/run/docker.sock, so a `container:` job never starts there (the runner fails at 'Checking docker version' before any step runs). No container block, so backend-test.yaml picks its native job, and setup_env.sh --no-prebuilt installs the CANN torch stack from backends.yaml into a job-local venv."
+    "prebuilt_env": true,
+    "enabled": false,
+    "container": {
+      "image": "harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-ascend-cann9.0.0-910c:2.2.0-0.2.3",
+      "options": "--ipc=host --privileged --device=/dev/davinci_manager --device=/dev/devmm_svm --device=/dev/hisi_hdc -v /usr/local/Ascend/driver:/usr/local/Ascend/driver -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi",
+      "runs_on": "flagcicd-910c"
+    },
+    "note": "Temporarily disabled (enabled=false): the 910C path is still being brought up (image pull, FlagTree compiler) and should not gate PRs. Flip enabled back to true when it is ready. Container job on the 910C ARC runner (flagcicd-910c) using the FlagOS Megatron app image, with the host driver userspace (/usr/local/Ascend/driver, /usr/local/dcmi) and npu-smi bind-mounted; prebuilt_env keeps the image's torch/flagtree stack and setup_env.sh's post_deps adds the test packages."
   },
   {
     "backend": "hygon",

@@ -322,10 +322,31 @@ class Benchmark:
         ``record_shapes`` is what the report prints, and a benchmark may
         compress it for readability (e.g. a long list of tensors on one line).
         The baseline lookup needs the individual tensor dimensions to build
-        its signature, so it goes through this hook instead; by default the
-        two are the same.
+        its signature, so it goes through this hook instead.
+
+        A tensor contributes its size *and* dtype, not its size alone: baseline
+        records describe their operands by both, and two variants of one shape
+        can differ only in a dtype -- a float32 gate beside a float16
+        activation, say. Keeping the dtype here is what lets the lookup pick
+        the variant's own record instead of the regular one.
         """
-        return self.record_shapes(*args, **kwargs)
+
+        def deep_parse(item):
+            if isinstance(item, torch.Tensor):
+                return (item.size(), item.dtype)
+            elif isinstance(item, (int, float, str, torch.dtype)):
+                return item
+            elif isinstance(item, (list, tuple)):
+                return [deep_parse(sub_item) for sub_item in item]
+            elif isinstance(item, dict):
+                return {key: deep_parse(value) for key, value in item.items()}
+            return None
+
+        parsed_args = [deep_parse(arg) for arg in args]
+        parsed_kwargs = {key: deep_parse(value) for key, value in kwargs.items()}
+        if parsed_args and parsed_kwargs:
+            return parsed_args, parsed_kwargs
+        return parsed_args if parsed_args else parsed_kwargs
 
     def init_default_config(self):
         self.set_shapes(self.DEFAULT_SHAPE_FILES)
