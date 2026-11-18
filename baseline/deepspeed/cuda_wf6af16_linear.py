@@ -191,3 +191,36 @@ def key_shape(binding):
     # First yielded tensor: hidden [tokens, in_channels]; unique per shape.
     tokens, in_channels, _ = binding["shape"]
     return [tokens, in_channels]
+
+
+def config(binding, dtype):
+    """Describe the real inputs/outputs for baseline matching."""
+    tokens, in_channels, out_channels = binding["shape"]
+    return {
+        "inputs": {
+            "hidden": {"shape": [tokens, in_channels], "dtype": str(dtype)},
+            # FP6 codes repacked into the kernel's 2-bit and 4-bit slices.
+            "weights_2bit": {
+                "shape": [out_channels, in_channels // 4],
+                "dtype": "torch.uint8",
+            },
+            "weights_4bit": {
+                "shape": [out_channels, in_channels // 2],
+                "dtype": "torch.uint8",
+            },
+            "scales": {"shape": [out_channels], "dtype": "torch.float16"},
+            # DeepSpeed's own packing; preprocess_weight returns flat buffers.
+            "ds_w2": {
+                "shape": [out_channels * in_channels // 4],
+                "dtype": "torch.uint8",
+            },
+            "ds_w4": {
+                "shape": [out_channels * in_channels // 2],
+                "dtype": "torch.uint8",
+            },
+        },
+        "outputs": {
+            "out": {"shape": [tokens, out_channels], "dtype": "torch.float16"},
+        },
+        "dims": {"M": tokens, "K": in_channels, "N": out_channels},
+    }

@@ -39,6 +39,15 @@ public forward dispatches to the cuTile kernel and its fused backward is what
 
 import torch
 
+# The collector profiles the backward under an NVTX range, but
+# torch.autograd.grad runs its backward kernels on autograd worker threads,
+# which do not inherit that thread-local range. Keep autograd on the calling
+# thread so Nsight Compute profiles the whole backward instead of nothing.
+try:
+    torch.autograd.set_multithreading_enabled(False)
+except AttributeError:
+    pass
+
 OP_NAME = "fused_proj_rms_compute_h_backward"
 DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
