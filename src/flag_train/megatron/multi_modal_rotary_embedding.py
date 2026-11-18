@@ -31,6 +31,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.runtime import torch_device_fn
+
 
 @triton.jit
 def _mrope_freqs_kernel(
@@ -60,7 +62,7 @@ def _mrope_freqs_kernel(
     # decode (s, b) from the flat output row id (sequence-major layout)
     s = rows // B
     b = rows - s * B
-    p_off = b * SB + s * SS
+    p_off = b.to(tl.int64) * SB + s.to(tl.int64) * SS
 
     p0 = tl.load(pos_ptr + p_off, mask=rmask, other=0).to(tl.float32)
     p1 = tl.load(pos_ptr + SM + p_off, mask=rmask, other=0).to(tl.float32)
@@ -73,7 +75,7 @@ def _mrope_freqs_kernel(
     cols = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = cols < M
     jr = tl.where(cols < D, cols, cols - D)  # j % D
-    f = tl.load(freq_ptr + jr * SF, mask=cmask, other=0.0)
+    f = tl.load(freq_ptr + jr.to(tl.int64) * SF, mask=cmask, other=0.0)
 
     sel0 = jr < C0
     sel1 = jr < (C0 + C1)
@@ -154,12 +156,15 @@ def multi_modal_rotary_embedding(
         position_ids = position_ids.unsqueeze(1)
     if position_ids.ndim != 3 or position_ids.shape[0] != 3 or inv_freq.ndim != 1:
         raise ValueError("expected position_ids [3, B, S] and inv_freq [D]")
+    if position_ids.device != inv_freq.device:
+        raise ValueError("position_ids and inv_freq must be on the same device")
     shape, grid, num_warps, args, is_empty = _make_entry(
         position_ids, inv_freq, mrope_section, seq_len_interpolation_factor
     )
     out = torch.empty(shape, dtype=torch.float32, device=position_ids.device)
     if not is_empty:
-        _mrope_freqs_kernel[grid](
-            position_ids, inv_freq, out, *args, num_warps=num_warps
-        )
+        with torch_device_fn.device(position_ids.device):
+            _mrope_freqs_kernel[grid](
+                position_ids, inv_freq, out, *args, num_warps=num_warps
+            )
     return out
