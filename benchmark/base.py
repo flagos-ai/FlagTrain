@@ -16,6 +16,7 @@ import gc
 import math
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any, Collection, Generator, List, Optional, Tuple
 
@@ -371,35 +372,35 @@ class Benchmark:
     def set_train(self, train_op):
         self.train_op = train_op
 
+    def _prepare_call(self, op, args, kwargs):
+        if not self.is_backward:
+            return lambda: op(*args, **kwargs), None
+
+        # Build the forward graph before timing or opening a capture scope.
+        out = op(*args, **kwargs)
+        dout = torch.randn_like(out)
+        xs = [x for x in args if torch.is_tensor(x) and x.requires_grad]
+
+        def run_derivative():
+            return torch.autograd.grad(
+                (out,), xs, grad_outputs=(dout,), retain_graph=True
+            )
+
+        return run_derivative, xs
+
     def get_latency(self, op, *args, _reference_candidate=False, **kwargs):
-        fn = lambda: op(*args, **kwargs)
-        if self.is_backward:
-            # Building the graph is preparation: it happens before any timing
-            # and, on its own, does not prove the derivative ran.
-            out = fn()
-            dout = torch.randn_like(out)
-            # fn = lambda: out.backward(dout, retain_graph=True)
-            xs = list(filter(lambda x: torch.is_tensor(x) and x.requires_grad, args))
+        fn, xs = self._prepare_call(op, args, kwargs)
+        if self.is_backward and _reference_candidate:
+            state = reference_execution()
+            if state is not None and state.enabled:
+                run_derivative = fn
 
-            def run_derivative():
-                return torch.autograd.grad(
-                    (out,), xs, grad_outputs=(dout,), retain_graph=True
-                )
+                def timed_reference_derivative():
+                    grads = run_derivative()
+                    state.candidate_derivative_calls += 1
+                    return grads
 
-            fn = run_derivative
-            if _reference_candidate:
-                state = reference_execution()
-                if state is not None and state.enabled:
-
-                    def timed_reference_derivative():
-                        grads = run_derivative()
-                        # Only the actual timed autograd call on the selected
-                        # reference's graph counts; the baseline path does not
-                        # pass this flag and is never counted.
-                        state.candidate_derivative_calls += 1
-                        return grads
-
-                    fn = timed_reference_derivative
+                fn = timed_reference_derivative
         if Config.mode == consts.BenchMode.OPERATOR:
             n_warm, n_rep = get_iter_count(fn)
             for i in range(n_warm):
@@ -428,7 +429,7 @@ class Benchmark:
                     warmup=Config.warm_up,
                     rep=Config.repetition,
                     return_mode="median",
-                    grad_to_none=xs if self.is_backward else None,
+                    grad_to_none=xs,
                 )
         elif Config.mode == consts.BenchMode.WRAPPER:
             n_warm, n_rep = get_iter_count(fn)
@@ -446,7 +447,7 @@ class Benchmark:
                 fn,
                 rep=Config.repetition,
                 return_mode="median",
-                grad_to_none=xs if self.is_backward else None,
+                grad_to_none=xs,
             )
         else:
             raise ValueError("Undefined Value of Benchmark Mode.")
@@ -654,6 +655,41 @@ class Benchmark:
         Config.executed_case_ids.update(executed)
         return results
 
+    def _run_profile_case(self, case_id):
+        if not self.supports_cases():
+            raise ValueError(
+                f"Operator '{self.op_name}' does not support --profile-only yet."
+            )
+        cases = self._collect_cases()
+        Config.available_case_ids.update(case.case_id for case in cases)
+        case = next((case for case in cases if case.case_id == case_id), None)
+        if case is None:
+            return []
+        if case_id in Config.executed_case_ids:
+            raise ValueError(f"Multiple benchmarks supplied profile case '{case_id}'.")
+        if not callable(self.train_op):
+            raise ValueError(
+                f"--profile-only requires a train_op for '{self.op_name}'."
+            )
+
+        if Config.profile_warmup:
+            args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
+            warmup, _ = self._prepare_call(self.train_op, args, kwargs)
+            for _ in range(Config.profile_warmup):
+                warmup()
+        args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
+        capture, _ = self._prepare_call(self.train_op, args, kwargs)
+        torch_device_fn.synchronize()
+
+        scope = Config.profile_hook(backend=vendor_name, case_id=case_id)
+        with scope if scope is not None else nullcontext():
+            for _ in range(Config.profile_iterations):
+                capture()
+            torch_device_fn.synchronize()
+
+        Config.executed_case_ids.add(case_id)
+        return [case_id]
+
     def _has_on_machine_baseline(self) -> bool:
         """Whether ``torch_op`` can actually be timed on this machine.
 
@@ -851,6 +887,9 @@ class Benchmark:
         configured_case_ids = getattr(Config, "case_ids", None)
         selection_requested = case_ids is not None or configured_case_ids is not None
         selected_case_ids = case_ids if case_ids is not None else configured_case_ids
+
+        if getattr(Config, "profile_only", False):
+            return self._run_profile_case(configured_case_ids[0])
 
         if getattr(Config, "list_cases", False):
             if selected_case_ids:

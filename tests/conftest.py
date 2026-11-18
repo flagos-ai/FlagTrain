@@ -118,6 +118,9 @@ def pytest_configure(config):
     global TO_CPU
     global QUICK_MODE
 
+    if config.getoption("profile_only", False):
+        return
+
     REGISTERED_MARKS = {
         marker.split(":")[0].strip() for marker in config.getini("markers")
     }
@@ -230,7 +233,7 @@ def pytest_runtest_logreport(report):
 
 def pytest_terminal_summary(terminalreporter):
     config = terminalreporter.config
-    if config.getoption("dummy_candidate"):
+    if config.getoption("dummy_candidate") or config.getoption("profile_only", False):
         return
     report_file = (config.getoption("--output") if RECORD_JSON else None) or REPORT_FILE
     data = TEST_RESULTS
