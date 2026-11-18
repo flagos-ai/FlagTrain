@@ -19,6 +19,15 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.megatron.fused_sinkhorn import (
+    _fits_triton_tile,
+    _prepare_sinkhorn,
+    _TorchSinkhorn,
+)
+from flag_train.runtime import torch_device_fn
+
+_BACKWARD_WORKSPACE_BYTES = 32 * 1024**2
+
 
 @triton.jit
 def _rounded(value, DTYPE: tl.constexpr):
@@ -38,7 +47,7 @@ def _forward(
     EPS: tl.constexpr,
     SAVE: tl.constexpr,
 ):
-    matrix_id = tl.program_id(0)
+    matrix_id = tl.program_id(0).to(tl.int64)
     i = tl.arange(0, TILE)
     mask = (i[:, None] < WIDTH) & (i[None, :] < WIDTH)
     elem = matrix_id * WIDTH * WIDTH + i[:, None] * WIDTH + i[None, :]
@@ -81,7 +90,8 @@ def _forward(
             tl.store(STATES + offset, matrix, mask)
             tl.store(DIVISORS + offset, denom, mask)
         matrix = tl.where(mask, _rounded(tl.div_rn(matrix, denom), dt), 0.0)
-    tl.store(OUT + elem, matrix, mask)
+    if not SAVE:
+        tl.store(OUT + elem, matrix, mask)
 
 
 @triton.jit
@@ -95,7 +105,7 @@ def _backward(
     TILE: tl.constexpr,
     ITERATIONS: tl.constexpr,
 ):
-    matrix_id = tl.program_id(0)
+    matrix_id = tl.program_id(0).to(tl.int64)
     i = tl.arange(0, TILE)
     mask = (i[:, None] < WIDTH) & (i[None, :] < WIDTH)
     elem = matrix_id * WIDTH * WIDTH + i[:, None] * WIDTH + i[None, :]
@@ -134,68 +144,84 @@ def _backward(
 
 class _Sinkhorn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, num_iterations, eps, save):
+    def forward(ctx, logits, num_iterations, eps):
         width = logits.shape[-1]
         count = logits.numel() // (width * width)
         result = torch.empty_like(logits, memory_format=torch.contiguous_format)
-        if save:
-            softmax = torch.empty_like(result)
-            shape = (count, num_iterations * 2 - 1, width, width)
-            states = torch.empty(shape, device=logits.device, dtype=logits.dtype)
-            divisors = torch.empty_like(states)
-            ctx.save_for_backward(softmax, states, divisors)
-            ctx.num_iterations = num_iterations
-        else:
-            softmax = states = divisors = result
+        ctx.save_for_backward(logits)
+        ctx.num_iterations = num_iterations
+        ctx.eps = eps
         if count:
-            _forward[(count,)](
-                logits,
-                result,
-                softmax,
-                states,
-                divisors,
-                width,
-                triton.next_power_of_2(width),
-                num_iterations,
-                eps,
-                save,
-                enable_fp_fusion=False,
-            )
+            with torch_device_fn.device(logits.device):
+                _forward[(count,)](
+                    logits,
+                    result,
+                    result,
+                    result,
+                    result,
+                    width,
+                    triton.next_power_of_2(width),
+                    num_iterations,
+                    eps,
+                    False,
+                    enable_fp_fusion=False,
+                )
         return result
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_output):
-        softmax, states, divisors = ctx.saved_tensors
-        width = grad_output.shape[-1]
-        count = grad_output.numel() // (width * width)
-        result = torch.empty_like(softmax)
-        if count:
-            _backward[(count,)](
-                grad_output.contiguous(),
-                softmax,
-                states,
-                divisors,
-                result,
-                width,
-                triton.next_power_of_2(width),
-                ctx.num_iterations,
-                enable_fp_fusion=False,
-            )
-        return result, None, None, None
+        (logits,) = ctx.saved_tensors
+        width = logits.shape[-1]
+        count = logits.numel() // (width * width)
+        result = torch.empty_like(logits, memory_format=torch.contiguous_format)
+        if not count:
+            return result, None, None
+
+        steps = ctx.num_iterations * 2 - 1
+        per_matrix_bytes = (1 + 2 * steps) * width * width * logits.element_size()
+        batch = min(count, max(1, _BACKWARD_WORKSPACE_BYTES // per_matrix_bytes))
+        matrices = logits.view(count, width, width)
+        gradient = grad_output.contiguous().view_as(matrices)
+        out = result.view_as(matrices)
+        softmax = torch.empty_like(matrices[:batch])
+        states = logits.new_empty((batch, steps, width, width))
+        divisors = torch.empty_like(states)
+        tile = triton.next_power_of_2(width)
+        # Recompute stage values into a bounded workspace reused by every chunk.
+        with torch_device_fn.device(logits.device):
+            for start in range(0, count, batch):
+                stop = min(start + batch, count)
+                grid = (stop - start,)
+                _forward[grid](
+                    matrices[start:stop],
+                    softmax,
+                    softmax,
+                    states,
+                    divisors,
+                    width,
+                    tile,
+                    ctx.num_iterations,
+                    ctx.eps,
+                    True,
+                    enable_fp_fusion=False,
+                )
+                _backward[grid](
+                    gradient[start:stop],
+                    softmax,
+                    states,
+                    divisors,
+                    out[start:stop],
+                    width,
+                    tile,
+                    ctx.num_iterations,
+                    enable_fp_fusion=False,
+                )
+        return result, None, None
 
 
 def fused_sinkhorn(input_logits, num_iterations, eps=1e-6):
-    if input_logits.ndim < 2 or input_logits.shape[-2] != input_logits.shape[-1]:
-        raise ValueError("fused_sinkhorn requires square matrices")
-    if input_logits.shape[-1] < 1 or num_iterations < 1:
-        raise ValueError(
-            "fused_sinkhorn requires nonempty matrices and positive iterations"
-        )
-    if input_logits.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        raise TypeError("fused_sinkhorn supports FP32, FP16 and BF16")
-    eps = float(eps)
-    if not 0 < eps < float("inf"):
-        raise ValueError("fused_sinkhorn requires a finite positive eps")
-    save = torch.is_grad_enabled() and input_logits.requires_grad
-    return _Sinkhorn.apply(input_logits.contiguous(), num_iterations, eps, save)
+    logits, num_iterations, eps = _prepare_sinkhorn(input_logits, num_iterations, eps)
+    if not _fits_triton_tile(logits, num_iterations):
+        return _TorchSinkhorn.apply(logits, num_iterations, eps)
+    return _Sinkhorn.apply(logits, num_iterations, eps)

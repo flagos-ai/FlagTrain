@@ -15,10 +15,14 @@
 
 """Sinkhorn projection and recomputed first-order backward."""
 
+from operator import index
+
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
+
+from flag_train.runtime import torch_device_fn
 
 from ._fused_sinkhorn_stages import as_float32, get_staged_plan
 
@@ -37,7 +41,9 @@ def _softmax(logits):
 @triton.jit
 def _forward(X, Y, WIDTH: tl.constexpr, STEPS: tl.constexpr, EPS: tl.constexpr):
     i = tl.arange(0, WIDTH)
-    index = tl.program_id(0) * WIDTH * WIDTH + i[:, None] * WIDTH + i[None, :]
+    index = (
+        tl.program_id(0).to(tl.int64) * WIDTH * WIDTH + i[:, None] * WIDTH + i[None, :]
+    )
     dtype: tl.constexpr = X.dtype.element_ty
     softmax = _softmax(tl.load(X + index).to(tl.float32))
     matrix = softmax + EPS
@@ -109,7 +115,9 @@ def _division_vjp(
 @triton.jit
 def _backward(X, G, DX, WIDTH: tl.constexpr, EPS: tl.constexpr):
     i = tl.arange(0, WIDTH)
-    index = tl.program_id(0) * WIDTH * WIDTH + i[:, None] * WIDTH + i[None, :]
+    index = (
+        tl.program_id(0).to(tl.int64) * WIDTH * WIDTH + i[:, None] * WIDTH + i[None, :]
+    )
     dtype: tl.constexpr = X.dtype.element_ty
     logits = tl.load(X + index).to(tl.float32)
     grad = tl.load(G + index).to(tl.float32)
@@ -222,31 +230,32 @@ class _Sinkhorn(torch.autograd.Function):
         ctx.num_iterations = num_iterations
         ctx.eps = eps
         result = torch.empty_like(logits)
-        if result.numel():
-            matrices = result.numel() // (width * width)
-            if _specialized(width, num_iterations):
-                _forward[(matrices,)](
-                    logits,
-                    result,
-                    width,
-                    2 * num_iterations - 1,
-                    eps,
-                    num_warps=1,
-                    enable_fp_fusion=False,
-                )
-            else:
-                _general[(matrices,)](
-                    logits,
-                    logits,
-                    result,
-                    width,
-                    triton.next_power_of_2(width),
-                    2 * num_iterations - 1,
-                    eps,
-                    False,
-                    num_warps=1,
-                    enable_fp_fusion=False,
-                )
+        with torch_device_fn.device(logits.device):
+            if result.numel():
+                matrices = result.numel() // (width * width)
+                if _specialized(width, num_iterations):
+                    _forward[(matrices,)](
+                        logits,
+                        result,
+                        width,
+                        2 * num_iterations - 1,
+                        eps,
+                        num_warps=1,
+                        enable_fp_fusion=False,
+                    )
+                else:
+                    _general[(matrices,)](
+                        logits,
+                        logits,
+                        result,
+                        width,
+                        triton.next_power_of_2(width),
+                        2 * num_iterations - 1,
+                        eps,
+                        False,
+                        num_warps=1,
+                        enable_fp_fusion=False,
+                    )
         return result
 
     @staticmethod
@@ -255,32 +264,33 @@ class _Sinkhorn(torch.autograd.Function):
         (logits,) = ctx.saved_tensors
         width = logits.shape[-1]
         grad_input = torch.empty_like(logits)
-        if logits.numel():
-            matrices = logits.numel() // (width * width)
-            gradient = grad_output.contiguous()
-            if _specialized(width, ctx.num_iterations):
-                _backward[(matrices,)](
-                    logits,
-                    gradient,
-                    grad_input,
-                    width,
-                    ctx.eps,
-                    num_warps=1 if width == 4 else 2,
-                    enable_fp_fusion=False,
-                )
-            else:
-                _general[(matrices,)](
-                    logits,
-                    gradient,
-                    grad_input,
-                    width,
-                    triton.next_power_of_2(width),
-                    2 * ctx.num_iterations - 1,
-                    ctx.eps,
-                    True,
-                    num_warps=1,
-                    enable_fp_fusion=False,
-                )
+        with torch_device_fn.device(logits.device):
+            if logits.numel():
+                matrices = logits.numel() // (width * width)
+                gradient = grad_output.contiguous()
+                if _specialized(width, ctx.num_iterations):
+                    _backward[(matrices,)](
+                        logits,
+                        gradient,
+                        grad_input,
+                        width,
+                        ctx.eps,
+                        num_warps=1 if width == 4 else 2,
+                        enable_fp_fusion=False,
+                    )
+                else:
+                    _general[(matrices,)](
+                        logits,
+                        gradient,
+                        grad_input,
+                        width,
+                        triton.next_power_of_2(width),
+                        2 * ctx.num_iterations - 1,
+                        ctx.eps,
+                        True,
+                        num_warps=1,
+                        enable_fp_fusion=False,
+                    )
         return grad_input, None, None
 
 
@@ -293,38 +303,39 @@ class _StagedSinkhorn(torch.autograd.Function):
         if logits.numel() == 0:
             return torch.empty_like(logits)
         width = logits.shape[-1]
-        if num_iterations == 3:
-            # Keep the fused forward while recomputing the staged gradient.
-            result = torch.empty_like(logits)
-            matrices = result.numel() // (width * width)
-            _forward[(matrices,)](
-                logits,
-                result,
-                width,
-                2 * num_iterations - 1,
-                eps,
-                num_warps=1,
-                enable_fp_fusion=False,
-            )
-            return result
-        if num_iterations == 2:
-            # Same treatment for the 3-step chain, also verified bit-identical.
-            result = torch.empty_like(logits)
-            matrices = result.numel() // (width * width)
-            _forward_three_steps[(matrices,)](
-                logits,
-                result,
-                width,
-                triton.next_power_of_2(width),
-                eps,
-                num_warps=1,
-                enable_fp_fusion=False,
-            )
-            return result
-        inference, _, _ = get_staged_plan(num_iterations)
-        return inference(
-            (*logits.shape, logits, as_float32(eps)), logits.device, logits.dtype
-        )[0]
+        with torch_device_fn.device(logits.device):
+            if num_iterations == 3:
+                # Keep the fused forward while recomputing the staged gradient.
+                result = torch.empty_like(logits)
+                matrices = result.numel() // (width * width)
+                _forward[(matrices,)](
+                    logits,
+                    result,
+                    width,
+                    2 * num_iterations - 1,
+                    eps,
+                    num_warps=1,
+                    enable_fp_fusion=False,
+                )
+                return result
+            if num_iterations == 2:
+                # Same treatment for the 3-step chain, also verified bit-identical.
+                result = torch.empty_like(logits)
+                matrices = result.numel() // (width * width)
+                _forward_three_steps[(matrices,)](
+                    logits,
+                    result,
+                    width,
+                    triton.next_power_of_2(width),
+                    eps,
+                    num_warps=1,
+                    enable_fp_fusion=False,
+                )
+                return result
+            inference, _, _ = get_staged_plan(num_iterations)
+            return inference(
+                (*logits.shape, logits, as_float32(eps)), logits.device, logits.dtype
+            )[0]
 
     @staticmethod
     @torch.autograd.function.once_differentiable
@@ -332,11 +343,14 @@ class _StagedSinkhorn(torch.autograd.Function):
         (logits,) = ctx.saved_tensors
         if logits.numel() == 0:
             return torch.empty_like(logits), None, None
-        _, forward, backward = get_staged_plan(ctx.num_iterations)
-        shape = tuple(logits.shape)
-        intermediate = forward((*shape, logits, ctx.eps), logits.device, logits.dtype)
-        args = (*shape, *intermediate[1 : -len(shape)], grad_output.contiguous())
-        grad = backward(args, logits.device, logits.dtype)[len(shape)]
+        with torch_device_fn.device(logits.device):
+            _, forward, backward = get_staged_plan(ctx.num_iterations)
+            shape = tuple(logits.shape)
+            intermediate = forward(
+                (*shape, logits, ctx.eps), logits.device, logits.dtype
+            )
+            args = (*shape, *intermediate[1 : -len(shape)], grad_output.contiguous())
+            grad = backward(args, logits.device, logits.dtype)[len(shape)]
         return grad, None, None
 
 
@@ -344,10 +358,37 @@ class _StagedSinkhorn(torch.autograd.Function):
 _STAGED_CONFIGS = {(3, 5, 2), (3, 4, 3), (4, 4, 20), (4, 8, 20)}
 
 
-def fused_sinkhorn(input_logits, num_iterations, eps=1e-6):
-    """Compute the Sinkhorn projection and its recomputed first-order gradient."""
+def _project_torch(logits, num_iterations, eps):
+    matrix = logits.softmax(dim=-1) + eps
+    for step in range(2 * num_iterations - 1):
+        axis = -2 if step % 2 == 0 else -1
+        matrix = matrix / (matrix.sum(dim=axis, keepdim=True) + eps)
+    return matrix
+
+
+class _TorchSinkhorn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, num_iterations, eps):
+        ctx.save_for_backward(logits)
+        ctx.num_iterations = num_iterations
+        ctx.eps = eps
+        return _project_torch(logits, num_iterations, eps)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output):
+        (logits,) = ctx.saved_tensors
+        with torch.enable_grad():
+            source = logits.detach().requires_grad_(True)
+            output = _project_torch(source, ctx.num_iterations, ctx.eps)
+            (grad,) = torch.autograd.grad(output, source, grad_output)
+        return grad, None, None
+
+
+def _prepare_sinkhorn(input_logits, num_iterations, eps):
     if input_logits.ndim < 2 or input_logits.shape[-2] != input_logits.shape[-1]:
         raise ValueError("fused_sinkhorn requires square matrices")
+    num_iterations = index(num_iterations)
     width = input_logits.shape[-1]
     if width < 1 or num_iterations < 1:
         raise ValueError(
@@ -358,10 +399,24 @@ def fused_sinkhorn(input_logits, num_iterations, eps=1e-6):
     eps = float(eps)
     if not 0 < eps < float("inf"):
         raise ValueError("fused_sinkhorn requires a finite positive eps")
-    logits = input_logits.contiguous()
+    return input_logits.contiguous(), num_iterations, eps
+
+
+def _fits_triton_tile(logits, num_iterations):
+    # The fused kernels keep one square tile and its reductions in a program.
+    return logits.shape[-1] <= 32 and num_iterations <= 32
+
+
+def fused_sinkhorn(input_logits, num_iterations, eps=1e-6):
+    """Compute the Sinkhorn projection and its recomputed first-order gradient."""
+    logits, num_iterations, eps = _prepare_sinkhorn(input_logits, num_iterations, eps)
+    if not _fits_triton_tile(logits, num_iterations):
+        return _TorchSinkhorn.apply(logits, num_iterations, eps)
     if (
         logits.dtype != torch.float32
-        and (logits.ndim, width, num_iterations) in _STAGED_CONFIGS
+        and (logits.ndim, logits.shape[-1], num_iterations) in _STAGED_CONFIGS
     ):
+        if logits.numel() >= 2**31:
+            return _TorchSinkhorn.apply(logits, num_iterations, eps)
         return _StagedSinkhorn.apply(logits, num_iterations, eps)
     return _Sinkhorn.apply(logits, num_iterations, eps)

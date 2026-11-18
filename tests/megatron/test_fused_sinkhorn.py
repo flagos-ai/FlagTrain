@@ -56,3 +56,30 @@ def test_fused_sinkhorn(shape, num_iterations, eps, dtype):
     expected_grad = torch.autograd.grad(expected, reference_input, grad_output)
     torch.testing.assert_close(actual_grad, expected_grad)
     torch.testing.assert_close(candidate_input, input_logits, rtol=0, atol=0)
+
+
+def test_fused_sinkhorn_wide_matrix():
+    x = torch.randn((1, 1025, 1025), device=flag_train.device, requires_grad=True)
+    actual = flag_train.megatron.fused_sinkhorn(x, 1)
+    matrix = x.softmax(dim=-1) + 1e-6
+    expected = matrix / (matrix.sum(dim=-2, keepdim=True) + 1e-6)
+    upstream = torch.randn_like(actual)
+    torch.testing.assert_close(actual, expected)
+    (actual_grad,) = torch.autograd.grad(actual, x, upstream)
+    (expected_grad,) = torch.autograd.grad(expected, x, upstream)
+    torch.testing.assert_close(actual_grad, expected_grad)
+
+
+def test_fused_sinkhorn_saves_only_logits():
+    x = torch.randn((8, 8, 8), device=flag_train.device, requires_grad=True)
+    saved = []
+
+    def pack(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        actual = flag_train.megatron.fused_sinkhorn(x, 20)
+    assert len(saved) == 1
+    assert saved[0].data_ptr() == x.data_ptr()
+    assert torch.isfinite(torch.autograd.grad(actual.sum(), x)[0]).all()
