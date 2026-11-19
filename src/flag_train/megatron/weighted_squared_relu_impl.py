@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import math
+import numbers
 
 import torch
 import triton
@@ -31,19 +32,157 @@ _NUM_WARPS = 4
 _BLOCK_SIZE = 1024
 _BLOCK_SIZE_16BIT = 2048
 
-_WEIGHTED_SQUARED_RELU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_WEIGHTED_SQUARED_RELU_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+)
+
+# Megatron leaves the arithmetic to torch, which also accepts integer
+# activations; Triton can load and square those. Bool is deliberately absent:
+# Megatron's `relu` rejects it.
+_INT_INPUT_DTYPES = (
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+)
+
+# Weight dtypes the Triton kernels can load. Complex weights are passed as
+# real/imaginary planes; the kernel keeps the real part of the final product,
+# matching Megatron's cast back to the activation dtype.
+_WEIGHT_DTYPES = _WEIGHTED_SQUARED_RELU_DTYPES + _INT_INPUT_DTYPES + (
+    torch.bool,
+    torch.uint16,
+    torch.uint32,
+    torch.uint64,
+)
+
+_CLAMP_VECTOR_DTYPES = _WEIGHT_DTYPES
 
 
-def _check_input(tensor, name):
-    if tensor.dtype not in _WEIGHTED_SQUARED_RELU_DTYPES:
-        wanted = " / ".join(str(dtype) for dtype in _WEIGHTED_SQUARED_RELU_DTYPES)
-        raise ValueError(f"{name} needs a {wanted} tensor, got {tensor.dtype}")
-    if tensor.device.type == "cpu":
-        raise ValueError(f"{name} needs a device tensor, not one on the CPU")
-    if tensor.device.type != runtime_device.name:
+def _fast_weights(weights, shape):
+    """A broadcast view of ``weights`` when the fast kernel can read it."""
+    if weights is None or weights.is_complex():
+        return None
+    try:
+        broadcast_shape = tuple(torch.broadcast_shapes(tuple(weights.shape), shape))
+    except RuntimeError:
+        return None
+    if broadcast_shape != tuple(shape):
+        return None
+    try:
+        return torch.broadcast_to(weights, shape)
+    except (RuntimeError, NotImplementedError):
+        return None
+
+
+def _normalize_weights(weights, input):
+    """Validate/normalize weights; raise where Megatron's torch multiply does."""
+    if weights is None:
+        return None
+    if isinstance(weights, torch.Tensor):
+        if weights.device != input.device:
+            if weights.dim() != 0 or weights.device.type != "cpu":
+                raise RuntimeError(
+                    "Expected all tensors to be on the same device, but found at "
+                    f"least two devices, {input.device} and {weights.device}!"
+                )
+            # torch allows a 0-dim CPU scalar next to a device tensor, but not
+            # a device scalar next to a CPU tensor.
+            weights = weights.to(input.device)
+        if not weights.is_complex() and weights.dtype not in _WEIGHT_DTYPES:
+            raise ValueError(
+                "weighted_squared_relu_impl weights needs a numeric tensor, "
+                f"got {weights.dtype}"
+            )
+        if weights.dtype == torch.bool:
+            weights = weights.to(torch.float32)
+        return weights
+    if isinstance(weights, numbers.Number):
+        weights = torch.as_tensor(weights, device=input.device)
+        if not weights.is_complex() and weights.dtype not in _WEIGHT_DTYPES:
+            raise ValueError(
+                "weighted_squared_relu_impl weights needs a numeric tensor, "
+                f"got {weights.dtype}"
+            )
+        if weights.dtype == torch.bool:
+            weights = weights.to(torch.float32)
+        return weights
+    raise TypeError(
+        "weighted_squared_relu_impl weights needs a tensor or a number, "
+        f"got {type(weights).__name__}"
+    )
+
+
+def _normalize_clamp(clamp_scale, input):
+    """Return ``(scalar, vector)`` for Megatron's scalar/vector clamp forms."""
+    if clamp_scale is None:
+        return None, None
+    if isinstance(clamp_scale, torch.Tensor):
+        if clamp_scale.numel() == 1:
+            if clamp_scale.device != input.device and not (
+                clamp_scale.dim() == 0
+                and clamp_scale.device.type == "cpu"
+                and input.device.type != "cpu"
+            ):
+                raise RuntimeError(
+                    "Expected all tensors to be on the same device, but found at "
+                    f"least two devices, {input.device} and {clamp_scale.device}!"
+                )
+            return clamp_scale.item(), None
+        if clamp_scale.device != input.device:
+            raise RuntimeError(
+                "Expected all tensors to be on the same device, but found at "
+                f"least two devices, {input.device} and {clamp_scale.device}!"
+            )
+        if not clamp_scale.is_complex() and clamp_scale.dtype not in _CLAMP_VECTOR_DTYPES:
+            raise ValueError(
+                "weighted_squared_relu_impl clamp_scale needs a numeric tensor, "
+                f"got {clamp_scale.dtype}"
+            )
+        if clamp_scale.is_complex():
+            return None, clamp_scale
+        return None, clamp_scale.to(torch.float32)
+    if isinstance(clamp_scale, numbers.Real):
+        return float(clamp_scale), None
+    if isinstance(clamp_scale, numbers.Complex):
+        return complex(clamp_scale), None
+    raise TypeError(
+        "weighted_squared_relu_impl clamp_scale needs a number or tensor, "
+        f"got {type(clamp_scale).__name__}"
+    )
+
+
+def _validate_input(input):
+    if input.dtype not in _WEIGHTED_SQUARED_RELU_DTYPES + _INT_INPUT_DTYPES:
         raise ValueError(
-            f"{name} needs a {runtime_device.name} tensor, got {tensor.device.type}"
+            "weighted_squared_relu_impl input needs a float or integer tensor, "
+            f"got {input.dtype}"
         )
+    if input.device.type not in ("cpu", runtime_device.name):
+        raise ValueError(
+            f"weighted_squared_relu_impl needs a CPU or {runtime_device.name} "
+            f"tensor, got {input.device.type}"
+        )
+
+
+def _accelerator_device():
+    """Move CPU inputs here so the computation still runs in Triton."""
+    name = runtime_device.name
+    if name == "cpu":
+        raise RuntimeError(
+            "weighted_squared_relu_impl cannot run CPU inputs without an "
+            "accelerator: no device Triton backend is available"
+        )
+    is_available = getattr(torch_device_fn, "is_available", None)
+    if callable(is_available) and not is_available():
+        raise RuntimeError(
+            f"weighted_squared_relu_impl cannot run CPU inputs: {name} is unavailable"
+        )
+    return name
 
 
 @triton.jit
@@ -67,17 +206,21 @@ def _weighted_forward_kernel(
     weight_ptr,
     y_ptr,
     hidden,
+    weight_stride_row,
+    weight_stride_col,
     abs_scale,
     neg_two_over_scale,
     HAS_CLAMP: tl.constexpr,
     EVEN_HIDDEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """``y = squared_relu(x) * weight[row]``, optionally tanh soft-clamped.
+    """``y = squared_relu(x) * weight[row, col]``, optionally clamped.
 
-    One program handles a ``BLOCK_SIZE`` slice of one row, so the per-token
-    weight is a scalar load. The activation is computed in fp32, matching the
-    reference; the bounds check is dropped when ``hidden`` is block-aligned.
+    One program handles a ``BLOCK_SIZE`` slice of one row.  ``weight`` is a
+    broadcast view of shape ``(num_tokens, hidden)``: a broadcast dimension has
+    stride 0, so the same load covers per-token, per-column and scalar weights.
+    The activation is computed in fp32, matching the reference; the bounds check
+    is dropped when ``hidden`` is block-aligned.
     """
     row = tle.program_id(0)
     base = row * hidden
@@ -85,10 +228,17 @@ def _weighted_forward_kernel(
 
     if EVEN_HIDDEN:
         x = tl.load(x_ptr + base + columns).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + row * weight_stride_row + columns * weight_stride_col
+        ).to(tl.float32)
     else:
         mask = columns < hidden
         x = tl.load(x_ptr + base + columns, mask=mask, other=0.0).to(tl.float32)
-    weight = tl.load(weight_ptr + row).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + row * weight_stride_row + columns * weight_stride_col,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
 
     if HAS_CLAMP:
         act = _clamped_square(x, abs_scale, neg_two_over_scale)
@@ -134,9 +284,194 @@ def _clamped_forward_kernel(
         tl.store(y_ptr + offsets, act.to(y_ptr.dtype.element_ty), mask=mask)
 
 
+@libentry()
+@triton.jit
+def _general_forward_kernel(
+    x_ptr,
+    weight_ptr,
+    weight_imag_ptr,
+    clamp_ptr,
+    clamp_imag_ptr,
+    y_ptr,
+    in_rows,
+    in_hidden,
+    out_hidden,
+    abs_scale,
+    neg_two_over_scale,
+    clamp_real_scalar,
+    clamp_imag_scalar,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
+    CLAMP_VECTOR: tl.constexpr,
+    CLAMP_COMPLEX: tl.constexpr,
+    WEIGHT_COMPLEX: tl.constexpr,
+    INT_INPUT: tl.constexpr,
+    UINT8_OUTPUT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """One output row/column tile for the broadcast and integer paths.
+
+    The output shape is ``broadcast(flat_input, weights, clamp)``. Input rows
+    and columns therefore repeat by modulo; weights and a vector clamp are
+    materialised to the output shape before launch. Complex clamp/weight
+    operands are passed as their real and imaginary planes because Triton has
+    no complex dtype.
+    """
+    out_row = tle.program_id(0)
+    columns = tle.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = columns < out_hidden
+
+    in_row = out_row % in_rows
+    in_columns = columns % in_hidden
+    x = tl.load(x_ptr + in_row * in_hidden + in_columns, mask=mask, other=0)
+
+    if HAS_CLAMP:
+        xf = x.to(tl.float32)
+        if CLAMP_COMPLEX:
+            if CLAMP_VECTOR:
+                a = tl.load(
+                    clamp_ptr + out_row * out_hidden + columns, mask=mask, other=0.0
+                ).to(tl.float32)
+                b = tl.load(
+                    clamp_imag_ptr + out_row * out_hidden + columns,
+                    mask=mask,
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                a = clamp_real_scalar
+                b = clamp_imag_scalar
+            z = tl.maximum(xf, 0.0)
+            denom = a * a + b * b
+            ur = z * a / denom
+            ui = -z * b / denom
+            e2 = tl.exp(2.0 * ur)
+            em2 = tl.exp(-2.0 * ur)
+            sinh = (e2 - em2) * 0.5
+            cosh = (e2 + em2) * 0.5
+            sin2b = tl.sin(2.0 * ui)
+            cos2b = tl.cos(2.0 * ui)
+            tanh_den = cosh + cos2b
+            tr = sinh / tanh_den
+            ti = sin2b / tanh_den
+            wr = a * tr - b * ti
+            wi = a * ti + b * tr
+            act_real = wr * wr - wi * wi
+            act_imag = 2.0 * wr * wi
+        elif CLAMP_VECTOR:
+            c = tl.load(
+                clamp_ptr + out_row * out_hidden + columns, mask=mask, other=0.0
+            ).to(tl.float32)
+            abs_c = tl.abs(c)
+            neg2 = tl.where(abs_c == 0.0, float("-inf"), -2.0 / abs_c)
+            e = tl.exp(tl.maximum(xf, 0.0) * neg2)
+            c = abs_c * ((1.0 - e) / (1.0 + e))
+            act_real = c * c
+            act_imag = 0.0
+        else:
+            act_real = _clamped_square(xf, abs_scale, neg_two_over_scale)
+            act_imag = 0.0
+    else:
+        act_imag = 0.0
+        if INT_INPUT:
+            r = tl.maximum(x, 0)
+            act_real = (r * r).to(tl.float32)
+        else:
+            xf = x.to(tl.float32)
+            r = tl.maximum(xf, 0.0)
+            act_real = r * r
+
+    if HAS_WEIGHT:
+        weight = tl.load(
+            weight_ptr + out_row * out_hidden + columns, mask=mask, other=0.0
+        ).to(tl.float32)
+        out = act_real * weight
+        if WEIGHT_COMPLEX:
+            weight_imag = tl.load(
+                weight_imag_ptr + out_row * out_hidden + columns,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            out = out - act_imag * weight_imag
+    else:
+        out = act_real
+
+    if UINT8_OUTPUT:
+        # torch's float -> uint8 cast truncates toward zero and wraps modulo
+        # 256; Triton's direct cast saturates negatives to zero.
+        out = (out.to(tl.int32) & 255).to(tl.uint8)
+    else:
+        out = out.to(y_ptr.dtype.element_ty)
+    tl.store(
+        y_ptr + out_row * out_hidden + columns,
+        out,
+        mask=mask,
+    )
+
+
+def _launch_general(
+    x,
+    weight_real,
+    weight_imag,
+    clamp_real,
+    clamp_imag,
+    out,
+    in_rows,
+    in_hidden,
+    out_hidden,
+    clamp_scalar,
+):
+    block_size, num_warps = _launch_config(x.dtype)
+    if clamp_scalar is None:
+        abs_scale, neg_two_over_scale = 0.0, 0.0
+        clamp_real_scalar, clamp_imag_scalar = 0.0, 0.0
+    elif isinstance(clamp_scalar, complex):
+        abs_scale, neg_two_over_scale = 0.0, 0.0
+        clamp_real_scalar = float(clamp_scalar.real)
+        clamp_imag_scalar = float(clamp_scalar.imag)
+    else:
+        abs_scale, neg_two_over_scale = _clamp_operands(clamp_scalar)
+        clamp_real_scalar, clamp_imag_scalar = 0.0, 0.0
+    clamp_complex = isinstance(clamp_scalar, complex) or clamp_imag is not None
+    grid = (out.numel() // out_hidden, triton.cdiv(out_hidden, block_size))
+    with torch_device_fn.device(x.device):
+        _general_forward_kernel[grid](
+            x,
+            x if weight_real is None else weight_real,
+            x if weight_imag is None else weight_imag,
+            x if clamp_real is None else clamp_real,
+            x if clamp_imag is None else clamp_imag,
+            out,
+            in_rows,
+            in_hidden,
+            out_hidden,
+            abs_scale,
+            neg_two_over_scale,
+            clamp_real_scalar,
+            clamp_imag_scalar,
+            HAS_WEIGHT=weight_real is not None,
+            HAS_CLAMP=clamp_scalar is not None or clamp_real is not None,
+            CLAMP_VECTOR=clamp_real is not None,
+            CLAMP_COMPLEX=clamp_complex,
+            WEIGHT_COMPLEX=weight_imag is not None,
+            INT_INPUT=x.dtype in _INT_INPUT_DTYPES,
+            UINT8_OUTPUT=out.dtype == torch.uint8,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
+        )
+
+
+def _finish_output(out, ori_shape):
+    if len(ori_shape) == 2:
+        return out
+    return out.view(ori_shape[0], ori_shape[1], -1)
+
+
 def _launch_config(dtype):
     """Block/warp pair measured fastest for ``dtype`` on this device."""
-    if runtime_device.vendor_name == "nvidia" and dtype != torch.float32:
+    if runtime_device.vendor_name == "nvidia" and dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ):
         return _BLOCK_SIZE_16BIT, _NUM_WARPS
     return _BLOCK_SIZE, _NUM_WARPS
 
@@ -150,7 +485,16 @@ def _clamp_operands(clamp_scale):
     return abs_scale, neg_two_over_scale
 
 
-def _launch_weighted(x, weights, out, hidden, num_tokens, clamp_scale):
+def _launch_weighted(
+    x,
+    weights,
+    out,
+    hidden,
+    num_tokens,
+    weight_stride_row,
+    weight_stride_col,
+    clamp_scale,
+):
     block_size, num_warps = _launch_config(x.dtype)
     if clamp_scale is None:
         abs_scale, neg_two_over_scale = 0.0, 0.0
@@ -163,6 +507,8 @@ def _launch_weighted(x, weights, out, hidden, num_tokens, clamp_scale):
             weights,
             out,
             hidden,
+            weight_stride_row,
+            weight_stride_col,
             abs_scale,
             neg_two_over_scale,
             HAS_CLAMP=clamp_scale is not None,
@@ -190,72 +536,137 @@ def _launch_clamped(x, out, n, clamp_scale):
 
 
 def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
-    """Squared-ReLU with optional per-token weights and optional tanh soft clamp.
+    """Squared-ReLU with optional weights and optional tanh soft clamp.
 
     Forward-only port of ``megatron.core.fusions.fused_weighted_squared_relu
-    .weighted_squared_relu_impl``. The input is viewed as ``(num_tokens, hidden)``,
-    so ``weights`` is one scalar per row. With ``clamp_scale`` the pre-activation
-    is ``clamp_scale * tanh(relu(x) / clamp_scale)``; both arguments ``None`` is
-    not a fused case (mirrors the reference's assertion).
+    .weighted_squared_relu_impl``.  The public contract is Megatron's: the input
+    is viewed as ``(num_tokens, hidden)`` with ``view`` (so layouts Megatron
+    cannot flatten fail here too), ``weights`` is ordinary torch broadcasting,
+    and the 3-D epilogue reshapes the result back to ``(S, B, hidden)``.
+    Float and integer tensors run Triton; broadcast weights (including extra
+    leading dimensions), complex weights/clamps, vector clamps and
+    non-contiguous inputs use the general Triton kernel. CPU inputs are staged
+    to the active accelerator, computed in Triton, and copied back to CPU.
+    Bool inputs are rejected rather than emulated with torch.
 
     Args:
-        input (Tensor): fp16, bf16 or fp32 tensor of shape ``(B, hidden)`` or
-            ``(S, B, hidden)`` on the active device. Non-contiguous input is
-            copied; empty input is returned without a launch.
-        weights (Tensor, optional): per-token weights of shape ``(B, 1)``
-            (``(S * B, 1)`` for a 3-D input), usually fp32.
-        clamp_scale (float, optional): the tanh soft-clamp scale.
+        input (Tensor): 2-D or 3-D tensor.  Supported dtypes are fp16, bf16,
+            fp32, fp64 and the integer types torch's ``relu`` accepts.
+        weights (Tensor, optional): any tensor or number broadcastable to the
+            flattened activation, with Megatron's ordinary broadcasting rules.
+        clamp_scale (float or Tensor, optional): scalar or broadcastable tanh
+            soft-clamp scale.
 
     Returns:
-        Tensor: same shape and dtype as ``input``.
+        Tensor: the forward result, with the same shape/dtype rules as Megatron.
+
+    Raises:
+        AssertionError: when both ``weights`` and ``clamp_scale`` are ``None``,
+            or when the input is not 2-D/3-D.
+        RuntimeError: when Megatron's ``view``/broadcast operations reject the
+            inputs, or when a CPU input has no accelerator to stage it through.
+        ValueError: for bool or other dtypes Triton cannot execute.
     """
     logger.debug("TRAIN WEIGHTED_SQUARED_RELU_IMPL")
     assert weights is not None or clamp_scale is not None, (
         "weighted_squared_relu_impl needs weights and/or clamp_scale; "
         "use squared_relu directly otherwise."
     )
-    assert input.dim() in (
+    ori_shape = input.shape
+    assert len(ori_shape) in (
         2,
         3,
     ), f"weighted_squared_relu_impl expects a 2-D or 3-D input, got {input.dim()}-D"
-    _check_input(input, "weighted_squared_relu_impl")
+    _validate_input(input)
 
-    hidden = input.shape[-1]
-    num_tokens = math.prod(input.shape[:-1])
+    # Match Megatron's `input.view(-1, hidden)`: layouts that cannot be viewed
+    # raise the same error before either implementation does any arithmetic.
+    flat = input.view(-1, ori_shape[-1])
+    weight_tensor = _normalize_weights(weights, input)
+    clamp_scalar, clamp_vector = _normalize_clamp(clamp_scale, input)
 
-    if weights is not None:
-        _check_input(weights, "weighted_squared_relu_impl weights")
-        expected = (num_tokens, 1)
-        if tuple(weights.shape) != expected:
-            raise ValueError(
-                "weighted_squared_relu_impl weights must be broadcast per token, "
-                f"i.e. shape {expected} for an input of shape "
-                f"{tuple(input.shape)}, got {tuple(weights.shape)}"
-            )
-        if weights.device != input.device:
-            raise ValueError(
-                "weighted_squared_relu_impl weights must be on the same device as the "
-                f"input, got {weights.device} and {input.device}"
-            )
-
-    if input.numel() == 0:
-        # No launch when there is nothing to activate.
-        return torch.empty_like(input)
-
-    if clamp_scale is not None:
-        clamp_scale = float(clamp_scale)
-
-    flat = input.contiguous().view(-1, hidden)
-    out = torch.empty_like(flat)
-    if weights is None:
-        _launch_clamped(flat, out, flat.numel(), clamp_scale)
-    else:
-        _launch_weighted(
-            flat,
-            weights.contiguous().view(-1),
-            out,
-            hidden,
-            num_tokens,
-            clamp_scale,
+    out_shape = tuple(
+        torch.broadcast_shapes(
+            tuple(flat.shape),
+            () if weight_tensor is None else tuple(weight_tensor.shape),
+            () if clamp_vector is None else tuple(clamp_vector.shape),
         )
-    return out.view(input.shape)
+    )
+    if flat.numel() == 0 or math.prod(out_shape) == 0:
+        out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+        return _finish_output(out, ori_shape)
+
+    compute_device = input.device
+    if input.device.type == "cpu":
+        # Megatron accepts CPU tensors. Keep its device rules during
+        # normalization, then run the arithmetic in Triton on the accelerator
+        # and copy the result back.
+        compute_device = _accelerator_device()
+        flat = flat.contiguous().to(compute_device)
+        if weight_tensor is not None:
+            weight_tensor = weight_tensor.to(compute_device)
+        if clamp_vector is not None:
+            clamp_vector = clamp_vector.to(compute_device)
+
+    flat_kernel = flat if flat.is_contiguous() else flat.contiguous()
+    fast_weights = (
+        _fast_weights(weight_tensor, flat.shape) if weight_tensor is not None else None
+    )
+    use_fast = (
+        flat_kernel.dtype in _WEIGHTED_SQUARED_RELU_DTYPES
+        and clamp_vector is None
+        and not isinstance(clamp_scalar, complex)
+        and tuple(out_shape) == tuple(flat.shape)
+        and (weight_tensor is None or fast_weights is not None)
+    )
+
+    if use_fast:
+        out = torch.empty_like(flat_kernel)
+        if weight_tensor is None:
+            _launch_clamped(flat_kernel, out, flat_kernel.numel(), clamp_scalar)
+        else:
+            _launch_weighted(
+                flat_kernel,
+                fast_weights,
+                out,
+                flat.shape[1],
+                flat.shape[0],
+                fast_weights.stride(0),
+                fast_weights.stride(1),
+                clamp_scalar,
+            )
+        out = _finish_output(out, ori_shape)
+        return out.to(input.device) if input.device.type == "cpu" else out
+
+    out = torch.empty(out_shape, dtype=input.dtype, device=compute_device)
+    out_hidden = out_shape[-1]
+    weight_real = weight_imag = None
+    if weight_tensor is not None:
+        weight = torch.broadcast_to(weight_tensor, out_shape)
+        if weight.is_complex():
+            weight_real = weight.real.contiguous()
+            weight_imag = weight.imag.contiguous()
+        else:
+            weight_real = weight.contiguous()
+    clamp_real = clamp_imag = None
+    if clamp_vector is not None:
+        clamp = torch.broadcast_to(clamp_vector, out_shape)
+        if clamp.is_complex():
+            clamp_real = clamp.real.contiguous()
+            clamp_imag = clamp.imag.contiguous()
+        else:
+            clamp_real = clamp.to(torch.float32).contiguous()
+    _launch_general(
+        flat_kernel,
+        weight_real,
+        weight_imag,
+        clamp_real,
+        clamp_imag,
+        out,
+        flat.shape[0],
+        flat.shape[1],
+        out_hidden,
+        clamp_scalar,
+    )
+    out = _finish_output(out, ori_shape)
+    return out.to(input.device) if input.device.type == "cpu" else out
