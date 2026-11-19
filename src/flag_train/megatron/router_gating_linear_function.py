@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from flag_train.runtime import device as runtime_device
+from flag_train.runtime import torch_device_fn
 
 # ---------------------------------------------------------------------------
 # dtype ids:  0 -> bfloat16, 1 -> float16, 2 -> float32
@@ -32,7 +33,7 @@ _DT_FP32 = 2
 
 @lru_cache(maxsize=None)
 def _sm_count(device):
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    return torch_device_fn.get_device_properties(device).multi_processor_count
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +741,7 @@ class _RouterGatingLinear(torch.autograd.Function):
                 dbias = dout.reshape(M, E).sum(dim=0).to(weight.dtype)
             return din, dweight, dbias, None
 
-        with torch.cuda.device(inp.device):
+        with torch_device_fn.device(inp.device):
             do2d = dout.reshape(M, E).contiguous()
             if needs[0]:
                 din = torch.empty(ctx.in_shape, dtype=inp.dtype, device=inp.device)
@@ -836,7 +837,7 @@ def router_gating_linear_function(inp, weight, bias, router_dtype):
     ):
         raise ValueError("Router gating linear supports float32, float16 and bfloat16")
 
-    with torch.cuda.device(inp.device):
+    with torch_device_fn.device(inp.device):
         return _RouterGatingLinear.apply(
             inp.contiguous(),
             weight.contiguous(),

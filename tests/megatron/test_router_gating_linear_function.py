@@ -21,6 +21,7 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.runtime import torch_backend_device
 from flag_train.testing import assert_close
 from tests.megatron._router_gating_linear_reference import (
     DTYPES,
@@ -38,10 +39,14 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(autouse=True)
 def _matmul_precision(monkeypatch):
     # Compare against Megatron's Torch path with full-precision accumulation.
-    matmul = torch.backends.cuda.matmul
+    matmul = torch_backend_device.matmul
     monkeypatch.setattr(matmul, "allow_tf32", False)
-    monkeypatch.setattr(matmul, "allow_fp16_reduced_precision_reduction", False)
-    monkeypatch.setattr(matmul, "allow_bf16_reduced_precision_reduction", False)
+    for setting in (
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+    ):
+        if hasattr(matmul, setting):
+            monkeypatch.setattr(matmul, setting, False)
 
 
 def _assert_fp32_reduction_close(actual, expected, reduction_size):
