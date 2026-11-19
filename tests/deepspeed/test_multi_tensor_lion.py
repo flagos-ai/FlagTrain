@@ -314,7 +314,11 @@ def _assert_step_matches(
 
 
 @pytest.mark.multi_tensor_lion
-@pytest.mark.parametrize("n_tensors,numel", [(1, 1024), (4, 4096), (16, 16384)])
+# 1000 and 4097 are not a whole number of tiles at any power-of-two block size,
+# so they exercise the masked path; the others are exact and run unmasked.
+@pytest.mark.parametrize(
+    "n_tensors,numel", [(1, 1024), (4, 4096), (16, 16384), (1, 1000), (5, 4097)]
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_multi_tensor_lion(n_tensors, numel, dtype):
     """A single Lion step must match the default oracle: DeepSpeed's
@@ -387,6 +391,31 @@ def test_multi_tensor_lion_mixed_dtypes():
     gs32, ps32, ms32 = _make_triplet(2, 4096, torch.float32)
     gs16, ps16, ms16 = _make_triplet(2, 4096, torch.float16)
     gs, ps, ms = gs32 + gs16, ps32 + ps16, ms32 + ms16
+
+    train_gs, train_ps, train_ms = _clone_lists(gs, ps, ms)
+    _step(flag_train.deepspeed.multi_tensor_lion, train_gs, train_ps, train_ms, 1)
+
+    ref_gs, ref_ps, ref_ms = _reference_lists(gs, ps, ms)
+    _step(multi_tensor_lion_ref, ref_gs, ref_ps, ref_ms, 1)
+    _assert_step_matches(train_ps, train_ms, ref_ps, ref_ms)
+
+
+@pytest.mark.multi_tensor_lion
+def test_multi_tensor_lion_mixed_sizes():
+    """A single call may carry tensors of different sizes.
+
+    Each tile size gets its own launch, and a size that is not a whole number of
+    tiles takes the masked path, so this covers both kernels in one call. The
+    torch reference is the oracle: DeepSpeed's op is called per dtype group and
+    is not sized for this either.
+    """
+    sizes = [(2, 4096), (2, 1000), (1, 100000)]
+    gs, ps, ms = [], [], []
+    for n_tensors, numel in sizes:
+        g, p, m = _make_triplet(n_tensors, numel, torch.float32)
+        gs += g
+        ps += p
+        ms += m
 
     train_gs, train_ps, train_ms = _clone_lists(gs, ps, ms)
     _step(flag_train.deepspeed.multi_tensor_lion, train_gs, train_ps, train_ms, 1)
