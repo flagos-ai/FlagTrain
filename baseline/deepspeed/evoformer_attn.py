@@ -118,3 +118,30 @@ def build_inputs(binding, dtype, device):
 def key_shape(binding):
     # First tensor: q [batch, pairs, seq_len, heads, head_size]; unique.
     return list(binding["shape"])
+
+
+def config(binding, dtype):
+    """Describe the real inputs/outputs for baseline matching."""
+    batch, pairs, seq_len, heads, head_size = binding["shape"]
+    dtype_str = str(dtype)
+    qkv_shape = [batch, pairs, seq_len, heads, head_size]
+    return {
+        "inputs": {
+            "q": {"shape": qkv_shape, "dtype": dtype_str},
+            "k": {"shape": qkv_shape, "dtype": dtype_str},
+            "v": {"shape": qkv_shape, "dtype": dtype_str},
+            # bias1 is the per-pair key mask, bias2 the per-batch pair bias.
+            "bias1": {"shape": [batch, pairs, 1, 1, seq_len], "dtype": dtype_str},
+            "bias2": {"shape": [batch, 1, heads, seq_len, seq_len], "dtype": dtype_str},
+        },
+        "outputs": {
+            "out": {"shape": qkv_shape, "dtype": dtype_str},
+        },
+        "dims": {
+            "batch": batch,
+            "pairs": pairs,
+            "seq_len": seq_len,
+            "heads": heads,
+            "head_size": head_size,
+        },
+    }
