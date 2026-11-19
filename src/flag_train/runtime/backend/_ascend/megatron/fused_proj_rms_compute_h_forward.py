@@ -87,15 +87,13 @@ _NORM_STAGES = _NUM_STAGES
 
 # RMS kernel: one program covers a small row block and the full K axis.
 _NORM_BLOCK_M = 32
-_NORM_BLOCK_K = 256
+_NORM_BLOCK_K = 512
 
-# Projection kernel: at least 4096 rows fill the GPU well enough for 64-row
-# tiles (better weight reuse); below that the extra parallelism of 32-row tiles
-# wins. The tile sizes were measured on the H20 mHC shapes.
+# Projection kernel tiles (measured fastest at both row regimes on 910B4).
 _PROJ_LARGE_M = 4096
 _PROJ_BLOCK_M_LARGE = 64
-_PROJ_BLOCK_K_LARGE = 128
-_PROJ_BLOCK_M_SMALL = 32
+_PROJ_BLOCK_K_LARGE = 256
+_PROJ_BLOCK_M_SMALL = 64
 _PROJ_BLOCK_K_SMALL = 256
 
 # Triton allocates one shared-memory buffer per pipelined tile per stage, so
@@ -109,6 +107,20 @@ _SHARED_MEMORY_BUDGET = 192 * 1024
 _MIN_BLOCK_N = 16
 
 _FORWARD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+_AICORE_NUM = None
+
+
+def _aicore_num():
+    """Physical AI-core count."""
+    global _AICORE_NUM
+    if _AICORE_NUM is None:
+        import torch_npu
+        import triton.runtime.driver as driver
+
+        device = torch_npu.npu.current_device()
+        _AICORE_NUM = driver.active.utils.get_device_properties(device)["num_aicore"]
+    return _AICORE_NUM
 
 
 def _check_input(tensor, name, dtypes):
@@ -184,77 +196,26 @@ def _rms_norm_kernel(
     tl.store(r_ptr + rows, r, mask=row_mask)
 
 
-@libentry()
 @triton.jit
-def _proj_compute_h_kernel(
-    x_ptr,
-    weight_ptr,
-    alpha_pre_ptr,
-    alpha_post_ptr,
-    alpha_res_ptr,
-    bias_ptr,
+def _proj_epilogue(
+    acc,
+    rows,
+    row_mask,
+    cols,
+    col_mask,
+    alpha,
+    bias_tile,
     r_ptr,
     h_pre_ptr,
     h_post_ptr,
     h_res_ptr,
-    proj_ptr,
-    M,
-    K,
     eps,
     compute_h_eps,
-    N: tl.constexpr,
-    N_RES: tl.constexpr,
     n: tl.constexpr,
-    FP32_INPUT: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    STAGES: tl.constexpr,
+    N_RES: tl.constexpr,
 ):
-    """Projection, scale by ``r``, and the three compute_h segment outputs.
-
-    ``BLOCK_N`` is ``N`` rounded up to a power of two, so one tile covers the
-    whole weight row count and the segment layout (pre / post / res) is a
-    column mask rather than a loop. The projection tile stays in registers
-    through the epilogue.
-    """
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = rows < M
-    cols = tl.arange(0, BLOCK_N)
-    col_mask = cols < N
-    ks = tl.arange(0, BLOCK_K)
+    """Scale one projection tile by ``r`` and write the three h segments."""
     rows64 = rows.to(tl.int64)
-
-    # Scalar gating factors; the segment each one applies to is a column mask.
-    alpha_pre = tl.load(alpha_pre_ptr).to(tl.float32)
-    alpha_post = tl.load(alpha_post_ptr).to(tl.float32)
-    alpha_res = tl.load(alpha_res_ptr).to(tl.float32)
-    alpha = tl.where(cols < n, alpha_pre, tl.where(cols < 2 * n, alpha_post, alpha_res))
-    bias_tile = tl.load(bias_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    x_rows = x_ptr + rows64[:, None] * K
-    weight_rows = weight_ptr + cols[None, :] * K
-    for k0 in tl.range(0, K, BLOCK_K, num_stages=STAGES):
-        ks_mask = k0 + ks < K
-        x_tile = tl.load(
-            x_rows + (k0 + ks)[None, :],
-            mask=row_mask[:, None] & ks_mask[None, :],
-            other=0.0,
-        )
-        weight_tile = tl.load(
-            weight_rows + (k0 + ks)[:, None],
-            mask=ks_mask[:, None] & col_mask[None, :],
-            other=0.0,
-        )
-        if FP32_INPUT:
-            # Backend-default precision (tf32 on NVIDIA), matching the tf32 MMA
-            # of Megatron's cuTile forward; fp32 IEEE dot is ~10x slower here.
-            acc = tl.dot(x_tile.to(tl.float32), weight_tile.to(tl.float32), acc=acc)
-        else:
-            acc = tl.dot(x_tile, weight_tile, acc=acc)
-
     r = tl.load(r_ptr + rows, mask=row_mask, other=1.0).to(tl.float32)
     inv_r_eps = 1.0 / (r + eps)
     h = acc * (alpha[None, :] * inv_r_eps[:, None]) + bias_tile[None, :]
@@ -281,11 +242,140 @@ def _proj_compute_h_kernel(
         mask=res_mask,
     )
 
-    tl.store(
-        proj_ptr + rows64[:, None] * N + cols[None, :],
-        acc,
-        mask=row_mask[:, None] & col_mask[None, :],
-    )
+
+@libentry()
+@triton.jit
+def _proj_compute_h_kernel(
+    x_ptr,
+    weight_ptr,
+    alpha_pre_ptr,
+    alpha_post_ptr,
+    alpha_res_ptr,
+    bias_ptr,
+    r_ptr,
+    h_pre_ptr,
+    h_post_ptr,
+    h_res_ptr,
+    M,
+    K,
+    eps,
+    compute_h_eps,
+    N: tl.constexpr,
+    N_RES: tl.constexpr,
+    n: tl.constexpr,
+    FP32_INPUT: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    STAGES: tl.constexpr,
+):
+    """Projection, scale by ``r``, and the three compute_h segment outputs.
+
+    ``BLOCK_N`` is ``N`` rounded up to a power of two, so one tile covers the
+    whole weight row count and the segment layout (pre / post / res) is a
+    column mask rather than a loop. Persistent 1-D grid; ``GROUP`` row tiles
+    share one weight load per K chunk.
+    """
+    pid = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+    cols = tl.arange(0, BLOCK_N)
+    col_mask = cols < N
+    ks = tl.arange(0, BLOCK_K)
+
+    # Scalar gating factors; the segment each one applies to is a column mask.
+    alpha_pre = tl.load(alpha_pre_ptr).to(tl.float32)
+    alpha_post = tl.load(alpha_post_ptr).to(tl.float32)
+    alpha_res = tl.load(alpha_res_ptr).to(tl.float32)
+    alpha = tl.where(cols < n, alpha_pre, tl.where(cols < 2 * n, alpha_post, alpha_res))
+    bias_tile = tl.load(bias_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
+    weight_rows = weight_ptr + cols[None, :] * K
+
+    num_tiles = tl.cdiv(M, BLOCK_M)
+    num_groups = tl.cdiv(num_tiles, GROUP)
+    groups_per_prog = tl.cdiv(num_groups, num_progs)
+    gstart = pid * groups_per_prog
+    gend = tl.minimum(num_groups, gstart + groups_per_prog)
+
+    for g in tl.range(gstart, gend, num_stages=1):
+        base = g * GROUP
+        rows0 = base * BLOCK_M + tl.arange(0, BLOCK_M)
+        row_mask0 = rows0 < M
+        x_rows0 = x_ptr + rows0.to(tl.int64)[:, None] * K
+        acc0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        if GROUP > 1:
+            rows1 = (base + 1) * BLOCK_M + tl.arange(0, BLOCK_M)
+            row_mask1 = rows1 < M
+            x_rows1 = x_ptr + rows1.to(tl.int64)[:, None] * K
+            acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k0 in tl.range(0, K, BLOCK_K, num_stages=STAGES):
+            ks_mask = k0 + ks < K
+            weight_tile = tl.load(
+                weight_rows + (k0 + ks)[:, None],
+                mask=ks_mask[:, None] & col_mask[None, :],
+                other=0.0,
+            )
+            x_tile0 = tl.load(
+                x_rows0 + (k0 + ks)[None, :],
+                mask=row_mask0[:, None] & ks_mask[None, :],
+                other=0.0,
+            )
+            if FP32_INPUT:
+                # Backend-default precision (tf32 on NVIDIA), matching the tf32
+                # MMA of Megatron's cuTile forward; fp32 IEEE dot is ~10x slower.
+                acc0 = tl.dot(
+                    x_tile0.to(tl.float32), weight_tile.to(tl.float32), acc=acc0
+                )
+            else:
+                acc0 = tl.dot(x_tile0, weight_tile, acc=acc0)
+            if GROUP > 1:
+                x_tile1 = tl.load(
+                    x_rows1 + (k0 + ks)[None, :],
+                    mask=row_mask1[:, None] & ks_mask[None, :],
+                    other=0.0,
+                )
+                if FP32_INPUT:
+                    acc1 = tl.dot(
+                        x_tile1.to(tl.float32), weight_tile.to(tl.float32), acc=acc1
+                    )
+                else:
+                    acc1 = tl.dot(x_tile1, weight_tile, acc=acc1)
+
+        _proj_epilogue(
+            acc0,
+            rows0,
+            row_mask0,
+            cols,
+            col_mask,
+            alpha,
+            bias_tile,
+            r_ptr,
+            h_pre_ptr,
+            h_post_ptr,
+            h_res_ptr,
+            eps,
+            compute_h_eps,
+            n,
+            N_RES,
+        )
+        if GROUP > 1:
+            _proj_epilogue(
+                acc1,
+                rows1,
+                row_mask1,
+                cols,
+                col_mask,
+                alpha,
+                bias_tile,
+                r_ptr,
+                h_pre_ptr,
+                h_post_ptr,
+                h_res_ptr,
+                eps,
+                compute_h_eps,
+                n,
+                N_RES,
+            )
 
 
 def _pipeline_stages(K, block_k, max_stages=_NUM_STAGES):
@@ -421,7 +511,6 @@ def fused_proj_rms_compute_h_forward(
     h_post = torch.empty(M, n, dtype=h_dtype, device=device)
     h_res = torch.empty(M, N - 2 * n, dtype=h_dtype, device=device)
     r = torch.empty(M, 1, dtype=matmul_dtype, device=device)
-    proj = torch.empty(M, N, dtype=matmul_dtype, device=device)
 
     if M == 0:
         # No launch when there are no rows to map.
@@ -431,6 +520,11 @@ def fused_proj_rms_compute_h_forward(
     block_m, block_n, block_k, proj_stages = _proj_config(
         M, N, K, x.element_size(), weight.element_size()
     )
+    # Persistent 1-D grid; group tiles only when every core gets at least two.
+    num_tiles = triton.cdiv(M, block_m)
+    aicore = _aicore_num()
+    proj_group = 2 if num_tiles >= 2 * aicore else 1
+    proj_grid = min(triton.cdiv(num_tiles, proj_group), aicore)
 
     with torch_device_fn.device(device):
         _rms_norm_kernel[(triton.cdiv(M, norm_m),)](
@@ -444,7 +538,7 @@ def fused_proj_rms_compute_h_forward(
             num_warps=_NUM_WARPS,
             num_stages=norm_stages,
         )
-        _proj_compute_h_kernel[(triton.cdiv(M, block_m),)](
+        _proj_compute_h_kernel[(proj_grid,)](
             x,
             weight,
             alpha_pre,
@@ -455,7 +549,6 @@ def fused_proj_rms_compute_h_forward(
             h_pre,
             h_post,
             h_res,
-            proj,
             M,
             K,
             float(eps),
@@ -464,6 +557,7 @@ def fused_proj_rms_compute_h_forward(
             N_RES=N - 2 * n,
             n=n,
             FP32_INPUT=matmul_dtype == torch.float32,
+            GROUP=proj_group,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
