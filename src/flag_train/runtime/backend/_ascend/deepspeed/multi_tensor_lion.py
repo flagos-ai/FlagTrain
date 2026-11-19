@@ -1,78 +1,8 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Ascend multi_tensor_lion.
-
-The generic implementation is ``flag_train.deepspeed.multi_tensor_lion`` and is
-what every backend without an override runs. Its launch shape is a CUDA one --
-one 2048-lane masked program per 2048 elements, one launch for the whole tensor
-set -- and on this backend (910B4, CANI 9.0 / BiShengHIR, card 6,
-``do_bench_npu`` KERNEL mode) that shape loses most of the machine:
-
-* A program's *fixed* cost dominates -- tens of nanoseconds whatever it carries
-  -- and it is lanes-per-program, not run length and not bytes, that sets the
-  achievable bandwidth, plateauing at 8192 lanes. So small tensors are priced
-  by their program count (1024 tensors x 1024 elements: 76 us for 20 MB of
-  traffic) and large ones never reach the memory path (8 x 1M elements: 513 us
-  where the same five streams copied take 101 us).
-* Every runtime scalar argument costs throughput (~40% for the second one on
-  this backend), and the generic kernel takes six.
-
-Measured against ``--base-data`` (mean ``vs Base`` over the seven benchmark
-rows, before -> after): 5.7 -> 13.0, and every row improved; the three worst,
-all large tensors, went 0.44 -> 2.70 (8 x 1M), 0.90 -> 1.83 (64 x 1M) and
-1.47 -> 1.80 (256 x 1M) in fp32, with fp16/bf16 tracking it.
-
-What this module does instead:
-
-* **8192-lane tiles.** The tile is the largest power of two dividing the
-  tensor's size (capped at 8192 lanes and at 32 KB per program), so its block
-  grid is exact and the kernel runs *unmasked*. Parameter sizes are multiples of
-  a hidden dimension, so that is the common case rather than a special one.
-  8192 is also the largest fp32 tile the 192 KB UB holds: a 16384-lane fp32
-  tile fails to compile ("requires 2360064 bits while 1572864 bits available").
-* **Pre-offset pointer tables.** ``g_ptrs[i]`` is the address of block ``i``, so
-  the device side is three independent loads and no address arithmetic, and the
-  kernel keeps a single runtime scalar (``lr``). The betas and the weight decay
-  are ``tl.constexpr`` at the measured price of extra runtime scalars; they are
-  fixed for a training run, so a caller that changes one pays one recompile.
-* **A persistent walk.** When a launch would need many programs, each program
-  walks several blocks: grid = ``clamp(cdiv(blocks, 32768/block), 32, 2048)``,
-  i.e. ~32768 lanes of work per program. Measured optima: 32 programs for 64 to
-  1024 tiny tensors, 256 for 8 x 1M, 2048 for 64-256 x 1M. That is what makes a
-  thousand tiny tensors (24 us where the generic shape took 76 us) and the
-  multi-hundred-MB cases pay the per-program cost once per program.
-* **A masked path for odd sizes**, because a size that is not a whole number of
-  tiles cannot run the exact-grid kernel. It keeps the same walking shape. Note
-  the offset in its index is a loaded value rather than folded into the pointer:
-  a masked access indexed by a compile-time ``tl.arange`` alone on a
-  runtime-loaded base miscompiles here, while the same access with a runtime
-  term in the index compiles and is bit-correct.
-
-Where the rows ended up: 8 x 1M fp32 at 84-101 us is the L2 bandwidth (the
-working set is 160 MB against a 168 MB L2) and matches a five-stream copy
-oracle; 64 x 1M at 1.18 ms and 256 x 1M at 4.74 ms are 1.08 TB/s, the HBM wall;
-1024 x 1024 at 24 us is flat across 32-256 programs. Dead ends, measured: 4096
-and 16384-lane tiles, walks with fewer than 128 programs for large blocks,
-masking the exact path (2-10% worse on the tiny-tensor rows), and ``num_stages``
-below 8192 (a no-op).
-
-Registration is by name. ``_ascend/deepspeed/__init__.py`` re-exports this
-module's ``multi_tensor_lion``, and ``SpecOpRegistrar`` writes it over the
-same-named generic function in ``flag_train.deepspeed`` when that package is
-imported -- the namespace the tests and the benchmark read the operator from.
-This module therefore imports nothing from ``flag_train.deepspeed``, which would
-re-enter the registrar mid-scan (see ``runtime/backend/__init__.py``).
+"""Ascend multi_tensor_lion: 8192-lane tiles, walked when the program count
+would otherwise be large. A program costs tens of ns whatever it carries
+here, so the generic 2048-lane masked shape was bounded by its program
+count, not by memory. Arithmetic and interface are the generic
+operator's; ``_ascend/deepspeed/__init__.py`` registers this by name.
 """
 
 import logging
@@ -88,20 +18,12 @@ from flag_train.utils import libentry
 
 logger = logging.getLogger(__name__)
 
-# Lanes per tile: measured throughput plateau and the largest fp32 tile the
-# 192 KB UB holds. ``_BLOCK_BYTES`` bounds the same tile by element size, so a
-# wider element (fp64) does not overrun the UB at that lane count.
+# Measured plateau; a 16384-lane fp32 tile overflows the 192 KB UB.
 _BLOCK_MAX = 8192
 _BLOCK_BYTES = 32768
-# The smallest tile that earns a block per program. A tensor below it is handled
-# by the masked kernel at the smallest power of two covering it, which bounds
-# the wasted lanes of its last block.
 _BLOCK_MIN = 512
 
-# Walk sizing: ~32768 lanes of work per program (about 0.6 MB of traffic for the
-# five fp32 streams), at least 32 programs so every vector core has work, and
-# never more than 2048 -- past that the per-program cost outweighs the walk, and
-# this backend rejects a grid product above 65535 anyway.
+# ~32768 lanes of work (about 0.6 MB over five fp32 streams) per program.
 _LANES_PER_PROGRAM = 32768
 _MIN_PROGRAMS = 32
 _MAX_WALK_PROGRAMS = 2048
@@ -112,13 +34,8 @@ def _next_pow2(n):
 
 
 def _block_for(numel, itemsize):
-    """The tile size for one tensor, or 0 for an empty tensor.
-
-    The tile is the largest power of two dividing ``numel`` (capped at
-    ``_BLOCK_MAX`` lanes and ``_BLOCK_BYTES`` bytes), so the tensor's block grid
-    is exact -- ``numel % block == 0`` -- and the kernel can run unmasked. A
-    size with a small power-of-two factor (an odd size) takes the masked kernel
-    at the smallest tile that covers it.
+    """Tile for one tensor (0 when empty): a power-of-two divisor of ``numel``,
+    capped, so the block grid is exact and the kernel runs unmasked.
     """
     if numel == 0:
         return 0
@@ -130,12 +47,8 @@ def _block_for(numel, itemsize):
 
 
 def _plan_launch(numels, block):
-    """``(grid, walk, full)`` for a group of tensors sharing ``block``.
-
-    ``full`` means every tensor is a whole number of blocks, so the unmasked
-    kernels can run. ``walk`` is False when every block can have its own
-    program, which is both the lowest-overhead form (one runtime scalar, no
-    loop) and the fastest while the blocks are small.
+    """``(grid, walk, full)`` for a group sharing ``block``: about 32768 lanes of
+    work per program, at least 32 programs, at most 2048.
     """
     n_blocks = sum((n + block - 1) // block for n in numels)
     full = all(n % block == 0 for n in numels)
@@ -160,18 +73,9 @@ def lion_block_kernel(
     WEIGHT_DECAY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """One complete Lion block, addressed by a pre-offset pointer table.
-
-    ``g_ptrs``/``p_ptrs``/``m_ptrs`` hold the three base addresses *of this
-    block* for every block of every tensor in the launch, so the kernel needs
-    neither the tensor's length nor a block offset: one program per block, and
-    the block is known to be complete.
-
-    Mirrors ``multi_tensor_lion_cuda`` in DeepSpeed: fp32 intermediate math,
-    ``c = beta1*m + (1-beta1)*g``, ``update = c > 0 ? -lr : +lr`` (c == 0 takes
-    +lr), ``p = p*(1 - lr*weight_decay) + update``, ``m = beta2*m + (1-beta2)*g``.
-    ``m`` is stored before ``p`` so the compiler can retire the moment's buffer
-    before the parameter arithmetic starts.
+    """One complete Lion block from pre-offset pointers: unmasked, one runtime
+    scalar. ``c = b1*m + (1-b1)*g``; ``p = p*(1-lr*wd) + (c>0 ? -lr : lr)``;
+    ``m = b2*m + (1-b2)*g``.
     """
     dtype = anchor.dtype.element_ty
     i = tl.program_id(0)
@@ -206,11 +110,8 @@ def lion_walk_kernel(
     WEIGHT_DECAY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """``lion_block_kernel`` with each program walking several blocks.
-
-    ``n_blocks`` stays a runtime value on purpose: a constant trip count is
-    unrolled by this compiler, which multiplies the live UB buffers and
-    overflows them.
+    """``lion_block_kernel`` with each program walking several blocks; the trip
+    count stays a runtime value so the loop is not unrolled.
     """
     dtype = anchor.dtype.element_ty
     n_programs = tl.num_programs(0)
@@ -248,16 +149,9 @@ def lion_partial_kernel(
     WEIGHT_DECAY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Lion for tensors whose block grid has a partial last block.
-
-    ``starts[i]`` is the element offset of block ``i`` inside its tensor and
-    ``remains[i]`` how many of its elements are real, so the last block of each
-    tensor is masked while every other block runs with a full one. Used only for
-    sizes that are not a multiple of ``BLOCK``.
-
-    The offset is a loaded value rather than folded into the pointer on purpose
-    (see the module docstring): a masked access indexed by a compile-time
-    ``tl.arange`` alone on a runtime-loaded base miscompiles here.
+    """Blocks of tensors whose size is not a multiple of ``BLOCK``: ``remain``
+    masks the tail, and the loaded ``start`` keeps a runtime term in the
+    index (a bare ``arange`` on a loaded base miscompiles here).
     """
     dtype = anchor.dtype.element_ty
     n_programs = tl.num_programs(0)
@@ -285,15 +179,8 @@ def lion_partial_kernel(
 
 
 def _build_metadata(g_list, p_list, m_list, block, partial):
-    """Per-block pointer tables, one entry per block of every tensor.
-
-    In the common (exact) case ``g_ptrs[i]`` is the address of block ``i``
-    itself, so the device side is three independent loads and no address
-    arithmetic. In the partial case the tables hold the tensor base plus the
-    block's element offset and remaining length, which the masked kernel needs.
-
-    Building the tables with numpy keeps a rebuild sub-millisecond at 1024
-    tensors; the result is cached anyway (see ``_get_metadata``).
+    """Per-block pointer tables: exact tiles point at their own start, partial
+    ones keep the base plus the block's offset and remaining count.
     """
     device = p_list[0].device
     numels = np.fromiter((t.numel() for t in g_list), dtype=np.int64, count=len(g_list))
@@ -306,8 +193,6 @@ def _build_metadata(g_list, p_list, m_list, block, partial):
     )
     starts = within * block
 
-    # Exact tiles point at their own start; partial ones keep the base and carry
-    # the offset separately for the masked kernel.
     byte_offsets = 0 if partial else starts * g_list[0].element_size()
 
     def tables(tensors):
@@ -326,12 +211,7 @@ def _build_metadata(g_list, p_list, m_list, block, partial):
     return g_ptrs, p_ptrs, m_ptrs, starts_dev, remain_dev
 
 
-# Device-meta cache keyed by the exact tensor set. A hit always yields
-# bit-identical content: the key contains every address and numel the buffer is
-# built from, so even tensors freed and re-created at the same addresses with
-# the same shapes produce the same key AND the same meta. Training loops call
-# the optimizer on a fixed tensor set every step, so after the first step every
-# call is a hit and the metadata cost disappears from the hot path.
+# Keyed by the exact tensor set, so an optimizer loop hits every step after the first.
 _META_CACHE = {}
 
 
@@ -348,8 +228,6 @@ def _get_metadata(g_list, p_list, m_list, block, partial):
     entry = _META_CACHE.get(key)
     if entry is None:
         if len(_META_CACHE) >= 64:
-            # Bound the device memory held by cached metas. Real workloads use
-            # one tensor set, so an eviction here only costs one rebuild.
             cur = next(iter(_META_CACHE))
             del _META_CACHE[cur]
         entry = _build_metadata(g_list, p_list, m_list, block, partial)
@@ -430,28 +308,11 @@ def multi_tensor_lion(
     step,
     weight_decay,
 ):
-    """Fused Lion optimizer step over a list of parameter tensors (Ascend).
+    """Fused Lion step over ``[grads, params, exp_avgs]`` (Ascend).
 
-    Faithful port of DeepSpeed's ``multi_tensor_lion`` CUDA operator. For each
-    tensor, with gradient ``g``, parameter ``p`` and first moment ``m``::
-
-        c      = beta1 * m + (1 - beta1) * g
-        update = -lr if c > 0 else +lr      # sign update; c == 0 takes +lr
-        p      = p * (1 - lr * weight_decay) + update
-        m      = beta2 * m + (1 - beta2) * g
-
-    Meanwhile every block of every tensor of one dtype and tile size is fused
-    into a single kernel launch, addressed through a device-side table of
-    per-block pointers that is cached across calls (see ``_get_metadata``).
-
-    The interface is the generic operator's -- see
-    ``flag_train.deepspeed.multi_tensor_lion`` for the argument contract.
-    ``chunk_size`` is accepted for parity and ignored (this implementation picks
-    its own element-per-program granularity); ``step`` is unused because Lion
-    has no bias correction; ``noop_flag`` is ignored, as DeepSpeed's own noop
-    check is commented out. ``beta1``, ``beta2`` and ``weight_decay`` are baked
-    into the kernel as compile-time constants, so a caller that changes one pays
-    one recompile; ``lr`` stays a runtime value and may change freely.
+    Same contract as ``flag_train.deepspeed.multi_tensor_lion``; ``lr`` is
+    the only runtime scalar, so the betas and weight decay are baked and a
+    caller that changes one pays one recompile.
     """
     logger.debug("TRAIN_ASCEND MULTI_TENSOR_LION")
 
@@ -464,8 +325,6 @@ def multi_tensor_lion(
             p.device.type == runtime_device.name
         ), f"multi_tensor_lion only supports {runtime_device.name} tensors"
 
-    # Group by dtype and by tile size, one launch per group (mirrors
-    # FusedLion.step, which groups by dtype alone).
     groups = {}
     itemsize = g_list[0].element_size()
     for g, p, m in zip(g_list, p_list, m_list):
