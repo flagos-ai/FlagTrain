@@ -82,14 +82,6 @@ _REFERENCE_SCORE_BUDGET = 1 << 26  # 67M entries, 268 MB of fp32
 # ---------------------------------------------------------------------------
 
 
-def _call(q, k, v, bias1=None, bias2=None):
-    """Call the public ``(Q, K, V, biases) -> out`` operator."""
-    biases = []
-    if bias1 is not None or bias2 is not None:
-        biases = [bias1] if bias2 is None else [bias1, bias2]
-    return flag_train.deepspeed.evoformer_attn(q, k, v, biases)
-
-
 def _reference(q, k, v, bias1=None, bias2=None):
     """The contract, composed from plain torch.
 
@@ -384,7 +376,7 @@ def test_forward_matches_reference(shape, dtype, biases):
     an unexercised kernel.
     """
     q, k, v, bias1, bias2 = _inputs(shape, dtype, bias1=biases[0], bias2=biases[1])
-    out = _call(q, k, v, bias1, bias2)
+    out = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2])
 
     rq, rk, rv, rb1, rb2 = _reference_operands(q, k, v, bias1, bias2)
     ref_out = _reference(rq, rk, rv, rb1, rb2)
@@ -408,7 +400,7 @@ def test_public_interface_matches_deepspeed_entry():
     # Keyword call: parameter names are part of the interface.
     out = flag_train.deepspeed.evoformer_attn(Q=q, K=k, V=v, biases=[bias1, bias2])
     assert isinstance(out, torch.Tensor)
-    ref_out = _call(q, k, v, bias1, bias2)
+    ref_out = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2])
     utils.train_assert_equal(utils.to_reference(out), utils.to_reference(ref_out))
 
     # The list is padded in place, exactly like upstream's entry.
@@ -463,8 +455,8 @@ def test_absent_bias_is_empty_tensor(dtype):
     shape = (1, 4, 64, 2, 32)
     q, k, v, bias1, bias2 = _inputs(shape, dtype)
 
-    with_none = _call(q, k, v, None, None)
-    with_empty = _call(q, k, v, _empty(q), _empty(q))
+    with_none = flag_train.deepspeed.evoformer_attn(q, k, v, [])
+    with_empty = flag_train.deepspeed.evoformer_attn(q, k, v, [_empty(q), _empty(q)])
     # Bit-identical, so the house equality helper rather than the closeness one:
     # the two spellings of "no bias" have to select the same kernel and produce
     # the same bits, not merely agree to a tolerance. Both sides are the
@@ -475,7 +467,7 @@ def test_absent_bias_is_empty_tensor(dtype):
     )
 
     # And an empty bias1 must not be the same as a present one.
-    with_bias = _call(q, k, v, bias1, bias2)
+    with_bias = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2])
     assert not torch.equal(with_none, with_bias)
 
 
@@ -513,7 +505,7 @@ def test_a_masked_key_contributes_nothing(dtype, head_size):
     mask[..., 10:20] = 0
     bias1 = _mask_bias(mask, dtype)
 
-    out = _call(q, k, v, bias1, None)
+    out = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1])
 
     rq, rk, rv, rb1, _ = _reference_operands(
         q, k[..., keep, :, :], v[..., keep, :, :], bias1[..., keep], None
@@ -545,7 +537,7 @@ def test_padding_the_tail_matches_a_shorter_sequence(dtype, shape, cut):
     mask[..., cut:] = 0
     bias1 = _mask_bias(mask, dtype)
 
-    out = _call(q, k, v, bias1, bias2)
+    out = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2])
 
     # The same attention over the first ``cut`` tokens -- bias2 is L x L, so it
     # is truncated on both axes, which is what "the padding is not there" means.
@@ -557,7 +549,7 @@ def test_padding_the_tail_matches_a_shorter_sequence(dtype, shape, cut):
     )
     b1s = bias1[..., :cut].contiguous()
     b2s = bias2[..., :cut, :cut].contiguous()
-    short_out = _call(qs, ks, vs, b1s, b2s)
+    short_out = flag_train.deepspeed.evoformer_attn(qs, ks, vs, [b1s, b2s])
 
     assert short_out.shape == short
     _assert_close("prefix out", out[:, :, :cut], short_out, dtype, _ATOL[dtype])
@@ -603,7 +595,7 @@ def test_large_shapes_match_reference(shape, dtype):
     would buy the same branch coverage for minutes of runtime.
     """
     q, k, v, bias1, bias2 = _inputs(shape, dtype)
-    out = _call(q, k, v, bias1, bias2)
+    out = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2])
 
     rq, rk, rv, rb1, rb2 = _reference_operands(q, k, v, bias1, bias2)
     ref_out = _reference(rq, rk, rv, rb1, rb2)
@@ -644,18 +636,18 @@ def test_the_pair_dimension_has_a_grid_ceiling():
         ]
 
     q, k, v = operands(slices)
-    out = _call(q, k, v)
+    out = flag_train.deepspeed.evoformer_attn(q, k, v, [])
     assert out.shape == q.shape
     assert bool(torch.isfinite(out).all())
 
     q, k, v = operands(slices + 1)
     if flag_train.vendor_name in _WALKING_SLICE_VENDORS:
-        out = _call(q, k, v)
+        out = flag_train.deepspeed.evoformer_attn(q, k, v, [])
         assert out.shape == q.shape
         assert bool(torch.isfinite(out).all())
     else:
         with pytest.raises(ValueError, match="65535"):
-            _call(q, k, v)
+            flag_train.deepspeed.evoformer_attn(q, k, v, [])
 
 
 @pytest.mark.evoformer_attn
@@ -684,7 +676,7 @@ def test_sequences_below_upstreams_floor(seq_len, dtype):
     """
     shape = (1, 4, seq_len, 2, 32)
     q, k, v, bias1, bias2 = _inputs(shape, dtype, bias1=False)
-    out = _call(q, k, v, bias1, bias2)
+    out = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2])
 
     rq, rk, rv, rb1, rb2 = _reference_operands(q, k, v, bias1, bias2)
     ref_out = _reference(rq, rk, rv, rb1, rb2)
@@ -711,7 +703,7 @@ def test_more_heads_than_one_launch_can_hold():
     batch, pairs, seq_len, heads, head_size = 1, 1, 64, 32769, 8
     shape = (batch, pairs, seq_len, heads, head_size)
     q, k, v, bias1, bias2 = _inputs(shape, dtype)
-    out = _call(q, k, v, bias1, bias2)
+    out = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2])
 
     assert out.shape == q.shape
 
@@ -753,7 +745,7 @@ def test_a_fully_masked_query_row_is_nan(dtype):
     b2 = bias2.clone()
     b2[..., cut:, :] = float("-inf")
 
-    out = _call(q, k, v, bias1, b2)
+    out = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, b2])
 
     assert bool(torch.isnan(out[:, :, cut:]).all()), "a fully masked row is NaN"
 
@@ -801,7 +793,7 @@ def test_matches_deepspeed_oracle(shape, dtype):
     """
     q, k, v, bias1, bias2 = _inputs(shape, dtype)
 
-    train_out = _call(q, k, v, bias1, bias2)
+    train_out = flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2])
 
     # Upstream's entry takes the biases as a list, and appends to it when it is
     # short -- which is why the list is built inline rather than reused.
@@ -838,28 +830,28 @@ def test_rejects_inputs_outside_the_contract():
 
     wide = torch.randn(1, 4, 64, 2, 128, dtype=dtype, device=flag_train.device)
     with pytest.raises(ValueError, match="head_size"):
-        _call(wide, wide, wide)
+        flag_train.deepspeed.evoformer_attn(wide, wide, wide, [])
 
     with pytest.raises(ValueError, match="same dtype"):
-        _call(q, k, v, bias1.to(torch.float32), bias2)
+        flag_train.deepspeed.evoformer_attn(q, k, v, [bias1.to(torch.float32), bias2])
 
     # The key may not silently disagree with the query's dtype or device.
     with pytest.raises(
         ValueError, match="query, key and value must have the same dtype"
     ):
-        _call(q, k.to(torch.float32), v)
+        flag_train.deepspeed.evoformer_attn(q, k.to(torch.float32), v, [])
 
     with pytest.raises(ValueError, match="bias1 must be on the query's device"):
-        _call(q, k, v, bias1.cpu(), bias2)
+        flag_train.deepspeed.evoformer_attn(q, k, v, [bias1.cpu(), bias2])
 
     with pytest.raises(ValueError, match="bias1"):
-        _call(q, k, v, bias1[:, :, 0], bias2)
+        flag_train.deepspeed.evoformer_attn(q, k, v, [bias1[:, :, 0], bias2])
 
     with pytest.raises(ValueError, match="at least 3-D"):
-        _call(q[0, 0, 0], k[0, 0, 0], v[0, 0, 0])
+        flag_train.deepspeed.evoformer_attn(q[0, 0, 0], k[0, 0, 0], v[0, 0, 0], [])
 
     with pytest.raises(ValueError, match="device tensor"):
-        _call(q.cpu(), k.cpu(), v.cpu())
+        flag_train.deepspeed.evoformer_attn(q.cpu(), k.cpu(), v.cpu(), [])
 
     # An empty sequence/head/head-size axis has no kernel to run; upstream's
     # L > 16 assert covers the first, and the other two would divide by zero
@@ -869,12 +861,14 @@ def test_rejects_inputs_outside_the_contract():
             torch.zeros(shape, dtype=dtype, device=flag_train.device) for _ in range(3)
         ]
         with pytest.raises(ValueError, match="non-empty"):
-            _call(*empty)
+            flag_train.deepspeed.evoformer_attn(*empty, [])
 
     # A 3-D operand has no pair dimension for a bias to be indexed by.
     flat = q.reshape(-1, 64, 2, 32)
     with pytest.raises(ValueError, match="5-D"):
-        _call(flat, flat, flat, bias1.reshape(-1, 64), bias2)
+        flag_train.deepspeed.evoformer_attn(
+            flat, flat, flat, [bias1.reshape(-1, 64), bias2]
+        )
 
 
 @pytest.mark.evoformer_attn
@@ -892,10 +886,10 @@ def test_rejects_operands_on_a_different_device():
     other = torch.device(f"{flag_train.device}:1")
 
     with pytest.raises(ValueError, match="same device"):
-        _call(q, k.to(other), v)
+        flag_train.deepspeed.evoformer_attn(q, k.to(other), v, [])
 
     with pytest.raises(ValueError, match="bias2 must be on the query's device"):
-        _call(q, k, v, bias1, bias2.to(other))
+        flag_train.deepspeed.evoformer_attn(q, k, v, [bias1, bias2.to(other)])
 
 
 @pytest.mark.evoformer_attn
@@ -909,5 +903,5 @@ def test_unbiased_query_may_have_any_leading_shape():
     dtype = torch.float16
     for shape in [(64, 2, 32), (3, 64, 2, 32), (1, 4, 64, 2, 32)]:
         q = torch.randn(shape, dtype=dtype, device=flag_train.device)
-        out = _call(q, q.clone(), q.clone())
+        out = flag_train.deepspeed.evoformer_attn(q, q.clone(), q.clone(), [])
         assert out.shape == shape
