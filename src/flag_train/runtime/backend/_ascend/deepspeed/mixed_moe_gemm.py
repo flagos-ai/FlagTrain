@@ -47,23 +47,21 @@ def mixed_moe_gemm_ascend_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    tile_m = tl.program_id(0)
-    tile_n = tl.program_id(1)
-    expert = tl.program_id(2).to(tl.int64)
+    tile_n = tl.program_id(0)
+    expert = tl.program_id(1).to(tl.int64)
     first_row = tl.load(row_ends_ptr + expert - 1, expert > 0, other=0)
     last_row = tl.load(row_ends_ptr + expert)
-    if tile_m * BLOCK_M < last_row - first_row:
+    cols = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets_k = tl.arange(0, BLOCK_K)
+    col_mask = cols < N
+    scales = tl.load(scale_ptr + expert * N + cols, col_mask, other=0).to(tl.float32)
+    packed_n: tl.constexpr = (N + 1) // 2 if NUM_BITS == 4 else N
+    k_tiles: tl.constexpr = (K + BLOCK_K - 1) // BLOCK_K
+    tile_m = 0
+    while tile_m * BLOCK_M < last_row - first_row:
         rows = first_row + tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        cols = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offsets_k = tl.arange(0, BLOCK_K)
         row_mask = (rows < last_row) & (rows < M)
-        col_mask = cols < N
-        scales = tl.load(scale_ptr + expert * N + cols, col_mask, other=0).to(
-            tl.float32
-        )
-        packed_n: tl.constexpr = (N + 1) // 2 if NUM_BITS == 4 else N
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-        k_tiles: tl.constexpr = (K + BLOCK_K - 1) // BLOCK_K
         for block_k in range(0, k_tiles):
             ks = block_k * BLOCK_K + offsets_k
             inputs = tl.load(
@@ -107,6 +105,7 @@ def mixed_moe_gemm_ascend_kernel(
             accumulator,
             row_mask[:, None] & col_mask[None, :],
         )
+        tile_m += 1
 
 
 def mixed_moe_gemm(
@@ -137,6 +136,16 @@ def mixed_moe_gemm(
     )
     if m == 0 or n == 0:
         return output
+    # Cube tiles are much more efficient when one block covers a full expert
+    # row range. This is only a performance knob: the kernel's tile_m loop is
+    # correct for any BLOCK_M and still handles uneven expert counts.
+    avg_rows = max(1, m // experts)
+    if avg_rows <= 32:
+        block_m = 32
+    elif avg_rows <= 64:
+        block_m = 64
+    else:
+        block_m = 128
     with torch_device_fn.device(hidden_states.device):
         # Cube loads require dense matrix rows; preserve strided public views
         # by using dense device buffers only when a view needs them.
@@ -146,7 +155,7 @@ def mixed_moe_gemm(
             if output.is_contiguous()
             else torch.empty_like(output, memory_format=torch.contiguous_format)
         )
-        mixed_moe_gemm_ascend_kernel[(triton.cdiv(m, 32), triton.cdiv(n, 64), experts)](
+        mixed_moe_gemm_ascend_kernel[(triton.cdiv(n, 64), experts)](
             result,
             inputs,
             weights,
@@ -163,7 +172,7 @@ def mixed_moe_gemm(
             NUM_BITS=num_bits,
             ACTIVATION=int(activation),
             HAS_BIAS=biases is not None,
-            BLOCK_M=32,
+            BLOCK_M=block_m,
             BLOCK_N=64,
             BLOCK_K=64,
         )
