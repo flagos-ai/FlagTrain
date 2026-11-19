@@ -511,13 +511,7 @@ def pytest_configure(config):
 def pytest_unconfigure(config):
     """Cleanup: restore all overridden operators."""
     if hasattr(config, "_override_registry"):
-        # A failed profile already reports why the selected case did not run.
-        allow_unused = (
-            Config is not None
-            and Config.profile_only
-            and Config.case_ids[0] not in Config.executed_case_ids
-        )
-        config._override_registry.restore_all(allow_unused=allow_unused)
+        config._override_registry.restore_all()
 
 
 @pytest.fixture(scope="session", autouse=True)

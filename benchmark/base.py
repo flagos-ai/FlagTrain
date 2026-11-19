@@ -372,35 +372,35 @@ class Benchmark:
     def set_train(self, train_op):
         self.train_op = train_op
 
-    def _prepare_call(self, op, args, kwargs):
-        if not self.is_backward:
-            return lambda: op(*args, **kwargs), None
-
-        # Build the forward graph before timing or opening a capture scope.
-        out = op(*args, **kwargs)
-        dout = torch.randn_like(out)
-        xs = [x for x in args if torch.is_tensor(x) and x.requires_grad]
-
-        def run_derivative():
-            return torch.autograd.grad(
-                (out,), xs, grad_outputs=(dout,), retain_graph=True
-            )
-
-        return run_derivative, xs
-
     def get_latency(self, op, *args, _reference_candidate=False, **kwargs):
-        fn, xs = self._prepare_call(op, args, kwargs)
-        if self.is_backward and _reference_candidate:
-            state = reference_execution()
-            if state is not None and state.enabled:
-                run_derivative = fn
+        fn = lambda: op(*args, **kwargs)
+        if self.is_backward:
+            # Building the graph is preparation: it happens before any timing
+            # and, on its own, does not prove the derivative ran.
+            out = fn()
+            dout = torch.randn_like(out)
+            # fn = lambda: out.backward(dout, retain_graph=True)
+            xs = list(filter(lambda x: torch.is_tensor(x) and x.requires_grad, args))
 
-                def timed_reference_derivative():
-                    grads = run_derivative()
-                    state.candidate_derivative_calls += 1
-                    return grads
+            def run_derivative():
+                return torch.autograd.grad(
+                    (out,), xs, grad_outputs=(dout,), retain_graph=True
+                )
 
-                fn = timed_reference_derivative
+            fn = run_derivative
+            if _reference_candidate:
+                state = reference_execution()
+                if state is not None and state.enabled:
+
+                    def timed_reference_derivative():
+                        grads = run_derivative()
+                        # Only the actual timed autograd call on the selected
+                        # reference's graph counts; the baseline path does not
+                        # pass this flag and is never counted.
+                        state.candidate_derivative_calls += 1
+                        return grads
+
+                    fn = timed_reference_derivative
         if Config.mode == consts.BenchMode.OPERATOR:
             n_warm, n_rep = get_iter_count(fn)
             for i in range(n_warm):
@@ -429,7 +429,7 @@ class Benchmark:
                     warmup=Config.warm_up,
                     rep=Config.repetition,
                     return_mode="median",
-                    grad_to_none=xs,
+                    grad_to_none=xs if self.is_backward else None,
                 )
         elif Config.mode == consts.BenchMode.WRAPPER:
             n_warm, n_rep = get_iter_count(fn)
@@ -447,7 +447,7 @@ class Benchmark:
                 fn,
                 rep=Config.repetition,
                 return_mode="median",
-                grad_to_none=xs,
+                grad_to_none=xs if self.is_backward else None,
             )
         else:
             raise ValueError("Undefined Value of Benchmark Mode.")
@@ -655,9 +655,25 @@ class Benchmark:
         Config.executed_case_ids.update(executed)
         return results
 
-    def _warmup_profile_case(self, case):
+    def _prepare_profile_call(self, case):
         args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
-        warmup, _ = self._prepare_call(self.train_op, args, kwargs)
+        op = self.train_op
+        if not self.is_backward:
+            return lambda: op(*args, **kwargs)
+
+        out = op(*args, **kwargs)
+        dout = torch.randn_like(out)
+        grad_inputs = [x for x in args if torch.is_tensor(x) and x.requires_grad]
+
+        def derivative():
+            return torch.autograd.grad(
+                (out,), grad_inputs, grad_outputs=(dout,), retain_graph=True
+            )
+
+        return derivative
+
+    def _warmup_profile_case(self, case):
+        warmup = self._prepare_profile_call(case)
         for _ in range(Config.profile_warmup):
             warmup()
         torch_device_fn.synchronize()
@@ -681,8 +697,7 @@ class Benchmark:
 
         if Config.profile_warmup:
             self._warmup_profile_case(case)
-        args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
-        capture, _ = self._prepare_call(self.train_op, args, kwargs)
+        capture = self._prepare_profile_call(case)
         torch_device_fn.synchronize()
 
         scope = Config.profile_hook(backend=vendor_name, case_id=case_id)

@@ -56,9 +56,7 @@ def test_reference_backward_requires_candidate_derivative(monkeypatch, run_deriv
     monkeypatch.setattr(
         base,
         "Config",
-        SimpleNamespace(
-            mode=BenchMode.CUDAGRAPH, skip_native=False, repetition=1, base_data=None
-        ),
+        SimpleNamespace(mode=BenchMode.CUDAGRAPH, skip_native=False, repetition=1),
     )
     timer_calls = iter([True, run_derivative])
 

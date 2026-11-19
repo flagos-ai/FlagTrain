@@ -409,7 +409,7 @@ class DynamicOpOverride:
             results[op_name] = self.override(op_name, impl_func, module_name)
         return results
 
-    def _restore_target(self, full_name: str, *, allow_unused: bool = False) -> bool:
+    def _restore_target(self, full_name: str) -> bool:
         """Restore a canonical ``module.attribute`` identity."""
         if full_name not in self._originals:
             warnings.warn(f"Operator '{full_name}' was not overridden by this registry")
@@ -443,7 +443,7 @@ class DynamicOpOverride:
             warnings.warn(f"Failed to restore '{full_name}': {e}")
             return False
 
-        if was_unused and not allow_unused:
+        if was_unused:
             raise AssertionError(
                 f"Operator '{attr_name}' was overridden via override_from_file "
                 f"but its candidate implementation was never invoked"
@@ -477,9 +477,7 @@ class DynamicOpOverride:
             return False
         return self._restore_target(target.full_name)
 
-    def restore_all(
-        self, module_name: str = "flag_train", *, allow_unused: bool = False
-    ):
+    def restore_all(self, module_name: str = "flag_train"):
         """
         Restore all overridden operators in the specified module.
 
@@ -489,12 +487,11 @@ class DynamicOpOverride:
 
         Args:
             module_name: Module name (default: "flag_train")
-            allow_unused: Restore overrides without requiring a candidate call.
 
         Raises:
             AssertionError: If any override loaded via ``override_from_file``
                 (i.e. through the CLI/config path) was registered but never
-                actually invoked before being restored, unless allow_unused is set.
+                actually invoked before being restored.
         """
         prefix = f"{module_name.rstrip('.')}."
         ops_to_restore = [
@@ -506,7 +503,7 @@ class DynamicOpOverride:
         unused_errors = []
         for full_name in ops_to_restore:
             try:
-                self._restore_target(full_name, allow_unused=allow_unused)
+                self._restore_target(full_name)
             except AssertionError as e:
                 unused_errors.append(str(e))
 

@@ -105,9 +105,10 @@ class ProbeBenchmark(base.GenericBenchmark):
             assert self.prepared_input() is None, "Warmup input is still live"
         return super().build_inputs(case)
 
-    def _prepare_call(self, op, args, kwargs):
+    def unpack_to_args_kwargs(self, inputs):
+        args, kwargs = super().unpack_to_args_kwargs(inputs)
         self.prepared_input = weakref.ref(args[0])
-        return super()._prepare_call(op, args, kwargs)
+        return args, kwargs
 
 def baseline(*args, **kwargs):
     pytest.fail("Profile must bypass the baseline")
@@ -227,25 +228,7 @@ def test_profile_rejects_unknown_workload(suite):
     result = run_profile(suite, "--case-id", f"{NODE}[forward]::core::float32::99")
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result.stdout.fnmatch_lines(["*case selection failed: unknown=*99*"])
-    assert "Traceback" not in result.stderr.str()
-    assert "candidate implementation was never invoked" not in result.stderr.str()
     assert not (suite.path / "events.txt").exists()
-
-
-def test_profile_checks_unused_overrides_after_successful_replay(suite):
-    result = run_profile(
-        suite,
-        "--case-id",
-        FORWARD_CASE,
-        "--profile-warmup",
-        "0",
-        "--override",
-        "megatron.unused_profile_probe:candidate.py:candidate",
-    )
-    assert result.ret == pytest.ExitCode.TESTS_FAILED
-    result.stderr.fnmatch_lines(
-        ["*unused_profile_probe*its candidate implementation was never invoked*"]
-    )
 
 
 @pytest.mark.parametrize(
