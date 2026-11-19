@@ -687,6 +687,13 @@ def pytest_sessionfinish(session, exitstatus):
             pytest.ExitCode.NO_TESTS_COLLECTED,
         ):
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        if (
+            unknown
+            and getattr(Config, "profile_only", False)
+            and hasattr(session.config, "_override_registry")
+        ):
+            # An unknown profile case cannot invoke the installed candidate.
+            session.config._override_registry.restore_all(allow_unused=True)
 
 
 def pytest_itemcollected(item):

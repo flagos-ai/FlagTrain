@@ -228,7 +228,24 @@ def test_profile_rejects_unknown_workload(suite):
     result = run_profile(suite, "--case-id", f"{NODE}[forward]::core::float32::99")
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result.stdout.fnmatch_lines(["*case selection failed: unknown=*99*"])
+    assert "Traceback" not in result.stderr.str()
+    assert "candidate implementation was never invoked" not in result.stderr.str()
     assert not (suite.path / "events.txt").exists()
+
+
+def test_benchmark_unknown_case_retains_unused_override_check(suite):
+    result = suite.runpytest_subprocess(
+        f"{NODE}[forward]",
+        "--level",
+        "core",
+        "--case-id",
+        f"{NODE}[forward]::core::float32::99",
+        "--override",
+        "megatron.profile_probe:candidate.py:candidate",
+    )
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.stdout.fnmatch_lines(["*case selection failed: unknown=*99*"])
+    result.stderr.fnmatch_lines(["*candidate implementation was never invoked*"])
 
 
 @pytest.mark.parametrize(
