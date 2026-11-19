@@ -536,16 +536,16 @@ def test_weighted_squared_relu_accepts_complex_weights():
 def test_weighted_squared_relu_accepts_complex_clamp(clamp_shape):
     """Megatron keeps complex clamp arithmetic until the final cast."""
     x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
-    clamp = (torch.randn(clamp_shape, dtype=torch.complex64) + 2).to(
-        flag_train.device
-    )
+    clamp = (torch.randn(clamp_shape, dtype=torch.complex64) + 2).to(flag_train.device)
     y = flag_train.megatron.weighted_squared_relu_impl(x, None, clamp)
 
     # The reference is evaluated on the CPU: some devices' ``tanh`` has no
     # complex kernel, and this oracle only has to be independent, not local.
     x_ref = utils.to_reference(x, upcast=True).cpu()
     clamp_ref = utils.to_reference(clamp, upcast=True).cpu()
-    expected = torch.pow(clamp_ref * torch.tanh(torch.relu(x_ref.float()) / clamp_ref), 2)
+    expected = torch.pow(
+        clamp_ref * torch.tanh(torch.relu(x_ref.float()) / clamp_ref), 2
+    )
     utils.train_assert_close(y.cpu(), expected.to(x.dtype), x.dtype)
 
 

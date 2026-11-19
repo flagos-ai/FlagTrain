@@ -53,11 +53,15 @@ _INT_INPUT_DTYPES = (
 # Weight dtypes the Triton kernels can load. Complex weights are passed as
 # real/imaginary planes; the kernel keeps the real part of the final product,
 # matching Megatron's cast back to the activation dtype.
-_WEIGHT_DTYPES = _WEIGHTED_SQUARED_RELU_DTYPES + _INT_INPUT_DTYPES + (
-    torch.bool,
-    torch.uint16,
-    torch.uint32,
-    torch.uint64,
+_WEIGHT_DTYPES = (
+    _WEIGHTED_SQUARED_RELU_DTYPES
+    + _INT_INPUT_DTYPES
+    + (
+        torch.bool,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+    )
 )
 
 _CLAMP_VECTOR_DTYPES = _WEIGHT_DTYPES
@@ -138,7 +142,10 @@ def _normalize_clamp(clamp_scale, input):
                 "Expected all tensors to be on the same device, but found at "
                 f"least two devices, {input.device} and {clamp_scale.device}!"
             )
-        if not clamp_scale.is_complex() and clamp_scale.dtype not in _CLAMP_VECTOR_DTYPES:
+        if (
+            not clamp_scale.is_complex()
+            and clamp_scale.dtype not in _CLAMP_VECTOR_DTYPES
+        ):
             raise ValueError(
                 "weighted_squared_relu_impl clamp_scale needs a numeric tensor, "
                 f"got {clamp_scale.dtype}"

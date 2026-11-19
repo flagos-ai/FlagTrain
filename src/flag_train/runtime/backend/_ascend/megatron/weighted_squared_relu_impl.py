@@ -352,10 +352,7 @@ def _needs_generic(input, weights, clamp_scale):
         if isinstance(clamp_scale, torch.Tensor):
             if clamp_scale.is_complex() or clamp_scale.numel() != 1:
                 return True
-            if (
-                clamp_scale.device != input.device
-                and clamp_scale.dim() != 0
-            ):
+            if clamp_scale.device != input.device and clamp_scale.dim() != 0:
                 return True
         elif not isinstance(clamp_scale, numbers.Real):
             return True
