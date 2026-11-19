@@ -17,6 +17,7 @@ from .fused_proj_rms_compute_h_forward import fused_proj_rms_compute_h_forward
 from .fused_proj_rms_forward import fused_proj_rms_forward
 from .quick_geglu import quick_geglu
 from .quick_gelu import quick_gelu
+from .router_gating_linear_function import router_gating_linear_function
 from .scaled_masked_softmax_cuda_backward import scaled_masked_softmax_cuda_backward
 from .scaled_masked_softmax_cuda_forward import scaled_masked_softmax_cuda_forward
 from .scaled_upper_triang_masked_softmax_forward import (
@@ -43,6 +44,7 @@ __all__ = [
     "fused_proj_rms_forward",
     "quick_geglu",
     "quick_gelu",
+    "router_gating_linear_function",
     "scaled_masked_softmax_cuda_backward",
     "scaled_masked_softmax_cuda_forward",
     "scaled_upper_triang_masked_softmax_forward",

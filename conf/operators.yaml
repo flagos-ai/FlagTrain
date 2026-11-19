@@ -423,6 +423,20 @@ ops:
   source: megatron.core.activations
   stages:
   - beta: '0.0.0'
+- id: router_gating_linear_function
+  description: Project Megatron router logits with optional bias and first-order gradients.
+  for:
+  - RouterGatingLinearFunction
+  labels:
+  - megatron
+  - moe
+  from:
+  - megatron
+  kind:
+  - MoE
+  source: megatron.core.transformer.moe.moe_utils.RouterGatingLinearFunction
+  stages:
+  - beta: '0.0.0'
 - id: scaled_masked_softmax_cuda_backward
   description: 'Gradient of the scaled masked softmax with respect to the scores:
     scale * y * (dy - sum(dy * y)) over the key axis.'
