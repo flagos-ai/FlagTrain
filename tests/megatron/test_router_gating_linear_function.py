@@ -14,11 +14,14 @@
 
 """Check Megatron's Torch router branch, including the mixed-dtype bias epilogue."""
 
+import math
+
 import pytest
 import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_close
 from tests.megatron._router_gating_linear_reference import (
     DTYPES,
     OVERRIDE_KEY,
@@ -30,6 +33,27 @@ from tests.megatron._router_gating_linear_reference import (
 pytestmark = pytest.mark.skipif(
     flag_train.vendor_name != "nvidia", reason="NVIDIA Router kernel"
 )
+
+
+@pytest.fixture(autouse=True)
+def _matmul_precision(monkeypatch):
+    # Compare against Megatron's Torch path with full-precision accumulation.
+    matmul = torch.backends.cuda.matmul
+    monkeypatch.setattr(matmul, "allow_tf32", False)
+    monkeypatch.setattr(matmul, "allow_fp16_reduced_precision_reduction", False)
+    monkeypatch.setattr(matmul, "allow_bf16_reduced_precision_reduction", False)
+
+
+def _assert_fp32_reduction_close(actual, expected, reduction_size):
+    # These dot products have an output scale proportional to sqrt(reduction_size).
+    # Account for FP32 accumulation order when cancellation brings a result near zero.
+    assert_close(
+        actual,
+        expected,
+        expected.dtype,
+        atol=1e-5,
+        reduce_dim=math.sqrt(reduction_size),
+    )
 
 
 @pytest.mark.router_gating_linear_function
@@ -53,7 +77,10 @@ def test_router_gating_linear_function(shape, num_experts, router_dtype, with_bi
     reference_bias = reference_inputs[2] if with_bias else None
     actual = candidate(*candidate_inputs[:2], candidate_bias, router_dtype)
     expected = reference(*reference_inputs[:2], reference_bias, router_dtype)
-    torch.testing.assert_close(actual, expected)
+    if router_dtype == torch.float32:
+        _assert_fp32_reduction_close(actual, expected, inp.size(-1))
+    else:
+        torch.testing.assert_close(actual, expected)
     if with_bias:
         torch.testing.assert_close(
             actual.flatten()[0], expected.flatten()[0], rtol=0, atol=0
@@ -70,9 +97,17 @@ def test_router_gating_linear_function(shape, num_experts, router_dtype, with_bi
     )
     actual_grads = torch.autograd.grad(actual, candidate_inputs, grad_output.clone())
     expected_grads = torch.autograd.grad(expected, reference_inputs, grad_output)
-    torch.testing.assert_close(actual_grads, expected_grads)
-    if with_bias and router_dtype == torch.float32:
-        torch.testing.assert_close(actual_grads[-1], expected_grads[-1], rtol=0, atol=0)
+    if router_dtype == torch.float32:
+        _assert_fp32_reduction_close(actual_grads[0], expected_grads[0], num_experts)
+        _assert_fp32_reduction_close(
+            actual_grads[1], expected_grads[1], grad_output.numel() // num_experts
+        )
+        if with_bias:
+            torch.testing.assert_close(
+                actual_grads[-1], expected_grads[-1], rtol=0, atol=0
+            )
+    else:
+        torch.testing.assert_close(actual_grads, expected_grads)
     for actual_input, original in zip(candidate_inputs, inputs):
         torch.testing.assert_close(actual_input, original, rtol=0, atol=0)
 

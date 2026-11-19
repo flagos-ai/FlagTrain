@@ -384,19 +384,24 @@ def _clamp_pow2(x):
     return v
 
 
-def _fwd_cfg(M, E, K):
-    bn = min(_clamp_pow2(E), 256)
-    bm = 16384 // bn
-    if bm > 128:
-        bm = 128
-    if bm < 16:
-        bm = 16
+def _matmul_warps(cd, tile_area):
+    # Two warps keep FP16/BF16 on warp-level MMA. Multi-warp-group
+    # tiles have produced incorrect results on Hopper.
+    if cd:
+        return 2
+    return 8 if tile_area >= 128 * 128 else 4
+
+
+def _fwd_cfg(M, E, K, cd):
+    # Keep two-warp accumulator tiles small enough to avoid register spilling.
+    bn = min(_clamp_pow2(E), 64 if cd else 256)
+    bm = min(64 if cd else 128, 16384 // bn)
     while bm > 16 and bm > M:
         bm //= 2
     bk = 64
     if K < 64:
         bk = _clamp_pow2(K)
-    nw = 8 if (bm * bn) >= 128 * 128 else 4
+    nw = _matmul_warps(cd, bm * bn)
     return bm, bn, bk, nw
 
 
@@ -524,7 +529,7 @@ def _fp32_router_forward(x, w, bias, out, rows, width, experts):
 
 
 def _launch_fwd(a2d, w, bias, o2d, M, E, K, cd, dt):
-    bm, bn, bk, nw = _fwd_cfg(M, E, K)
+    bm, bn, bk, nw = _fwd_cfg(M, E, K, cd)
     grid = (triton.cdiv(M, bm), triton.cdiv(E, bn))
     bptr = bias if bias is not None else a2d
     _fwd_kernel[grid](
@@ -551,12 +556,12 @@ def _launch_fwd(a2d, w, bias, o2d, M, E, K, cd, dt):
 
 
 def _launch_da(do2d, w, da2d, M, E, K, cd, dt, rd_dt):
-    bm = 128
+    bm = 64 if cd else 128
     while bm > 16 and bm > M:
         bm //= 2
-    bk = 128 if K >= 128 else _clamp_pow2(K)
+    bk = min(_clamp_pow2(K), 64 if cd else 128)
     be = min(_clamp_pow2(E), 32)
-    nw = 8 if (bm * bk) >= 128 * 128 else 4
+    nw = _matmul_warps(cd, bm * bk)
     grid = (triton.cdiv(M, bm), triton.cdiv(K, bk))
     _dag_kernel[grid](
         do2d,
@@ -605,7 +610,7 @@ def _launch_dw(do2d, a2d, M, E, K, cd):
         split = 1
     n_blk = triton.cdiv(n_mb, split)
     dpart = torch.empty((split, E, K), dtype=torch.float32, device=do2d.device)
-    nw = 8 if (be * bk) >= 128 * 128 else 4
+    nw = _matmul_warps(cd, be * bk)
     grid = (n_et, n_kt, split)
     _dwg_kernel[grid](
         do2d,
