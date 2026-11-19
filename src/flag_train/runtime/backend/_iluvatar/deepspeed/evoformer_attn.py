@@ -626,7 +626,7 @@ def evoformer_attn(Q, K, V, biases):
     Returns:
         Tensor: the attention output, shaped like ``Q``.
     """
-    logger.debug("TRAIN EVOFORMER_ATTN")
+    logger.debug("TRAIN_ILUVATAR EVOFORMER_ATTN")
     bias1, bias2 = _normalize_biases(biases)
 
     # Upstream's public entry reaches the kernel through a wrapper that makes
