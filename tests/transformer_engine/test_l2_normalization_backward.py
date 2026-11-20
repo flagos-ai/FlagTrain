@@ -20,13 +20,36 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
-from tests.transformer_engine._l2_backward_reference import (
-    DTYPES,
-    OP_NAME,
-    SHAPES,
-    make_inputs,
-    reference,
+
+OP_NAME = "l2_normalization_backward"
+SHAPES = (
+    (8, 64),
+    (32, 128),
+    (2, 16, 80),
+    (1, 1),
+    (31, 127),
+    (128, 768),
+    (512, 1024),
+    (8, 128, 1536),
+    (2048, 4096),
 )
+DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+EPS = 1e-6
+
+
+def make_inputs(shape, dtype, device):
+    rng = torch.Generator(device="cpu").manual_seed(42)
+    x = torch.randn(shape, generator=rng, dtype=torch.float32).to(device, dtype)
+    grad = torch.randn(shape, generator=rng, dtype=torch.float32).to(device, dtype)
+    inverse_norm = (x.float().square().sum(dim=-1, keepdim=True) + EPS).rsqrt()
+    return grad, x, inverse_norm, EPS
+
+
+def reference(grad_output, x, rsqrt_norm, eps):
+    x32, grad32 = x.float(), grad_output.float()
+    projection = (x32 * grad32).sum(dim=-1, keepdim=True)
+    norm_squared = x32.square().sum(dim=-1, keepdim=True) + eps
+    return (rsqrt_norm * (grad32 - x32 * projection / norm_squared)).to(x.dtype)
 
 
 @pytest.mark.l2_normalization_backward

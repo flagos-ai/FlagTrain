@@ -20,7 +20,7 @@ import pytest
 import flag_train
 from benchmark.base import GenericBenchmark
 from benchmark.cases import BenchmarkCasePlan
-from tests.transformer_engine._l2_backward_reference import (
+from tests.transformer_engine.test_l2_normalization_backward import (
     DTYPES,
     EPS,
     OP_NAME,
