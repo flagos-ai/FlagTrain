@@ -518,35 +518,28 @@ def test_weighted_squared_relu_accepts_cpu_input():
 
 
 @pytest.mark.weighted_squared_relu_impl
-def test_weighted_squared_relu_accepts_complex_weights():
-    """Megatron multiplies then casts the complex product back to input dtype."""
+def test_weighted_squared_relu_rejects_complex_weights():
+    """Complex weights are outside the operator's real-valued contract."""
     x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
-    # Drawn on the CPU: some device RNGs reject complex dtypes even though
-    # the device stores and multiplies them.
     weights = torch.rand((16, 1), dtype=torch.complex64).to(flag_train.device)
-    y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
-    expected = _megatron_weighted_squared_relu(x, weights, None)
-    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
+    with pytest.raises(ValueError, match="real-valued"):
+        flag_train.megatron.weighted_squared_relu_impl(x, weights)
+    with pytest.raises(ValueError, match="real-valued"):
+        flag_train.megatron.weighted_squared_relu_impl(x, 1 + 2j)
 
 
 @pytest.mark.weighted_squared_relu_impl
 @pytest.mark.parametrize(
     "clamp_shape", [(), (64,), (1, 64)], ids=["scalar", "vector", "row_vector"]
 )
-def test_weighted_squared_relu_accepts_complex_clamp(clamp_shape):
-    """Megatron keeps complex clamp arithmetic until the final cast."""
+def test_weighted_squared_relu_rejects_complex_clamp(clamp_shape):
+    """Complex clamp scales are outside the operator's real-valued contract."""
     x = torch.randn((16, 64), dtype=torch.float32, device=flag_train.device)
     clamp = (torch.randn(clamp_shape, dtype=torch.complex64) + 2).to(flag_train.device)
-    y = flag_train.megatron.weighted_squared_relu_impl(x, None, clamp)
-
-    # The reference is evaluated on the CPU: some devices' ``tanh`` has no
-    # complex kernel, and this oracle only has to be independent, not local.
-    x_ref = utils.to_reference(x, upcast=True).cpu()
-    clamp_ref = utils.to_reference(clamp, upcast=True).cpu()
-    expected = torch.pow(
-        clamp_ref * torch.tanh(torch.relu(x_ref.float()) / clamp_ref), 2
-    )
-    utils.train_assert_close(y.cpu(), expected.to(x.dtype), x.dtype)
+    with pytest.raises(ValueError, match="real-valued"):
+        flag_train.megatron.weighted_squared_relu_impl(x, None, clamp)
+    with pytest.raises(ValueError, match="real-valued"):
+        flag_train.megatron.weighted_squared_relu_impl(x, None, 1 + 2j)
 
 
 @pytest.mark.weighted_squared_relu_impl

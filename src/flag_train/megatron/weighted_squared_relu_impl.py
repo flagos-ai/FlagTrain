@@ -50,9 +50,9 @@ _INT_INPUT_DTYPES = (
     torch.int64,
 )
 
-# Weight dtypes the Triton kernels can load. Complex weights are passed as
-# real/imaginary planes; the kernel keeps the real part of the final product,
-# matching Megatron's cast back to the activation dtype.
+# Weight dtypes the Triton kernels can load. Complex weights are rejected:
+# Megatron's arithmetic would keep a complex product until the final cast, but
+# this operator only supports real-valued weights.
 _WEIGHT_DTYPES = (
     _WEIGHTED_SQUARED_RELU_DTYPES
     + _INT_INPUT_DTYPES
@@ -69,7 +69,7 @@ _CLAMP_VECTOR_DTYPES = _WEIGHT_DTYPES
 
 def _fast_weights(weights, shape):
     """A broadcast view of ``weights`` when the fast kernel can read it."""
-    if weights is None or weights.is_complex():
+    if weights is None:
         return None
     try:
         broadcast_shape = tuple(torch.broadcast_shapes(tuple(weights.shape), shape))
@@ -88,6 +88,11 @@ def _normalize_weights(weights, input):
     if weights is None:
         return None
     if isinstance(weights, torch.Tensor):
+        if weights.is_complex():
+            raise ValueError(
+                "weighted_squared_relu_impl weights must be real-valued, "
+                f"got {weights.dtype}"
+            )
         if weights.device != input.device:
             if weights.dim() != 0 or weights.device.type != "cpu":
                 raise RuntimeError(
@@ -97,7 +102,7 @@ def _normalize_weights(weights, input):
             # torch allows a 0-dim CPU scalar next to a device tensor, but not
             # a device scalar next to a CPU tensor.
             weights = weights.to(input.device)
-        if not weights.is_complex() and weights.dtype not in _WEIGHT_DTYPES:
+        if weights.dtype not in _WEIGHT_DTYPES:
             raise ValueError(
                 "weighted_squared_relu_impl weights needs a numeric tensor, "
                 f"got {weights.dtype}"
@@ -105,9 +110,18 @@ def _normalize_weights(weights, input):
         if weights.dtype == torch.bool:
             weights = weights.to(torch.float32)
         return weights
+    if isinstance(weights, numbers.Complex) and not isinstance(weights, numbers.Real):
+        raise ValueError(
+            "weighted_squared_relu_impl weights must be real-valued, got complex"
+        )
     if isinstance(weights, numbers.Number):
         weights = torch.as_tensor(weights, device=input.device)
-        if not weights.is_complex() and weights.dtype not in _WEIGHT_DTYPES:
+        if weights.is_complex():
+            raise ValueError(
+                "weighted_squared_relu_impl weights must be real-valued, "
+                f"got {weights.dtype}"
+            )
+        if weights.dtype not in _WEIGHT_DTYPES:
             raise ValueError(
                 "weighted_squared_relu_impl weights needs a numeric tensor, "
                 f"got {weights.dtype}"
@@ -126,6 +140,11 @@ def _normalize_clamp(clamp_scale, input):
     if clamp_scale is None:
         return None, None
     if isinstance(clamp_scale, torch.Tensor):
+        if clamp_scale.is_complex():
+            raise ValueError(
+                "weighted_squared_relu_impl clamp_scale must be real-valued, "
+                f"got {clamp_scale.dtype}"
+            )
         if clamp_scale.numel() == 1:
             if clamp_scale.device != input.device and not (
                 clamp_scale.dim() == 0
@@ -142,21 +161,18 @@ def _normalize_clamp(clamp_scale, input):
                 "Expected all tensors to be on the same device, but found at "
                 f"least two devices, {input.device} and {clamp_scale.device}!"
             )
-        if (
-            not clamp_scale.is_complex()
-            and clamp_scale.dtype not in _CLAMP_VECTOR_DTYPES
-        ):
+        if clamp_scale.dtype not in _CLAMP_VECTOR_DTYPES:
             raise ValueError(
                 "weighted_squared_relu_impl clamp_scale needs a numeric tensor, "
                 f"got {clamp_scale.dtype}"
             )
-        if clamp_scale.is_complex():
-            return None, clamp_scale
         return None, clamp_scale.to(torch.float32)
     if isinstance(clamp_scale, numbers.Real):
         return float(clamp_scale), None
     if isinstance(clamp_scale, numbers.Complex):
-        return complex(clamp_scale), None
+        raise ValueError(
+            "weighted_squared_relu_impl clamp_scale must be real-valued, got complex"
+        )
     raise TypeError(
         "weighted_squared_relu_impl clamp_scale needs a number or tensor, "
         f"got {type(clamp_scale).__name__}"
@@ -296,22 +312,16 @@ def _clamped_forward_kernel(
 def _general_forward_kernel(
     x_ptr,
     weight_ptr,
-    weight_imag_ptr,
     clamp_ptr,
-    clamp_imag_ptr,
     y_ptr,
     in_rows,
     in_hidden,
     out_hidden,
     abs_scale,
     neg_two_over_scale,
-    clamp_real_scalar,
-    clamp_imag_scalar,
     HAS_WEIGHT: tl.constexpr,
     HAS_CLAMP: tl.constexpr,
     CLAMP_VECTOR: tl.constexpr,
-    CLAMP_COMPLEX: tl.constexpr,
-    WEIGHT_COMPLEX: tl.constexpr,
     INT_INPUT: tl.constexpr,
     UINT8_OUTPUT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -320,9 +330,7 @@ def _general_forward_kernel(
 
     The output shape is ``broadcast(flat_input, weights, clamp)``. Input rows
     and columns therefore repeat by modulo; weights and a vector clamp are
-    materialised to the output shape before launch. Complex clamp/weight
-    operands are passed as their real and imaginary planes because Triton has
-    no complex dtype.
+    materialised to the output shape before launch.
     """
     out_row = tle.program_id(0)
     columns = tle.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -334,37 +342,7 @@ def _general_forward_kernel(
 
     if HAS_CLAMP:
         xf = x.to(tl.float32)
-        if CLAMP_COMPLEX:
-            if CLAMP_VECTOR:
-                a = tl.load(
-                    clamp_ptr + out_row * out_hidden + columns, mask=mask, other=0.0
-                ).to(tl.float32)
-                b = tl.load(
-                    clamp_imag_ptr + out_row * out_hidden + columns,
-                    mask=mask,
-                    other=0.0,
-                ).to(tl.float32)
-            else:
-                a = clamp_real_scalar
-                b = clamp_imag_scalar
-            z = tl.maximum(xf, 0.0)
-            denom = a * a + b * b
-            ur = z * a / denom
-            ui = -z * b / denom
-            e2 = tl.exp(2.0 * ur)
-            em2 = tl.exp(-2.0 * ur)
-            sinh = (e2 - em2) * 0.5
-            cosh = (e2 + em2) * 0.5
-            sin2b = tl.sin(2.0 * ui)
-            cos2b = tl.cos(2.0 * ui)
-            tanh_den = cosh + cos2b
-            tr = sinh / tanh_den
-            ti = sin2b / tanh_den
-            wr = a * tr - b * ti
-            wi = a * ti + b * tr
-            act_real = wr * wr - wi * wi
-            act_imag = 2.0 * wr * wi
-        elif CLAMP_VECTOR:
+        if CLAMP_VECTOR:
             c = tl.load(
                 clamp_ptr + out_row * out_hidden + columns, mask=mask, other=0.0
             ).to(tl.float32)
@@ -372,35 +350,24 @@ def _general_forward_kernel(
             neg2 = tl.where(abs_c == 0.0, float("-inf"), -2.0 / abs_c)
             e = tl.exp(tl.maximum(xf, 0.0) * neg2)
             c = abs_c * ((1.0 - e) / (1.0 + e))
-            act_real = c * c
-            act_imag = 0.0
+            act = c * c
         else:
-            act_real = _clamped_square(xf, abs_scale, neg_two_over_scale)
-            act_imag = 0.0
+            act = _clamped_square(xf, abs_scale, neg_two_over_scale)
+    elif INT_INPUT:
+        r = tl.maximum(x, 0)
+        act = (r * r).to(tl.float32)
     else:
-        act_imag = 0.0
-        if INT_INPUT:
-            r = tl.maximum(x, 0)
-            act_real = (r * r).to(tl.float32)
-        else:
-            xf = x.to(tl.float32)
-            r = tl.maximum(xf, 0.0)
-            act_real = r * r
+        xf = x.to(tl.float32)
+        r = tl.maximum(xf, 0.0)
+        act = r * r
 
     if HAS_WEIGHT:
         weight = tl.load(
             weight_ptr + out_row * out_hidden + columns, mask=mask, other=0.0
         ).to(tl.float32)
-        out = act_real * weight
-        if WEIGHT_COMPLEX:
-            weight_imag = tl.load(
-                weight_imag_ptr + out_row * out_hidden + columns,
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-            out = out - act_imag * weight_imag
+        out = act * weight
     else:
-        out = act_real
+        out = act
 
     if UINT8_OUTPUT:
         # torch's float -> uint8 cast truncates toward zero and wraps modulo
@@ -417,10 +384,8 @@ def _general_forward_kernel(
 
 def _launch_general(
     x,
-    weight_real,
-    weight_imag,
-    clamp_real,
-    clamp_imag,
+    weight,
+    clamp,
     out,
     in_rows,
     in_hidden,
@@ -430,36 +395,23 @@ def _launch_general(
     block_size, num_warps = _launch_config(x.dtype)
     if clamp_scalar is None:
         abs_scale, neg_two_over_scale = 0.0, 0.0
-        clamp_real_scalar, clamp_imag_scalar = 0.0, 0.0
-    elif isinstance(clamp_scalar, complex):
-        abs_scale, neg_two_over_scale = 0.0, 0.0
-        clamp_real_scalar = float(clamp_scalar.real)
-        clamp_imag_scalar = float(clamp_scalar.imag)
     else:
         abs_scale, neg_two_over_scale = _clamp_operands(clamp_scalar)
-        clamp_real_scalar, clamp_imag_scalar = 0.0, 0.0
-    clamp_complex = isinstance(clamp_scalar, complex) or clamp_imag is not None
     grid = (out.numel() // out_hidden, triton.cdiv(out_hidden, block_size))
     with torch_device_fn.device(x.device):
         _general_forward_kernel[grid](
             x,
-            x if weight_real is None else weight_real,
-            x if weight_imag is None else weight_imag,
-            x if clamp_real is None else clamp_real,
-            x if clamp_imag is None else clamp_imag,
+            x if weight is None else weight,
+            x if clamp is None else clamp,
             out,
             in_rows,
             in_hidden,
             out_hidden,
             abs_scale,
             neg_two_over_scale,
-            clamp_real_scalar,
-            clamp_imag_scalar,
-            HAS_WEIGHT=weight_real is not None,
-            HAS_CLAMP=clamp_scalar is not None or clamp_real is not None,
-            CLAMP_VECTOR=clamp_real is not None,
-            CLAMP_COMPLEX=clamp_complex,
-            WEIGHT_COMPLEX=weight_imag is not None,
+            HAS_WEIGHT=weight is not None,
+            HAS_CLAMP=clamp_scalar is not None or clamp is not None,
+            CLAMP_VECTOR=clamp is not None,
             INT_INPUT=x.dtype in _INT_INPUT_DTYPES,
             UINT8_OUTPUT=out.dtype == torch.uint8,
             BLOCK_SIZE=block_size,
@@ -551,18 +503,19 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
     cannot flatten fail here too), ``weights`` is ordinary torch broadcasting,
     and the 3-D epilogue reshapes the result back to ``(S, B, hidden)``.
     Float and integer tensors run Triton; broadcast weights (including extra
-    leading dimensions), complex weights/clamps, vector clamps and
-    non-contiguous inputs use the general Triton kernel. CPU inputs are staged
-    to the active accelerator, computed in Triton, and copied back to CPU.
-    Bool inputs are rejected rather than emulated with torch.
+    leading dimensions), vector clamps and non-contiguous inputs use the general
+    Triton kernel. CPU inputs are staged to the active accelerator, computed in
+    Triton, and copied back to CPU. Bool inputs, complex weights and complex
+    clamp scales are rejected rather than emulated with torch.
 
     Args:
         input (Tensor): 2-D or 3-D tensor.  Supported dtypes are fp16, bf16,
             fp32, fp64 and the integer types torch's ``relu`` accepts.
-        weights (Tensor, optional): any tensor or number broadcastable to the
-            flattened activation, with Megatron's ordinary broadcasting rules.
-        clamp_scale (float or Tensor, optional): scalar or broadcastable tanh
-            soft-clamp scale.
+        weights (Tensor or number, optional): real-valued tensor or number
+            broadcastable to the flattened activation, with Megatron's ordinary
+            broadcasting rules.
+        clamp_scale (float or Tensor, optional): real scalar or broadcastable
+            tanh soft-clamp scale.
 
     Returns:
         Tensor: the forward result, with the same shape/dtype rules as Megatron.
@@ -572,7 +525,8 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
             or when the input is not 2-D/3-D.
         RuntimeError: when Megatron's ``view``/broadcast operations reject the
             inputs, or when a CPU input has no accelerator to stage it through.
-        ValueError: for bool or other dtypes Triton cannot execute.
+        ValueError: for bool inputs, complex weights or clamp scales, or other
+            dtypes Triton cannot execute.
     """
     logger.debug("TRAIN WEIGHTED_SQUARED_RELU_IMPL")
     assert weights is not None or clamp_scale is not None, (
@@ -622,7 +576,6 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
     use_fast = (
         flat_kernel.dtype in _WEIGHTED_SQUARED_RELU_DTYPES
         and clamp_vector is None
-        and not isinstance(clamp_scalar, complex)
         and tuple(out_shape) == tuple(flat.shape)
         and (weight_tensor is None or fast_weights is not None)
     )
@@ -647,28 +600,20 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
 
     out = torch.empty(out_shape, dtype=input.dtype, device=compute_device)
     out_hidden = out_shape[-1]
-    weight_real = weight_imag = None
-    if weight_tensor is not None:
-        weight = torch.broadcast_to(weight_tensor, out_shape)
-        if weight.is_complex():
-            weight_real = weight.real.contiguous()
-            weight_imag = weight.imag.contiguous()
-        else:
-            weight_real = weight.contiguous()
-    clamp_real = clamp_imag = None
-    if clamp_vector is not None:
-        clamp = torch.broadcast_to(clamp_vector, out_shape)
-        if clamp.is_complex():
-            clamp_real = clamp.real.contiguous()
-            clamp_imag = clamp.imag.contiguous()
-        else:
-            clamp_real = clamp.to(torch.float32).contiguous()
+    weight = (
+        None
+        if weight_tensor is None
+        else torch.broadcast_to(weight_tensor, out_shape).contiguous()
+    )
+    clamp = (
+        None
+        if clamp_vector is None
+        else torch.broadcast_to(clamp_vector, out_shape).to(torch.float32).contiguous()
+    )
     _launch_general(
         flat_kernel,
-        weight_real,
-        weight_imag,
-        clamp_real,
-        clamp_imag,
+        weight,
+        clamp,
         out,
         flat.shape[0],
         flat.shape[1],
