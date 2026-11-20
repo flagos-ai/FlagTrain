@@ -310,7 +310,7 @@ ops:
   - Normalization
   source: megatron.core.transformer.hyper_connection
   stages:
-  - beta: '0.0.0'
+  - stable: '0.0.0'
 - id: l2_normalization_backward
   description: Input gradient for L2 normalization using the saved inverse norm.
   for:
@@ -324,7 +324,7 @@ ops:
   - Normalization
   source: transformer_engine.pytorch.jit
   stages:
-  - beta: '0.0.0'
+  - stable: '0.0.0'
 - id: lamb
   description: 'Fused LAMB optimizer update. Supports fp32 or fp64 master weights
     and moments; fp16 gradients against fp32 master weights are also supported.'
@@ -395,7 +395,7 @@ ops:
   - Tensor
   source: megatron.core.transformer.multi_token_prediction
   stages:
-  - beta: '0.0.0'
+  - stable: '0.0.0'
 - id: multi_modal_rotary_embedding
   description: Generates non-interleaved multimodal rotary frequencies with optional sequence interpolation.
   for:
@@ -409,7 +409,7 @@ ops:
   - Attention
   source: megatron.core.models.common.embeddings.rotary_pos_embedding
   stages:
-  - beta: '0.0.0'
+  - stable: '0.0.0'
 - id: multi_tensor_adam
   description: Fused Adam/AdamW optimizer update over multiple parameter tensors.
   for:
@@ -492,7 +492,7 @@ ops:
   - MoE
   source: megatron.core.transformer.moe.moe_utils.RouterGatingLinearFunction
   stages:
-  - beta: '0.0.0'
+  - stable: '0.0.0'
 - id: scaled_masked_softmax_cuda_backward
   description: 'Gradient of the scaled masked softmax with respect to the scores:
     scale * y * (dy - sum(dy * y)) over the key axis.'
@@ -610,4 +610,4 @@ ops:
   - Activation
   source: megatron.core.fusions.fused_bias_swiglu
   stages:
-  - beta: '0.0.0'
+  - stable: '0.0.0'
