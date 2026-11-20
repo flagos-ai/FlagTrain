@@ -21,7 +21,7 @@ import torch
 import flag_train
 from benchmark.base import GenericBenchmark
 from benchmark.cases import BenchmarkCasePlan
-from tests.megatron._multi_modal_rotary_reference import (
+from tests.megatron.test_multi_modal_rotary_embedding import (
     OP_NAME,
     TIMING_WORKLOADS,
     make_inputs,
