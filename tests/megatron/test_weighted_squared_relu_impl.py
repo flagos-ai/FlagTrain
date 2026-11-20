@@ -493,7 +493,7 @@ def test_weighted_squared_relu_accepts_integer_input():
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
     expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
     assert y.shape == x.shape and y.dtype == x.dtype
-    torch.testing.assert_close(y, expected)
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
 
 @pytest.mark.weighted_squared_relu_impl
@@ -514,7 +514,7 @@ def test_weighted_squared_relu_accepts_cpu_input():
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
     expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
     assert y.device.type == "cpu"
-    torch.testing.assert_close(y, expected)
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
 
 @pytest.mark.weighted_squared_relu_impl
@@ -526,7 +526,7 @@ def test_weighted_squared_relu_accepts_complex_weights():
     weights = torch.rand((16, 1), dtype=torch.complex64).to(flag_train.device)
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
     expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
-    torch.testing.assert_close(y, expected)
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
 
 @pytest.mark.weighted_squared_relu_impl
@@ -561,7 +561,7 @@ def test_weighted_squared_relu_accepts_unsigned_weights(dtype):
     # multiply, which not every device's ``mul`` spells out for unsigned ints.
     promoted = torch.promote_types(x.dtype, weights.dtype)
     expected = (torch.pow(torch.relu(x), 2) * weights.to(promoted)).to(x.dtype)
-    torch.testing.assert_close(y, expected)
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
 
 @pytest.mark.weighted_squared_relu_impl
@@ -571,7 +571,7 @@ def test_weighted_squared_relu_uint8_wraps_like_torch():
     weights = torch.tensor([[-3.1]], dtype=torch.float32, device=flag_train.device)
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
     expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
-    torch.testing.assert_close(y, expected)
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
 
 @pytest.mark.weighted_squared_relu_impl
@@ -593,7 +593,7 @@ def test_weighted_squared_relu_accepts_extra_weight_dims(shape, weights_shape):
     if x.dim() == 3:
         expected = expected.view(x.shape[0], x.shape[1], -1)
     assert y.shape == expected.shape
-    torch.testing.assert_close(y, expected)
+    utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
 
 @pytest.mark.weighted_squared_relu_impl
