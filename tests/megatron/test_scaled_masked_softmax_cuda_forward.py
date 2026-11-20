@@ -33,6 +33,7 @@ composition so it cannot silently drift.
 
 import importlib.metadata
 import importlib.util
+import inspect
 import warnings
 
 import pytest
@@ -52,23 +53,26 @@ needs_extension = pytest.mark.skipif(
     reason="Megatron's Apex scaled-softmax CUDA extension is not installed",
 )
 
-_DTYPES = [torch.float16, torch.float32]
+_DTYPES = [torch.float16]
 if utils.bf16_is_supported:
     _DTYPES.append(torch.bfloat16)
 _EXT_DTYPES = [torch.float16] + ([torch.bfloat16] if utils.bf16_is_supported else [])
 
-# ``[b, np, sq, sk]``: a single score, odd sizes, query and key lengths that
-# differ, a full attention head, and the sizes the benchmark reports.
+# ``[b, np, sq, sk]`` shapes Megatron selects for the fused path:
+# ``16 < sk <= 4096``, ``sq/sk`` divisible by 4, ``b * np`` divisible by 4,
+# and ``sq`` divisible by Apex's batch-per-block for the key length. The key
+# lengths cover the batch-per-block tiers from 8 down to 4; query/key lengths
+# differ, and the benchmark shapes are appended below.
 _SHAPES = [
-    (1, 1, 1, 1),
-    (1, 1, 1, 5),
-    (2, 3, 4, 4),
-    (2, 3, 5, 7),
-    (1, 2, 16, 16),
-    (2, 4, 31, 31),
-    (2, 8, 64, 64),
+    (2, 2, 8, 20),
+    (1, 4, 24, 24),
+    (2, 2, 16, 32),
+    (2, 2, 32, 48),
+    (2, 2, 64, 96),
+    (2, 8, 64, 128),
     (4, 8, 128, 128),
     (2, 8, 128, 256),
+    (2, 2, 64, 4096),
     (1, 8, 1024, 1024),
 ]
 _BENCH_SHAPES = [
@@ -262,6 +266,23 @@ def test_baseline_source():
 
 
 @pytest.mark.scaled_masked_softmax_cuda_forward
+def test_public_interface_matches_megatron():
+    """The call shape is the Apex entry Megatron's forward invokes."""
+    params = inspect.signature(
+        flag_train.megatron.scaled_masked_softmax_cuda_forward
+    ).parameters
+    assert list(params) == ["inputs", "mask", "scale"]
+    assert all(param.default is inspect.Parameter.empty for param in params.values())
+
+    shape = (2, 4, 32, 32)
+    scores = torch.randn(shape, dtype=torch.float16, device=flag_train.device)
+    mask = _padding_mask(shape)
+    out = flag_train.megatron.scaled_masked_softmax_cuda_forward(scores, mask, _SCALE)
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == scores.shape and out.dtype == scores.dtype
+
+
+@pytest.mark.scaled_masked_softmax_cuda_forward
 @pytest.mark.parametrize("shape", _SHAPES + _BENCH_SHAPES)
 @pytest.mark.parametrize("build_mask", _MASK_BUILDERS)
 @pytest.mark.parametrize("dtype", _DTYPES)
@@ -297,9 +318,9 @@ def test_forward(shape, build_mask, dtype):
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_fully_masked_rows_are_zero(dtype):
     """A row that masks every key has no distribution: upstream answers zeros."""
-    shape = (2, 2, 8, 8)
+    shape = (2, 2, 32, 32)
     scores = torch.randn(shape, dtype=dtype, device=flag_train.device)
-    mask = torch.zeros((2, 1, 8, 8), dtype=torch.bool, device=flag_train.device)
+    mask = torch.zeros((2, 1, 32, 32), dtype=torch.bool, device=flag_train.device)
     mask[:, 0, -1, :] = True  # one fully masked row per batch entry
     mask[:, 0, 0, :] = True
 
@@ -315,7 +336,7 @@ def test_fully_masked_rows_are_zero(dtype):
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_scale_and_values(dtype):
     """Scale 0, negative scale, and saturated scores stay finite."""
-    shape = (2, 4, 4, 4)
+    shape = (2, 4, 16, 32)
     scores = torch.randn(shape, dtype=torch.float32, device=flag_train.device)
     scores[..., 0], scores[..., -1] = -10.0, 10.0
     scores = scores.to(dtype)
@@ -332,7 +353,7 @@ def test_scale_and_values(dtype):
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_zero_dim_scale(dtype):
     """Megatron passes ``scale_t[0]``, a 0-dim tensor, not a Python float."""
-    shape = (2, 2, 8, 8)
+    shape = (2, 2, 32, 32)
     scores = torch.randn(shape, dtype=dtype, device=flag_train.device)
     mask = _padding_mask(shape)
     scale = torch.tensor([_SCALE], dtype=torch.float32)
@@ -345,11 +366,11 @@ def test_zero_dim_scale(dtype):
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_noncontiguous(dtype):
     utils.init_seed(1)
-    base = torch.randn((2, 4, 8, 8), dtype=dtype, device=flag_train.device)
-    scores = base.transpose(2, 3)  # [2, 4, 8, 8], non-contiguous
-    mask = torch.zeros((2, 1, 8, 8), dtype=torch.bool, device=base.device)
+    base = torch.randn((2, 4, 64, 32), dtype=dtype, device=flag_train.device)
+    scores = base.transpose(2, 3)  # [2, 4, 32, 64], non-contiguous
+    mask = torch.zeros((2, 1, 64, 32), dtype=torch.bool, device=base.device)
     mask[:, 0, :, 4:] = True
-    mask = mask.transpose(2, 3)  # [2, 1, 8, 8], non-contiguous
+    mask = mask.transpose(2, 3)  # [2, 1, 32, 64], non-contiguous
     assert not scores.is_contiguous() and not mask.is_contiguous()
 
     out = flag_train.megatron.scaled_masked_softmax_cuda_forward(scores, mask, _SCALE)
@@ -359,9 +380,55 @@ def test_noncontiguous(dtype):
 
 @pytest.mark.scaled_masked_softmax_cuda_forward
 @pytest.mark.parametrize("dtype", _DTYPES)
+def test_uint8_mask(dtype):
+    """Apex reads the mask as bytes; a uint8 0/1 mask is the same contract."""
+    utils.init_seed(2)
+    shape = (2, 4, 16, 32)
+    scores = torch.randn(shape, dtype=dtype, device=flag_train.device)
+    mask = _padding_mask(shape)
+
+    expected = flag_train.megatron.scaled_masked_softmax_cuda_forward(
+        scores, mask, _SCALE
+    )
+    out = flag_train.megatron.scaled_masked_softmax_cuda_forward(
+        scores, mask.to(torch.uint8), _SCALE
+    )
+    torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.scaled_masked_softmax_cuda_forward
+@pytest.mark.parametrize("mask_dtype", [torch.uint8, torch.int32, torch.float32])
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_mask_dtype_is_read_as_bytes(mask_dtype, dtype):
+    """Apex casts mask storage to uint8; only bytes equal to 1 are masked."""
+    utils.init_seed(3)
+    shape = (2, 4, 16, 32)
+    scores = torch.randn(shape, dtype=dtype, device=flag_train.device)
+    packed = _padding_mask(shape).to(mask_dtype)
+    raw = packed.view(torch.uint8).reshape(-1)[: packed.numel()].view(packed.shape)
+    expected = flag_train.megatron.scaled_masked_softmax_cuda_forward(
+        scores, raw == 1, _SCALE
+    )
+
+    out = flag_train.megatron.scaled_masked_softmax_cuda_forward(scores, packed, _SCALE)
+    torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.scaled_masked_softmax_cuda_forward
+@pytest.mark.parametrize("dtype", _DTYPES)
 def test_empty_batch(dtype):
-    scores = torch.empty((0, 2, 4, 4), dtype=dtype, device=flag_train.device)
-    mask = torch.empty((1, 1, 4, 4), dtype=torch.bool, device=flag_train.device)
+    scores = torch.empty((0, 2, 8, 64), dtype=dtype, device=flag_train.device)
+    mask = torch.empty((1, 1, 8, 64), dtype=torch.bool, device=flag_train.device)
+    out = flag_train.megatron.scaled_masked_softmax_cuda_forward(scores, mask, _SCALE)
+    assert out.shape == scores.shape and out.numel() == 0
+
+
+@pytest.mark.scaled_masked_softmax_cuda_forward
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_zero_heads_returns_empty(dtype):
+    """Apex's zero-sized head grid is a no-op; the output is empty."""
+    scores = torch.empty((2, 0, 32, 32), dtype=dtype, device=flag_train.device)
+    mask = torch.empty((2, 1, 32, 32), dtype=torch.bool, device=flag_train.device)
     out = flag_train.megatron.scaled_masked_softmax_cuda_forward(scores, mask, _SCALE)
     assert out.shape == scores.shape and out.numel() == 0
 
@@ -369,7 +436,7 @@ def test_empty_batch(dtype):
 @pytest.mark.scaled_masked_softmax_cuda_forward
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_does_not_mutate_operands(dtype):
-    shape = (2, 2, 8, 8)
+    shape = (2, 2, 32, 32)
     scores = torch.randn(shape, dtype=dtype, device=flag_train.device)
     mask = _padding_mask(shape)
     scores_copy, mask_copy = scores.clone(), mask.clone()
@@ -384,8 +451,9 @@ def test_does_not_mutate_operands(dtype):
 @pytest.mark.parametrize(
     "shape",
     [
-        (1, 1, 16, 16),
-        (1, 2, 64, 64),
+        (2, 2, 16, 20),
+        (2, 2, 32, 32),
+        (2, 4, 64, 64),
         (2, 4, 128, 128),
         (1, 8, 128, 256),
         (2, 4, 256, 512),
@@ -423,49 +491,96 @@ def test_vendored_baseline_matches_torch(dtype):
 
 @pytest.mark.scaled_masked_softmax_cuda_forward
 @pytest.mark.parametrize(
-    ("case", "match"),
+    ("case", "match", "error"),
     [
-        ("ndim", "4-D"),
-        ("dtype", "needs a"),
-        ("mask-ndim", "mask needs a 4-D"),
-        ("mask-dtype", "bool"),
-        ("mask-batch", "b or 1"),
-        ("mask-shape", "must match the scores"),
-        ("mask-device", "one device"),
-        ("cpu", "not one on the CPU"),
-        ("key-limit", "exceeds Megatron"),
-        ("scale", "one element"),
+        ("ndim", "4D", RuntimeError),
+        ("dtype", "Only fp16 and bf16", RuntimeError),
+        ("mask-ndim", "4D", RuntimeError),
+        ("mask-batch", "pad_batches", RuntimeError),
+        ("mask-shape", r"mask\.size\(3\)", RuntimeError),
+        ("mask-device", "one device", RuntimeError),
+        ("cpu", "CPU", RuntimeError),
+        ("key-limit", "key_seq_len", RuntimeError),
+        ("key-limit-wide", "key_seq_len <= 16384", RuntimeError),
+        ("sq-one", "query_seq_len > 1", RuntimeError),
+        ("sk-zero", "16 < sk <= 4096", RuntimeError),
+        ("sk-lower", "16 < sk <= 4096", RuntimeError),
+        ("sq-multiple-of-4", r"sq % 4 == 0", RuntimeError),
+        ("sk-multiple-of-4", r"sk % 4 == 0", RuntimeError),
+        ("attn-batches", r"attn_batches % 4 == 0", RuntimeError),
+        ("sq-divisibility", "batches_per_block", RuntimeError),
+        ("scale", "one-element", TypeError),
     ],
 )
-def test_rejects_invalid_arguments(case, match):
-    if case == "dtype" and not flag_train.runtime.device.support_fp64:
-        # The fp64 rejection cannot be exercised where the device has no fp64:
-        # torch_npu's Tensor.double() silently keeps float32, so the guard
-        # would be handed a supported dtype and would rightly not raise.
-        pytest.skip("device does not support fp64")
-    scores = torch.randn((2, 2, 4, 4), dtype=torch.float32, device=flag_train.device)
+def test_rejects_invalid_arguments(case, match, error):
+    scores = torch.randn((2, 2, 32, 32), dtype=torch.float16, device=flag_train.device)
     mask = _padding_mask(scores.shape)
     args = (scores, mask, _SCALE)
     if case == "ndim":
-        args = (scores.reshape(2, 2, 16), mask, _SCALE)
+        args = (scores.reshape(2, 2, 1024), mask, _SCALE)
     elif case == "dtype":
-        args = (scores.double(), mask, _SCALE)
+        args = (scores.float(), mask, _SCALE)
     elif case == "mask-ndim":
-        args = (scores, mask.reshape(2, 16), _SCALE)
-    elif case == "mask-dtype":
-        args = (scores, mask.to(torch.uint8), _SCALE)
+        args = (scores, mask.reshape(2, 1024), _SCALE)
     elif case == "mask-batch":
         args = (scores, mask[:1].repeat(3, 1, 1, 1), _SCALE)
     elif case == "mask-shape":
-        args = (scores, mask[..., :2], _SCALE)
+        args = (scores, mask[..., :4], _SCALE)
     elif case == "mask-device":
         args = (scores, mask.cpu(), _SCALE)
     elif case == "cpu":
         args = (scores.cpu(), mask.cpu(), _SCALE)
     elif case == "key-limit":
-        big = torch.empty((1, 1, 1, 4097), dtype=torch.float16, device=scores.device)
-        args = (big, torch.zeros_like(big, dtype=torch.bool), _SCALE)
+        big = torch.empty((2, 2, 32, 4097), dtype=torch.float16, device=scores.device)
+        mask = torch.zeros((2, 1, 32, 4097), dtype=torch.bool, device=scores.device)
+        args = (big, mask, _SCALE)
+    elif case == "key-limit-wide":
+        big = torch.empty((2, 2, 32, 16385), dtype=torch.float16, device=scores.device)
+        mask = torch.zeros((2, 1, 32, 16385), dtype=torch.bool, device=scores.device)
+        args = (big, mask, _SCALE)
+    elif case == "sq-one":
+        args = (
+            torch.empty((2, 2, 1, 32), dtype=torch.float16, device=scores.device),
+            torch.empty((2, 1, 1, 32), dtype=torch.bool, device=scores.device),
+            _SCALE,
+        )
+    elif case == "sk-zero":
+        args = (
+            torch.empty((2, 2, 32, 0), dtype=torch.float16, device=scores.device),
+            torch.empty((2, 1, 32, 0), dtype=torch.bool, device=scores.device),
+            _SCALE,
+        )
+    elif case == "sk-lower":
+        args = (
+            torch.empty((2, 2, 32, 16), dtype=torch.float16, device=scores.device),
+            torch.empty((2, 1, 32, 16), dtype=torch.bool, device=scores.device),
+            _SCALE,
+        )
+    elif case == "sq-multiple-of-4":
+        args = (
+            torch.empty((2, 2, 10, 32), dtype=torch.float16, device=scores.device),
+            torch.empty((2, 1, 10, 32), dtype=torch.bool, device=scores.device),
+            _SCALE,
+        )
+    elif case == "sk-multiple-of-4":
+        args = (
+            torch.empty((2, 2, 8, 18), dtype=torch.float16, device=scores.device),
+            torch.empty((2, 1, 8, 18), dtype=torch.bool, device=scores.device),
+            _SCALE,
+        )
+    elif case == "attn-batches":
+        args = (
+            torch.empty((1, 2, 32, 32), dtype=torch.float16, device=scores.device),
+            torch.empty((1, 1, 32, 32), dtype=torch.bool, device=scores.device),
+            _SCALE,
+        )
+    elif case == "sq-divisibility":
+        args = (
+            torch.empty((2, 2, 12, 64), dtype=torch.float16, device=scores.device),
+            torch.empty((2, 1, 12, 64), dtype=torch.bool, device=scores.device),
+            _SCALE,
+        )
     elif case == "scale":
         args = (scores, mask, torch.ones(2))
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(error, match=match):
         flag_train.megatron.scaled_masked_softmax_cuda_forward(*args)

@@ -19,10 +19,10 @@ Self-contained module; depends only on torch and deepspeed. It does not import
 ``BlockedFlashAttn``; when DeepSpeed is unavailable it raises instead of
 collecting a baseline or falling back to flash-attn / a torch composition.
 
-The input construction (paged cache, atoms, dense KV) and the atom builder are
-copied from ``FlagTrain/benchmark/deepspeed/test_blocked_flash.py``; the atom
-field offsets come from ``src/flag_train/deepspeed/blocked_flash.py`` (ABI
-constants). DeepSpeed is loaded lazily on the first call.
+The input construction (paged cache and pointer atom tables) and the atom
+builder are copied from ``FlagTrain/benchmark/deepspeed/test_blocked_flash.py``;
+the atom field offsets come from ``src/flag_train/deepspeed/blocked_flash.py``
+(ABI constants). DeepSpeed is loaded lazily on the first call.
 """
 
 import torch
@@ -209,7 +209,9 @@ def _load_deepspeed_blocked_flash():
     try:
         from deepspeed.inference.v2.inference_utils import DtypeEnum
         from deepspeed.inference.v2.kernels.ragged_ops import BlockedFlashAttn
+        from deepspeed.ops.op_builder import RaggedOpsBuilder
 
+        RaggedOpsBuilder().load()
         return BlockedFlashAttn, DtypeEnum
     except Exception as exc:
         raise RuntimeError(
@@ -227,7 +229,12 @@ def _deepspeed_blocked_flash():
 
 
 def _deepspeed_atoms(seq_params, q_block_size, kv_block_size, device):
-    """Atoms in the reference layout, for the DeepSpeed baseline."""
+    """Atoms in the pinned-host layout DeepSpeed's kernel expects.
+
+    The operator under test points slot [0] at the device block list; this
+    baseline points it at a pinned host copy instead, so both tables can be
+    built from the same logical block list.
+    """
     atoms, kv_block_idx = build_blocked_flash_atoms(
         seq_params, q_block_size, kv_block_size, device
     )
@@ -297,28 +304,25 @@ def blocked_flash_input_fn(shape, dtype, device):
     atoms, kv_block_idx = build_blocked_flash_atoms(
         [(n_tokens, 0)], q_block_size, kv_block_size, device
     )
+    pointer_atoms = atoms.clone()
+    addresses = kv_block_idx.data_ptr() + 4 * atoms[:, int(_ATOM_BLOCK_OFFSET)].to(
+        torch.int64
+    )
+    pointer_atoms[:, 0:2] = addresses.view(torch.int32).reshape(-1, 2)
 
     deepspeed_atoms, deepspeed_pinned = _deepspeed_atoms(
         [(n_tokens, 0)], q_block_size, kv_block_size, device
     )
 
-    cu_seqlens = torch.tensor([0, n_tokens], dtype=torch.int32, device=device)
     yield (
         out,
         q,
         k_cache,
         v_cache,
-        atoms,
+        pointer_atoms,
         kv_block_idx,
-        kv[:, : n_heads_kv * head_size].contiguous(),
-        kv[:, n_heads_kv * head_size :].contiguous(),
-        cu_seqlens,
-        cu_seqlens,
-        n_tokens,
-        n_tokens,
         deepspeed_atoms,
         deepspeed_pinned,
-        q_block_size,
     )
 
 
@@ -327,17 +331,10 @@ def torch_op(
     q,
     k,
     v,
-    atoms,
-    kv_block_idx,
-    dense_k,
-    dense_v,
-    cu_q,
-    cu_kv,
-    max_q,
-    max_kv,
+    _pointer_atoms,
+    _kv_block_idx,
     deepspeed_atoms,
-    deepspeed_pinned,
-    q_block_size,
+    _deepspeed_pinned,
 ):
     """DeepSpeed BlockedFlashAttn; raises when it cannot be loaded."""
     return _deepspeed_kernel(k.size(-1), out.dtype)(
@@ -364,3 +361,40 @@ def key_shape(binding):
     # First tensor: out [n_tokens, n_heads_q * head_size]; unique per shape.
     n_tokens, head_size, n_heads_q, _ = binding["shape"]
     return [n_tokens, n_heads_q * head_size]
+
+
+def config(binding, dtype):
+    """Describe the real inputs/outputs of the baseline call."""
+    n_tokens, head_size, n_heads_q, n_heads_kv = binding["shape"]
+    q_block_size, kv_block_size = _cache_geometry(head_size)
+    n_blocks = (n_tokens + kv_block_size - 1) // kv_block_size
+    n_atoms = (n_tokens + q_block_size - 1) // q_block_size
+    dtype_str = str(dtype)
+    q_width = n_heads_q * head_size
+    kv_shape = [n_blocks, kv_block_size, n_heads_kv, head_size]
+
+    return {
+        "inputs": {
+            "out": {"shape": [n_tokens, q_width], "dtype": dtype_str},
+            "q": {"shape": [n_tokens, q_width], "dtype": dtype_str},
+            "k": {"shape": kv_shape, "dtype": dtype_str},
+            "v": {"shape": kv_shape, "dtype": dtype_str},
+            "pointer_atoms": {"shape": [n_atoms, 8], "dtype": "torch.int32"},
+            "kv_block_idx": {"shape": [n_blocks], "dtype": "torch.int32"},
+            "deepspeed_atoms": {"shape": [n_atoms, 8], "dtype": "torch.int32"},
+            "deepspeed_pinned": {"shape": [n_blocks], "dtype": "torch.int32"},
+        },
+        "outputs": {
+            "out": {"shape": [n_tokens, q_width], "dtype": dtype_str},
+        },
+        "dims": {
+            "n_tokens": n_tokens,
+            "head_size": head_size,
+            "n_heads_q": n_heads_q,
+            "n_heads_kv": n_heads_kv,
+            "q_block_size": q_block_size,
+            "kv_block_size": kv_block_size,
+            "n_blocks": n_blocks,
+            "n_atoms": n_atoms,
+        },
+    }

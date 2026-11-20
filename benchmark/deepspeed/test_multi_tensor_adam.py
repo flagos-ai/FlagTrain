@@ -138,6 +138,23 @@ class MultiTensorAdamBenchmark(base.GenericBenchmark):
     def set_more_shapes(self):
         return []
 
+    def record_shapes(self, *args, **kwargs):
+        # The inputs are (grads, params, exp_avgs, exp_avg_sqs), four lists of
+        # _N_TENSORS tensors of one size each, so the default deep_parse prints
+        # that same ``torch.Size`` 4 * _N_TENSORS times per row and says nothing
+        # extra. Compress to the case description; the number of lists is fixed
+        # by the operator's signature and is implied by ``multi_tensor_adam``.
+        gs = args[0]
+        return f"{len(gs)} tensors x {list(gs[0].shape)}"
+
+    def baseline_shape_detail(self, *args, **kwargs):
+        """The default structured form, for ``--base-data`` matching.
+
+        ``record_shapes`` above is the compact report line; the baseline lookup
+        needs the per-tensor dimensions to build its signature.
+        """
+        return super().record_shapes(*args, **kwargs)
+
 
 def multi_tensor_adam_input_fn(shape, dtype, device):
     """Yield ``(g_list, p_list, m_list, v_list)`` with ``_N_TENSORS`` tensors each.

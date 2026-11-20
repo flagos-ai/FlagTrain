@@ -84,3 +84,20 @@ def build_inputs(binding, dtype, device):
 def key_shape(binding):
     # First (and only) tensor is the input itself; unique per shape.
     return list(binding["shape"])
+
+
+def config(binding, dtype):
+    """Describe the real inputs/outputs for baseline matching."""
+    shape = list(binding["shape"])
+    last = shape[-1]
+    return {
+        "inputs": {"x": {"shape": shape, "dtype": str(dtype)}},
+        "outputs": {
+            # One bit per element, packed eight to a byte along the last dim.
+            "out": {
+                "shape": shape[:-1] + [(last + 7) // 8],
+                "dtype": "torch.uint8",
+            },
+        },
+        "dims": {"shape": shape, "last_dim": last},
+    }

@@ -72,18 +72,20 @@ def _reference(tensor):
     return utils.to_reference(tensor.detach(), upcast=True)
 
 
-def _assert_close(actual, expected, dtype):
-    utils.train_assert_close(utils.to_reference(actual), expected, dtype)
+def _assert_close(actual, expected, dtype, equal_nan=False):
+    utils.train_assert_close(
+        utils.to_reference(actual), expected, dtype, equal_nan=equal_nan
+    )
 
 
-def _check_forward(x):
+def _check_forward(x, equal_nan=False):
     dtype = x.dtype
     y = flag_train.megatron.quick_gelu(x)
     assert y.shape == x.shape
     assert y.dtype == dtype
 
     x_ref = _reference(x)
-    _assert_close(y, reference_quick_gelu(x_ref), dtype)
+    _assert_close(y, reference_quick_gelu(x_ref), dtype, equal_nan=equal_nan)
 
 
 @pytest.mark.quick_gelu
@@ -117,6 +119,45 @@ def test_quick_gelu_values(dtype):
     ]
     x = torch.tensor(values, dtype=torch.float32, device=flag_train.device).to(dtype)
     _check_forward(x)
+
+
+# The sigmoid argument must not be clamped: for x below about -47 the true
+# output is still decaying exponentially, while a clamp leaves a 1.8e-35 floor
+# that x multiplies back up (-1e38 * 1.8e-35 is about -1.8e3, not 0).
+_EXTREME_VALUES = {
+    torch.float16: [-65504.0, -1e4, -50.0, -47.1, -47.0, 47.0, 1e4, 65504.0],
+    torch.bfloat16: [-3e38, -1e10, -1e4, -50.0, -47.1, -47.0, 47.0, 1e4, 3e38],
+    torch.float32: [-1e38, -1e10, -1e4, -50.0, -47.1, -47.0, 1e4, 47.0, 1e38],
+}
+
+
+@pytest.mark.quick_gelu
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_quick_gelu_extreme_values(dtype):
+    """The negative tail must decay to zero, not grow with x."""
+    values = _EXTREME_VALUES[dtype]
+    x = torch.tensor(values, dtype=torch.float32, device=flag_train.device).to(dtype)
+    _check_forward(x)
+
+    # At the old clamp boundary this used to be about -1.8e3; the correct
+    # result is a signed zero.
+    y = flag_train.megatron.quick_gelu(x)
+    negative_extreme = y[0]
+    assert negative_extreme == 0.0
+
+
+@pytest.mark.quick_gelu
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_quick_gelu_special_values(dtype):
+    """NaN is preserved; -inf follows x * sigmoid(-inf) = -inf * 0 = NaN."""
+    values = [float("-inf"), float("inf"), float("nan")]
+    x = torch.tensor(values, dtype=torch.float32, device=flag_train.device).to(dtype)
+    _check_forward(x, equal_nan=True)
+
+    y = flag_train.megatron.quick_gelu(x)
+    assert torch.isnan(y[0])
+    assert torch.isinf(y[1]) and y[1] > 0
+    assert torch.isnan(y[2])
 
 
 @pytest.mark.quick_gelu

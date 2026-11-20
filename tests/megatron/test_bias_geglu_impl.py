@@ -14,22 +14,18 @@
 """Correctness tests for fused bias + GeGLU (forward only).
 
 The reference is Megatron-LM's own ``bias_geglu_impl`` when megatron-core is
-installed, so the kernel is checked against the implementation it ports.
-Without megatron-core, and for the quick_gelu variant (whose public Megatron
-entry point takes different arguments), the reference is ``bias_geglu_ref``:
-the eager formula Megatron-LM checks its own fusion against, the tanh GELU (or
-quick_gelu) of the gate half times the linear half, with the bias added by
-ordinary broadcasting. That formula covers every variant and is always
-available, so the suite still runs without Megatron-LM.
+installed. Otherwise, ``bias_geglu_ref`` evaluates the eager tanh-GELU formula
+with the bias added by ordinary broadcasting.
 
 Under ``--ref cpu`` the operands are moved to the CPU and upcast, so the
 comparison is against a higher-precision CPU result. Tolerances are
 ``train_assert_close``'s defaults.
 
-Only the forward output is checked: the backward is a separate operator. The
-``fp8_input_store`` and ``cpu_offload_input`` flags stay for Megatron-LM
-signature compatibility but have nothing left to save, so passing either one is
-expected to raise. ``bias`` must have the same dtype as ``input``.
+Only the forward output is checked: the backward is a separate operator.
+The Triton implementation accepts contiguous active-device fp16/bf16/fp32
+inputs, plus fp64 on devices with FP64 support, and optional same-dtype bias
+broadcastable to the flattened input. Unsupported operands are rejected
+instead of using an eager PyTorch fallback.
 """
 
 import pytest
@@ -99,8 +95,8 @@ _SHAPES = [
     (4, 7, 32),
 ]
 
-# Bias is orthogonal to the shapes and variants below, so it is sampled on a
-# few representative cases only.
+# Bias is orthogonal to the shapes above, so it is sampled on representative
+# cases only.
 _BIAS_SHAPES = [
     (1, 2),
     (17, 32),
@@ -108,19 +104,10 @@ _BIAS_SHAPES = [
     (4, 7, 32),
 ]
 
-# name -> operator kwargs. quick_offset also exercises linear_offset.
-_VARIANTS = {
-    "gelu": {"activation": "gelu"},
-    "quick": {"activation": "quick_gelu"},
-    "quick_offset": {"activation": "quick_gelu", "linear_offset": 0.5},
-}
 
-
-def bias_geglu_ref(x, bias=None, activation="gelu", linear_offset=0.0):
+def bias_geglu_ref(x, bias=None):
     y = x if bias is None else x + bias
     gate, linear = torch.chunk(y, 2, dim=-1)
-    if activation == "quick_gelu":
-        return (gate * torch.sigmoid(1.702 * gate)) * (linear + linear_offset)
     # tanh approximation of GELU, the same constants as Megatron-LM.
     return (
         gate
@@ -139,37 +126,41 @@ def _assert_close(actual, expected, dtype):
     utils.train_assert_close(utils.to_reference(actual), expected, dtype)
 
 
-def _expected_output(x, bias, **kwargs):
-    """Megatron-LM when available for the plain GELU path, else the formula.
+def _expected_output(x, bias):
+    """Use Megatron-LM when available, otherwise use the eager formula.
 
     The Megatron side gets contiguous operands: its ``input.view(-1, hidden)``
     rejects the transposed inputs this suite deliberately feeds the operator.
-    Its public entry point has no quick_gelu switch, so that variant always
-    compares against the eager formula. Empty inputs also use the formula:
-    Megatron restores a rank-3 result with ``view(..., -1)``, which is
-    ambiguous when the output has zero elements.
+    Empty inputs also use the formula: Megatron restores a rank-3 result with
+    ``view(..., -1)``, which is ambiguous when the output has zero elements.
     """
-    if (
-        _megatron_impl is not None
-        and not utils.TO_CPU
-        and x.numel() > 0
-        and kwargs.get("activation", "gelu") == "gelu"
-    ):
+    if _megatron_impl is not None and not utils.TO_CPU and x.numel() > 0:
         return _megatron_impl(
             x.contiguous(),
             None if bias is None else bias.contiguous(),
         )
-    return bias_geglu_ref(x, bias, **kwargs)
+    ori_shape = x.shape
+    flat = x.view(-1, ori_shape[-1])
+    output = bias_geglu_ref(flat, bias)
+    return (
+        output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+    )
 
 
-def _check_bias_geglu(x, bias, **kwargs):
+def _check_bias_geglu(x, bias):
+    # Restoring an empty rank-3 result with view(..., -1) is ambiguous.
+    if x.ndim == 3 and x.numel() == 0:
+        with pytest.raises(RuntimeError):
+            flag_train.megatron.bias_geglu_impl(x, bias)
+        return
+
     dtype = x.dtype
-    y = flag_train.megatron.bias_geglu_impl(x, bias, **kwargs)
+    y = flag_train.megatron.bias_geglu_impl(x, bias)
     assert y.shape[-1] * 2 == x.shape[-1]
     assert y.shape[:-1] == x.shape[:-1]
     assert y.dtype == dtype
 
-    expected = _expected_output(_reference(x), _reference(bias), **kwargs)
+    expected = _expected_output(_reference(x), _reference(bias))
     _assert_close(y, expected, dtype)
 
 
@@ -193,116 +184,151 @@ def test_bias_geglu_impl_bias(shape, dtype):
 
 
 @pytest.mark.bias_geglu_impl
-@pytest.mark.parametrize("variant", list(_VARIANTS))
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_bias_geglu_impl_variants(variant, dtype):
-    utils.init_seed(1)
-    x = torch.randn((16, 64), dtype=dtype, device=flag_train.device)
-    _check_bias_geglu(x, None, **_VARIANTS[variant])
-
-
-@pytest.mark.bias_geglu_impl
-@pytest.mark.parametrize("variant", list(_VARIANTS))
-def test_bias_geglu_impl_variants_bias(variant):
-    utils.init_seed(1)
-    x = torch.randn((16, 64), dtype=torch.float16, device=flag_train.device)
-    bias = torch.randn((64,), dtype=torch.float16, device=flag_train.device)
-    _check_bias_geglu(x, bias, **_VARIANTS[variant])
-
-
-@pytest.mark.bias_geglu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_geglu_impl_bias_shapes(dtype):
     utils.init_seed(4)
     x = torch.randn((8, 32), dtype=dtype, device=flag_train.device)
     _check_bias_geglu(x, torch.randn((1, 32), dtype=dtype, device=flag_train.device))
     _check_bias_geglu(x, torch.randn((8, 32), dtype=dtype, device=flag_train.device))
-    _check_bias_geglu(
-        x,
-        torch.tensor(0.25, dtype=dtype, device=flag_train.device),
-        activation="quick_gelu",
-    )
+    _check_bias_geglu(x, torch.tensor(0.25, dtype=dtype, device=flag_train.device))
 
 
 @pytest.mark.bias_geglu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_geglu_impl_large_values(dtype):
-    """Extreme magnitudes: GELU/tanh and quick_gelu/sigmoid saturation."""
+    """Extreme magnitudes: check GELU/tanh saturation."""
     values = [-1000.0, -90.0, -20.0, -1.0, 0.0, 1.0, 20.0, 90.0, 1000.0, -8.0]
     # 10 gate values and 10 linear values.
     data = values + [-1000.0, -4.0, -1.0, 0.0, 0.5, 1.0, 4.0, 20.0, 90.0, 1000.0]
     x = torch.tensor(data, dtype=torch.float32, device=flag_train.device).to(dtype)
     x = x.view(1, -1)
     _check_bias_geglu(x, None)
-    _check_bias_geglu(x, None, activation="quick_gelu")
-    _check_bias_geglu(x, None, activation="quick_gelu", linear_offset=100.0)
 
 
 @pytest.mark.bias_geglu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_geglu_impl_noncontiguous(dtype):
+    """Non-contiguous inputs are rejected without an eager fallback."""
     utils.init_seed(5)
     base = torch.randn((32, 64), dtype=dtype, device=flag_train.device)
     x = base.t()
-    assert x.shape == (64, 32)
-    assert not x.is_contiguous()
     bias = torch.randn((64,), dtype=dtype, device=flag_train.device)[::2]
-    assert bias.shape == (32,)
-    assert not bias.is_contiguous()
-    _check_bias_geglu(x, bias)
+
+    with pytest.raises(ValueError, match="contiguous"):
+        flag_train.megatron.bias_geglu_impl(x, bias)
 
     cube = torch.randn((4, 8, 16), dtype=dtype, device=flag_train.device)
     transposed = cube.transpose(0, 2)
-    assert not transposed.is_contiguous()
-    assert transposed.shape[-1] % 2 == 0
-    _check_bias_geglu(transposed, None, activation="quick_gelu")
+
+    # The public view rejects this layout before operand validation.
+    with pytest.raises(RuntimeError):
+        flag_train.megatron.bias_geglu_impl(transposed, None)
 
 
 @pytest.mark.bias_geglu_impl
-def test_bias_geglu_impl_rejects_bad_arguments():
+def test_bias_geglu_impl_rank_validation():
     device = flag_train.device
-    x = torch.randn((4, 8), device=device)
-    with pytest.raises(ValueError, match="rank 2 or 3"):
+    with pytest.raises(AssertionError):
         flag_train.megatron.bias_geglu_impl(torch.randn((8,), device=device), None)
-    with pytest.raises(ValueError, match="rank 2 or 3"):
+    with pytest.raises(AssertionError):
         flag_train.megatron.bias_geglu_impl(
             torch.randn((1, 1, 2, 4), device=device), None
         )
-    with pytest.raises(ValueError, match="even"):
-        flag_train.megatron.bias_geglu_impl(torch.randn((4, 7), device=device), None)
-    with pytest.raises(ValueError, match="CPU"):
-        flag_train.megatron.bias_geglu_impl(torch.randn((4, 8)), None)
-    with pytest.raises(ValueError, match="activation"):
-        flag_train.megatron.bias_geglu_impl(x, None, activation="silu")
-    with pytest.raises(ValueError, match="only used by quick_gelu"):
-        flag_train.megatron.bias_geglu_impl(x, None, linear_offset=1.0)
-    with pytest.raises(ValueError, match="finite"):
-        flag_train.megatron.bias_geglu_impl(
-            x, None, activation="quick_gelu", linear_offset=float("inf")
-        )
-    with pytest.raises(ValueError, match="broadcast"):
-        flag_train.megatron.bias_geglu_impl(x, torch.randn((3,), device=device))
-    # An empty input must not skip the bias checks.
-    with pytest.raises(ValueError, match="broadcast"):
-        flag_train.megatron.bias_geglu_impl(
-            torch.empty((0, 8), device=device), torch.randn((3,), device=device)
-        )
-    # Forward only: the flags that used to control the saved activations raise.
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        flag_train.megatron.bias_geglu_impl(x, None, fp8_input_store=True)
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        flag_train.megatron.bias_geglu_impl(x, None, cpu_offload_input=True)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_bias_broadcast_validation():
+    x = torch.randn((4, 8), device=flag_train.device)
+    with pytest.raises(ValueError, match="broadcastable"):
+        flag_train.megatron.bias_geglu_impl(x, torch.randn((3,), device=x.device))
 
 
 @pytest.mark.bias_geglu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_bias_geglu_impl_requires_matching_bias_dtype(dtype):
-    """The kernel computes the add in fp32; a mixed-dtype bias would silently
-    change the promoted dtype eager PyTorch produces, so it is rejected."""
-    device = flag_train.device
+def test_bias_geglu_impl_bias_dtype_validation(dtype):
+    """Mixed-dtype bias is rejected instead of using eager type promotion."""
     other = torch.float32 if dtype != torch.float32 else torch.float16
-    x = torch.randn((4, 8), dtype=dtype, device=device)
+    x = torch.randn((4, 8), dtype=dtype, device=flag_train.device)
+    bias = torch.randn((8,), dtype=other, device=flag_train.device)
     with pytest.raises(ValueError, match="input dtype"):
-        flag_train.megatron.bias_geglu_impl(
-            x, torch.randn((8,), dtype=other, device=device)
-        )
+        flag_train.megatron.bias_geglu_impl(x, bias)
+
+
+@pytest.mark.bias_geglu_impl
+@pytest.mark.parametrize("shape", [(4, 16), (2, 3, 16)])
+@pytest.mark.parametrize("bias_mode", ["none", "vector", "full"])
+def test_bias_geglu_impl_fp64(shape, bias_mode):
+    """FP64 inputs use FP64 arithmetic throughout the Triton kernel."""
+    if not flag_train.runtime.device.support_fp64:
+        pytest.skip("the active device does not support FP64")
+
+    utils.init_seed(6)
+    x = torch.randn(shape, dtype=torch.float64, device=flag_train.device)
+    flat = x.view(-1, shape[-1])
+    if bias_mode == "none":
+        bias = None
+    elif bias_mode == "vector":
+        bias = torch.randn(shape[-1], dtype=torch.float64, device=flag_train.device)
+    else:
+        bias = torch.randn_like(flat)
+
+    _check_bias_geglu(x, bias)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_additional_dtype_validation():
+    """Unsupported dtypes are rejected rather than evaluated with PyTorch."""
+    unsupported = [torch.int32, torch.bool, torch.complex64]
+    if not flag_train.runtime.device.support_fp64:
+        unsupported.insert(0, torch.float64)
+
+    for dtype in unsupported:
+        x = torch.zeros((4, 8), dtype=dtype, device=flag_train.device)
+        with pytest.raises(ValueError, match="unsupported dtype"):
+            flag_train.megatron.bias_geglu_impl(x, None)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_cpu_validation():
+    x = torch.randn((4, 8), device="cpu")
+    with pytest.raises(ValueError, match="active device"):
+        flag_train.megatron.bias_geglu_impl(x, None)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_leading_broadcast_validation():
+    x = torch.randn((4, 8), device=flag_train.device)
+    bias = torch.randn((1, 1, 8), device=flag_train.device)
+    with pytest.raises(ValueError, match="broadcastable"):
+        flag_train.megatron.bias_geglu_impl(x, bias)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_scalar_bias_validation():
+    x = torch.randn((4, 8), dtype=torch.float16, device=flag_train.device)
+    with pytest.raises(TypeError, match="Tensor or None"):
+        flag_train.megatron.bias_geglu_impl(x, 0.5)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_odd_last_dimension():
+    x = torch.randn((4, 7), device=flag_train.device)
+    with pytest.raises(ValueError, match="must be even"):
+        flag_train.megatron.bias_geglu_impl(x, None)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_empty_3d_error():
+    x = torch.empty((2, 0, 8), device=flag_train.device)
+    with pytest.raises(RuntimeError):
+        flag_train.megatron.bias_geglu_impl(x, None)
+
+
+@pytest.mark.bias_geglu_impl
+def test_bias_geglu_impl_bias_device_validation():
+    if flag_train.device == "cpu":
+        pytest.skip("requires distinct CPU and active devices")
+    x = torch.randn((4, 8), device=flag_train.device)
+    bias = torch.randn((8,), device="cpu")
+    with pytest.raises(ValueError, match="input device"):
+        flag_train.megatron.bias_geglu_impl(x, bias)

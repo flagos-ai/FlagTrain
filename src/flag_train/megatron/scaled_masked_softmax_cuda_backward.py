@@ -60,7 +60,7 @@ from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 
 # ``FusedScaleMaskSoftmax.is_kernel_available`` rejects ``sk > 4096``; above
 # that Megatron falls back to the torch path. One program reduces one row, so
@@ -97,28 +97,61 @@ def _tile(block_n: int) -> tuple:
 
 
 def _check_scale(scale):
-    """Accept the Python float or 0-dim tensor that Megatron passes."""
+    """Accept the Python float or one-element tensor Apex's binding accepts."""
     if isinstance(scale, torch.Tensor):
         if scale.numel() != 1:
-            raise ValueError(
-                f"fused softmax scale needs one element, got {tuple(scale.shape)}"
+            raise TypeError(
+                "scaled masked softmax scale must be a real number or a "
+                f"one-element tensor, got {tuple(scale.shape)}"
             )
         scale = scale.item()
-    return float(scale)
+    if isinstance(scale, (str, bytes)):
+        raise TypeError("scaled masked softmax scale must be a real number")
+    try:
+        return float(scale)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("scaled masked softmax scale must be a real number") from exc
 
 
 def _check_tensor(tensor, name):
     if tensor.ndim != 4:
-        raise ValueError(f"{name} needs a 4-D tensor, got {tensor.ndim}-D")
+        # Apex's backward binding says "expected 3D tensor" for this 4-D check.
+        raise RuntimeError("expected 3D tensor")
     if tensor.dtype not in _SUPPORTED_DTYPES:
-        wanted = " / ".join(str(dtype) for dtype in _SUPPORTED_DTYPES)
-        raise ValueError(f"{name} needs a {wanted} tensor, got {tensor.dtype}")
+        raise RuntimeError("Only fp16 and bf16 are supported")
     if tensor.device.type == "cpu":
-        raise ValueError(f"{name} needs a device tensor, not one on the CPU")
+        raise RuntimeError(f"{name} needs a device tensor, not one on the CPU")
     if tensor.device.type != runtime_device.name:
-        raise ValueError(
+        raise RuntimeError(
             f"{name} needs a {runtime_device.name} tensor, got {tensor.device.type}"
         )
+
+
+def _softmax_results_as(output_grads, softmax_results):
+    """View ``softmax_results`` the way Apex's backward reads it.
+
+    Apex dispatches on ``output_grads.dtype`` and reinterprets the contiguous
+    ``softmax_results`` storage as that dtype without checking shape or dtype
+    equality. Mirror the defined part of that contract: take the first
+    ``output_grads.numel()`` elements out of the byte stream. A buffer too small
+    for that read is undefined in Apex, so reject it instead of reading out of
+    bounds.
+    """
+    softmax_results = softmax_results.contiguous()
+    numel = output_grads.numel()
+    if softmax_results.dtype == output_grads.dtype:
+        flat = softmax_results.reshape(-1)
+        if flat.numel() < numel:
+            raise RuntimeError(
+                "softmax_results has fewer elements than output_grads requires"
+            )
+        return flat[:numel].view(output_grads.shape)
+
+    needed = numel * output_grads.element_size()
+    raw = softmax_results.view(torch.uint8).reshape(-1)
+    if raw.numel() < needed:
+        raise RuntimeError("softmax_results has fewer bytes than output_grads requires")
+    return raw[:needed].view(output_grads.dtype).view(output_grads.shape)
 
 
 @libentry()
@@ -182,51 +215,41 @@ def scaled_masked_softmax_cuda_backward(output_grads, softmax_results, scale):
     the forward have ``softmax_results == 0`` and therefore zero gradient.
 
     Args:
-        output_grads (Tensor): fp16, bf16 or fp32 upstream gradient of shape
+        output_grads (Tensor): fp16 or bf16 upstream gradient of shape
             ``[b, np, sq, sk]``. A non-contiguous tensor is copied.
-        softmax_results (Tensor): forward output, same shape and dtype as
-            ``output_grads``.
+        softmax_results (Tensor): forward output. As in Apex, its contiguous
+            storage is read as ``output_grads.dtype`` without requiring equal
+            shape or dtype; the buffer must be large enough for the read.
         scale (float | Tensor): the forward scaling factor; Megatron passes a
             0-dim tensor (``scale_t[0]``).
 
     Returns:
-        Tensor: contiguous input gradient with the input's shape and dtype.
+        Tensor: contiguous input gradient with the input's shape and dtype. An
+        empty input, including a zero key length, returns an empty tensor
+        without a launch.
 
     Raises:
-        ValueError: if the operands are not matching 4-D tensors of a supported
-            dtype on the active device, or the key length exceeds 4096.
+        RuntimeError: when Apex would reject the call (wrong rank or dtype,
+            key length over 4096), when the operands are on different devices,
+            or when ``softmax_results`` is too small for Apex's read.
+        TypeError: when ``scale`` is not a real number or one-element tensor.
     """
     logger.debug("TRAIN SCALED_MASKED_SOFTMAX_CUDA_BACKWARD")
     _check_tensor(output_grads, "scaled masked softmax backward grad")
     _check_tensor(softmax_results, "scaled masked softmax backward results")
-    if output_grads.shape != softmax_results.shape:
-        raise ValueError(
-            "scaled masked softmax backward needs matching shapes, got "
-            f"{tuple(output_grads.shape)} and {tuple(softmax_results.shape)}"
-        )
-    if output_grads.dtype != softmax_results.dtype:
-        raise ValueError(
-            "scaled masked softmax backward needs matching dtypes, got "
-            f"{output_grads.dtype} and {softmax_results.dtype}"
-        )
     if output_grads.device != softmax_results.device:
-        raise ValueError(
+        raise RuntimeError(
             "scaled masked softmax backward needs both operands on one device"
         )
     sk = output_grads.shape[-1]
     if sk > _MAX_KEY_LEN:
-        raise ValueError(
-            f"scaled masked softmax backward: key length {sk} exceeds "
-            f"Megatron's fused-softmax limit of {_MAX_KEY_LEN}"
-        )
-    if sk == 0:
-        raise ValueError("scaled masked softmax backward: key length must be positive")
+        raise RuntimeError("key_seq_len >= 0 && key_seq_len <= 4096")
     scale = _check_scale(scale)
     if output_grads.numel() == 0:
         return torch.empty_like(output_grads, memory_format=torch.contiguous_format)
 
     dy = output_grads.contiguous()
-    y = softmax_results.contiguous()
+    y = _softmax_results_as(dy, softmax_results)
     dx = torch.empty_like(dy)
     rows = dy.numel() // sk
     block_n = triton.next_power_of_2(sk)
