@@ -15,7 +15,9 @@
 
 Same contract and activation formula as
 ``flag_train.megatron.weighted_squared_relu_impl``; only the launch shape and
-how the clamp operands reach the kernel change. Measured on 910B4 (card 6):
+how the clamp operands reach the kernel change. Calls the row-weight kernel
+cannot express delegate to the generic Triton implementation, never to torch.
+Measured on 910B4 (card 6):
 
 * **Programs are the unit of cost, not lanes.**  A program touching 1024 lanes
   costs the same fixed overhead as one touching 8192, so each program gets
@@ -43,6 +45,7 @@ unchanged.
 
 import logging
 import math
+import numbers
 
 import torch
 import triton
@@ -55,7 +58,12 @@ from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-_WEIGHTED_SQUARED_RELU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_WEIGHTED_SQUARED_RELU_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+)
 
 # Lanes per program.  This is the measured plateau, and also the largest tile
 # that fits the clamp's live buffers in UB.
@@ -79,11 +87,11 @@ _FLAT_WALK_PROGRAMS = 512
 
 
 def _check_input(tensor, name):
-    """Validate dtype and device exactly as the generic operator does.
+    """Validate the dtype and device of the Ascend row-weight kernel.
 
-    Defined here rather than imported: importing ``flag_train.megatron`` here
-    re-enters ``SpecOpRegistrar`` mid-scan, and the half-built op list it then
-    caches silently leaves the generic implementation in place.
+    Other dtypes/devices are delegated to the generic Triton path before this
+    check. Defined here rather than imported so importing this module does not
+    re-enter ``SpecOpRegistrar`` mid-scan.
     """
     if tensor.dtype not in _WEIGHTED_SQUARED_RELU_DTYPES:
         wanted = " / ".join(str(dtype) for dtype in _WEIGHTED_SQUARED_RELU_DTYPES)
@@ -94,6 +102,41 @@ def _check_input(tensor, name):
         raise ValueError(
             f"{name} needs a {runtime_device.name} tensor, got {tensor.device.type}"
         )
+
+
+def _check_weights(weights):
+    """Weights may be any real numeric dtype; the kernel casts to fp32."""
+    if weights.dtype.is_complex:
+        raise ValueError("weighted_squared_relu_impl weights must be real-valued")
+    if weights.device.type == "cpu":
+        raise ValueError(
+            "weighted_squared_relu_impl weights needs a device tensor, not one on the CPU"
+        )
+    if weights.device.type != runtime_device.name:
+        raise ValueError(
+            "weighted_squared_relu_impl weights needs a "
+            f"{runtime_device.name} tensor, got {weights.device.type}"
+        )
+
+
+# Weight dtypes torch stores but this device's ``mul`` and kernels reject.
+_UNSUPPORTED_WEIGHT_DTYPES = (torch.uint16, torch.uint32, torch.uint64)
+
+
+def _widen_unsigned_weights(weights, input):
+    """Spell out torch's promotion for unsigned weights.
+
+    torch multiplies an integer weight by promoting it to the activation's
+    dtype, but this device has neither an ATen ``mul`` nor a kernel load for
+    unsigned 16/32/64-bit tensors, so make that promotion explicit.
+    """
+    if (
+        isinstance(weights, torch.Tensor)
+        and weights.dtype in _UNSUPPORTED_WEIGHT_DTYPES
+        and input.dtype.is_floating_point
+    ):
+        return weights.to(input.dtype)
+    return weights
 
 
 @triton.jit
@@ -275,6 +318,56 @@ def _walk_tile_shape(hidden):
     return max(1, _TILE_LANES // columns), columns
 
 
+def _needs_generic(input, weights, clamp_scale):
+    """Whether the Ascend row-weight kernel cannot express this call."""
+    if input.dtype not in _WEIGHTED_SQUARED_RELU_DTYPES:
+        return True
+    if input.device.type != runtime_device.name:
+        return True
+    if input.numel() == 0:
+        # The generic path owns Megatron's empty/3-D epilogue edge cases.
+        return True
+
+    hidden = input.shape[-1]
+    num_tokens = math.prod(input.shape[:-1])
+    if weights is not None:
+        if not isinstance(weights, torch.Tensor):
+            return True
+        if weights.device != input.device or weights.is_complex():
+            return True
+        if weights.dtype not in _WEIGHTED_SQUARED_RELU_DTYPES:
+            return True
+        try:
+            broadcast_shape = torch.broadcast_shapes(
+                tuple(weights.shape), (num_tokens, hidden)
+            )
+        except RuntimeError:
+            return True
+        if broadcast_shape != (num_tokens, hidden):
+            return True
+        if torch.broadcast_to(weights, (num_tokens, hidden)).stride(1) != 0:
+            return True
+
+    if clamp_scale is not None:
+        if isinstance(clamp_scale, torch.Tensor):
+            if clamp_scale.is_complex() or clamp_scale.numel() != 1:
+                return True
+            if clamp_scale.device != input.device and clamp_scale.dim() != 0:
+                return True
+        elif not isinstance(clamp_scale, numbers.Real):
+            return True
+    return False
+
+
+def _generic_forward(input, weights, clamp_scale):
+    """Use the generic Triton implementation, never a torch computation."""
+    from flag_train.megatron.weighted_squared_relu_impl import (
+        weighted_squared_relu_impl as generic_impl,
+    )
+
+    return generic_impl(input, weights, clamp_scale)
+
+
 def _launch_weighted(x, weights, out, hidden, num_tokens, clamp_scale):
     rows, columns = _tile_shape(hidden)
     walk_rows, walk_columns = _walk_tile_shape(hidden)
@@ -353,25 +446,50 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
         2,
         3,
     ), f"weighted_squared_relu_impl expects a 2-D or 3-D input, got {input.dim()}-D"
+    weights = _widen_unsigned_weights(weights, input)
+    if input.device.type == "cpu":
+        # Megatron accepts CPU tensors: run on the accelerator, return on CPU.
+        device = torch.device(runtime_device.name)
+        if isinstance(weights, torch.Tensor):
+            weights = weights.to(device)
+        if isinstance(clamp_scale, torch.Tensor):
+            clamp_scale = clamp_scale.to(device)
+        out = weighted_squared_relu_impl(input.to(device), weights, clamp_scale)
+        return out.to(input.device)
+    if _needs_generic(input, weights, clamp_scale):
+        return _generic_forward(input, weights, clamp_scale)
     _check_input(input, "weighted_squared_relu_impl")
 
     hidden = input.shape[-1]
     num_tokens = math.prod(input.shape[:-1])
 
     if weights is not None:
-        _check_input(weights, "weighted_squared_relu_impl weights")
-        expected = (num_tokens, 1)
-        if tuple(weights.shape) != expected:
-            raise ValueError(
-                "weighted_squared_relu_impl weights must be broadcast per token, "
-                f"i.e. shape {expected} for an input of shape "
-                f"{tuple(input.shape)}, got {tuple(weights.shape)}"
-            )
+        _check_weights(weights)
         if weights.device != input.device:
             raise ValueError(
                 "weighted_squared_relu_impl weights must be on the same device as the "
                 f"input, got {weights.device} and {input.device}"
             )
+        # Megatron broadcasts the weights against the flattened activation.
+        # The Ascend kernel below is specialised for one weight per row; other
+        # broadcast forms were already delegated to the generic Triton path.
+        try:
+            broadcast_shape = torch.broadcast_shapes(
+                tuple(weights.shape), (num_tokens, hidden)
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                "weighted_squared_relu_impl weights must be broadcastable to "
+                f"{(num_tokens, hidden)} (the flattened activation shape), got "
+                f"{tuple(weights.shape)}"
+            ) from exc
+        if broadcast_shape != (num_tokens, hidden):
+            raise ValueError(
+                "weighted_squared_relu_impl weights must broadcast to exactly "
+                f"{(num_tokens, hidden)} (the flattened activation shape), got "
+                f"{tuple(weights.shape)} -> {tuple(broadcast_shape)}"
+            )
+        weights = torch.broadcast_to(weights, (num_tokens, hidden))
 
     if input.numel() == 0:
         # No launch when there is nothing to activate.
@@ -380,14 +498,21 @@ def weighted_squared_relu_impl(input, weights=None, clamp_scale=None):
     if clamp_scale is not None:
         clamp_scale = float(clamp_scale)
 
-    flat = input.contiguous().view(-1, hidden)
+    # Match Megatron's ``input.view(-1, hidden)``: layouts it cannot flatten
+    # fail here too. A viewable but non-contiguous layout is copied for the
+    # kernel, which is a layout change rather than a different computation.
+    flat = input.view(-1, hidden)
+    if not flat.is_contiguous():
+        flat = flat.contiguous()
+
     out = torch.empty_like(flat)
     if weights is None:
         _launch_clamped(flat, out, flat.numel(), clamp_scale)
     else:
+        # A broadcast dimension has stride 0; materialise the per-row scalar.
         _launch_weighted(
             flat,
-            weights.contiguous().view(-1),
+            weights[:, 0].contiguous(),
             out,
             hidden,
             num_tokens,
