@@ -20,7 +20,7 @@ import pytest
 import flag_train
 from benchmark.base import GenericBenchmark
 from benchmark.cases import BenchmarkCasePlan
-from tests.megatron._mtp_loss_auto_scaler_reference import (
+from tests.megatron.test_mtp_loss_auto_scaler import (
     DTYPES,
     OP_NAME,
     WORKLOADS,
