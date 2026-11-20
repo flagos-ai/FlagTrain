@@ -13,14 +13,9 @@
 # limitations under the License.
 """Ascend-correct evoformer attention forward.
 
-The arithmetic is ``flag_train.deepspeed.evoformer_attn``'s, unchanged. Two
-things the generic kernel does are wrong here, both measured on a 910B.
-
-An ``or`` of two *runtime* comparisons is miscompiled as a store mask: the
-generic ``lse`` mask drops whole rows, a different set each run. Either side
-alone, their ``and``, and an ``or`` with a foldable constant are all clean. Since
-``seq_len <= lse_dim`` the left side is a subset of the right, so one comparison
-stores exactly the same rows.
+The arithmetic is the generic implementation's ``_attention``, unchanged; the
+public ``evoformer_attn(Q, K, V, biases)`` wrapper follows the same contract.
+One thing needs special handling here, measured on a 910B.
 
 A kernel containing a ``tl.dot`` cannot launch more than 32768 programs; above
 exactly 2**15, whatever the grid shape or ``num_warps``, it hangs rather than
@@ -48,8 +43,8 @@ from flag_train.deepspeed.evoformer_attn import (
     _bias1_row,
     _bias2_tile,
     _check_launch_arguments,
-    _lse_shape,
     _normalize_bias,
+    _normalize_biases,
     _pairs_of,
     _stride_bn,
 )
@@ -76,10 +71,8 @@ def _evoformer_fwd_kernel(
     v_ptr,
     bias1_ptr,
     bias2_ptr,
-    lse_ptr,
     qk_scale,
     seq_len,
-    lse_dim,
     num_slices,
     n_pairs,
     q_stride_bn,
@@ -90,8 +83,6 @@ def _evoformer_fwd_kernel(
     o_stride_h,
     bias2_stride_b,
     bias2_stride_h,
-    lse_stride_bn,
-    lse_stride_h,
     HAS_BIAS1: tl.constexpr,
     HAS_BIAS2: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
@@ -223,15 +214,9 @@ def _evoformer_fwd_kernel(
             o_mask = d_mask[None, :]
         else:
             o_mask = m_mask[:, None] & d_mask[None, :]
-        # Rows from seq_len to lse_dim (the next multiple of 32) carry +inf, which
-        # is what upstream's backward reads; rows at or past lse_dim are never
-        # written. Same rows as the generic mask, minus the ``or``.
-        lse_mask = offs_m < lse_dim
 
         if NEEDS_GUARD:
-            tail = idx < num_slices
-            o_mask = o_mask & tail
-            lse_mask = lse_mask & tail
+            o_mask = o_mask & (idx < num_slices)
 
         tl.store(
             out_ptr
@@ -242,17 +227,6 @@ def _evoformer_fwd_kernel(
             acc.to(out_ptr.dtype.element_ty),
             mask=o_mask,
         )
-        if EVEN:
-            tl.store(
-                lse_ptr + bn * lse_stride_bn + head * lse_stride_h + offs_m,
-                m_i + tl.log(l_safe),
-            )
-        else:
-            tl.store(
-                lse_ptr + bn * lse_stride_bn + head * lse_stride_h + offs_m,
-                tl.where(offs_m < seq_len, m_i + tl.log(l_safe), float("inf")),
-                mask=lse_mask,
-            )
 
 
 # Largest area first: the Cube's MAC rate rises steeply with tile area (1.5 at
@@ -291,13 +265,13 @@ def _grid_for(m_tiles, head_axis, num_slices):
     return (m_tiles, head_axis, slots), n_iters, n_iters * slots != num_slices
 
 
-def evoformer_attn(q, k, v, bias1=None, bias2=None):
-    """Evoformer attention forward; see ``flag_train.deepspeed.evoformer_attn``.
+def _attention(q, k, v, bias1=None, bias2=None):
+    """Ascend internal forward, returning ``out``.
 
-    Same signature, arithmetic and returned ``(out, lse)``. Only the ``lse`` store
-    mask and the grid differ -- see this module's docstring.
+    Same arithmetic as the generic ``_attention``; only the grid differs -- see
+    this module's docstring.  The public ``evoformer_attn`` below wraps this with
+    DeepSpeed's interface.
     """
-    logger.debug("TRAIN_ASCEND EVOFORMER_ATTN")
 
     bias1 = _normalize_bias(bias1, q)
     bias2 = _normalize_bias(bias2, q)
@@ -323,9 +297,6 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
         )
 
     out = torch.empty_like(q)
-    lse = torch.empty(
-        _lse_shape(batch, heads, seq_len), dtype=torch.float32, device=q.device
-    )
 
     # bias1 is [B, N, 1, 1, L]: one L-row per (batch, pair).
     # bias2 is [B, 1, H, L, L]: one L x L matrix per (batch, head).
@@ -357,7 +328,6 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
             k_here = k[..., head_slice, :]
             v_here = v[..., head_slice, :]
             out_here = out[..., head_slice, :]
-            lse_here = lse[..., head_slice, :]
             # An absent bias borrows the query's pointer; never dereferenced.
             bias1_here = bias1 if has_bias1 else q_here
             bias2_here = bias2[..., head_slice, :, :] if has_bias2 else q_here
@@ -370,10 +340,8 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
                 v_here,
                 bias1_here,
                 bias2_here,
-                lse_here,
                 head_size**-0.5,
                 seq_len,
-                lse_here.shape[-1],
                 batch,
                 n_pairs,
                 _stride_bn(q_here),
@@ -384,8 +352,6 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
                 out_here.stride(-2),
                 bias2_stride_b,
                 bias2_stride_h,
-                lse_here.stride(-3),
-                lse_here.stride(-2),
                 HAS_BIAS1=has_bias1,
                 HAS_BIAS2=has_bias2,
                 HEAD_SIZE=head_size,
@@ -397,4 +363,22 @@ def evoformer_attn(q, k, v, bias1=None, bias2=None):
                 EVEN=even,
                 num_warps=num_warps,
             )
-    return out, lse
+    return out
+
+
+def evoformer_attn(Q, K, V, biases):
+    """DeepSpeed-compatible public entry; returns only the output tensor.
+
+    See ``flag_train.deepspeed.evoformer_attn`` for the full contract.  The
+    internal ``_attention`` above is the Ascend kernel.
+    """
+    logger.debug("TRAIN_ASCEND EVOFORMER_ATTN")
+    bias1, bias2 = _normalize_biases(biases)
+    q = Q.contiguous()
+    k = K.contiguous()
+    v = V.contiguous()
+    if bias1 is not None:
+        bias1 = bias1.contiguous()
+    if bias2 is not None:
+        bias2 = bias2.contiguous()
+    return _attention(q, k, v, bias1, bias2)

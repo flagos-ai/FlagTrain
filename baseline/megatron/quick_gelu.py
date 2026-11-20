@@ -23,6 +23,8 @@ Shapes and dtypes are copied from
 ``FlagTrain/benchmark/megatron/test_quick_gelu.py``.
 """
 
+import math
+
 import torch
 
 OP_NAME = "quick_gelu"
@@ -78,3 +80,13 @@ def build_inputs(binding, dtype, device):
 
 def key_shape(binding):
     return list(binding["shape"])
+
+
+def config(binding, dtype):
+    """Describe the real inputs/outputs for baseline matching."""
+    shape = list(binding["shape"])
+    return {
+        "inputs": {"x": {"shape": shape, "dtype": str(dtype)}},
+        "outputs": {"out": {"shape": shape, "dtype": str(dtype)}},
+        "dims": {"numel": math.prod(shape), "shape": shape},
+    }

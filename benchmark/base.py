@@ -16,6 +16,7 @@ import gc
 import math
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any, Collection, Generator, List, Optional, Tuple
 
@@ -322,10 +323,31 @@ class Benchmark:
         ``record_shapes`` is what the report prints, and a benchmark may
         compress it for readability (e.g. a long list of tensors on one line).
         The baseline lookup needs the individual tensor dimensions to build
-        its signature, so it goes through this hook instead; by default the
-        two are the same.
+        its signature, so it goes through this hook instead.
+
+        A tensor contributes its size *and* dtype, not its size alone: baseline
+        records describe their operands by both, and two variants of one shape
+        can differ only in a dtype -- a float32 gate beside a float16
+        activation, say. Keeping the dtype here is what lets the lookup pick
+        the variant's own record instead of the regular one.
         """
-        return self.record_shapes(*args, **kwargs)
+
+        def deep_parse(item):
+            if isinstance(item, torch.Tensor):
+                return (item.size(), item.dtype)
+            elif isinstance(item, (int, float, str, torch.dtype)):
+                return item
+            elif isinstance(item, (list, tuple)):
+                return [deep_parse(sub_item) for sub_item in item]
+            elif isinstance(item, dict):
+                return {key: deep_parse(value) for key, value in item.items()}
+            return None
+
+        parsed_args = [deep_parse(arg) for arg in args]
+        parsed_kwargs = {key: deep_parse(value) for key, value in kwargs.items()}
+        if parsed_args and parsed_kwargs:
+            return parsed_args, parsed_kwargs
+        return parsed_args if parsed_args else parsed_kwargs
 
     def init_default_config(self):
         self.set_shapes(self.DEFAULT_SHAPE_FILES)
@@ -633,6 +655,60 @@ class Benchmark:
         Config.executed_case_ids.update(executed)
         return results
 
+    def _prepare_profile_call(self, case):
+        args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
+        op = self.train_op
+        if not self.is_backward:
+            return lambda: op(*args, **kwargs)
+
+        out = op(*args, **kwargs)
+        dout = torch.randn_like(out)
+        grad_inputs = [x for x in args if torch.is_tensor(x) and x.requires_grad]
+
+        def derivative():
+            return torch.autograd.grad(
+                (out,), grad_inputs, grad_outputs=(dout,), retain_graph=True
+            )
+
+        return derivative
+
+    def _warmup_profile_case(self, case):
+        warmup = self._prepare_profile_call(case)
+        for _ in range(Config.profile_warmup):
+            warmup()
+        torch_device_fn.synchronize()
+
+    def _run_profile_case(self, case_id):
+        if not self.supports_cases():
+            raise ValueError(
+                f"Operator '{self.op_name}' does not support --profile-only yet."
+            )
+        cases = self._collect_cases()
+        Config.available_case_ids.update(case.case_id for case in cases)
+        case = next((case for case in cases if case.case_id == case_id), None)
+        if case is None:
+            return []
+        if case_id in Config.executed_case_ids:
+            raise ValueError(f"Multiple benchmarks supplied profile case '{case_id}'.")
+        if not callable(self.train_op):
+            raise ValueError(
+                f"--profile-only requires a train_op for '{self.op_name}'."
+            )
+
+        if Config.profile_warmup:
+            self._warmup_profile_case(case)
+        capture = self._prepare_profile_call(case)
+        torch_device_fn.synchronize()
+
+        scope = Config.profile_hook(backend=vendor_name, case_id=case_id)
+        with scope if scope is not None else nullcontext():
+            for _ in range(Config.profile_iterations):
+                capture()
+            torch_device_fn.synchronize()
+
+        Config.executed_case_ids.add(case_id)
+        return [case_id]
+
     def _has_on_machine_baseline(self) -> bool:
         """Whether ``torch_op`` can actually be timed on this machine.
 
@@ -830,6 +906,9 @@ class Benchmark:
         configured_case_ids = getattr(Config, "case_ids", None)
         selection_requested = case_ids is not None or configured_case_ids is not None
         selected_case_ids = case_ids if case_ids is not None else configured_case_ids
+
+        if getattr(Config, "profile_only", False):
+            return self._run_profile_case(configured_case_ids[0])
 
         if getattr(Config, "list_cases", False):
             if selected_case_ids:
