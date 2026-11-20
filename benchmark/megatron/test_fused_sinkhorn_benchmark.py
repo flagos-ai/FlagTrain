@@ -20,7 +20,7 @@ import pytest
 import flag_train
 from benchmark.base import GenericBenchmark
 from benchmark.cases import BenchmarkCasePlan
-from tests.megatron._fused_sinkhorn_reference import (
+from tests.megatron.test_fused_sinkhorn import (
     CASES,
     DTYPES,
     OP_NAME,

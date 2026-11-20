@@ -13,20 +13,97 @@
 # limitations under the License.
 
 
-"""Check the compiled Megatron Sinkhorn projection and its recomputed first-order gradient."""
+"""Check the compiled Megatron Sinkhorn projection and its recomputed first-order gradient.
+
+Megatron compiled Torch Sinkhorn fallback at d2b0e35cc4f05bc6b70734d558617050fbbb51ed.
+"""
+
+from functools import lru_cache
 
 import pytest
 import torch
+from torch._dynamo import config as dynamo_config
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
-from tests.megatron._fused_sinkhorn_reference import (
-    CASES,
-    DTYPES,
-    OVERRIDE_KEY,
-    make_inputs,
-    reference,
+
+OP_NAME = "fused_sinkhorn"
+OVERRIDE_KEY = f"megatron.{OP_NAME}"
+CASES = (
+    ((8, 4, 4), 1, 1e-6),
+    ((2, 16, 8, 8), 3, 1e-4),
+    ((1, 1, 1), 1, 1e-6),
+    ((1, 4, 4), 1, 1e-6),
+    ((3, 5, 5), 2, 1e-5),
+    ((257, 4, 4), 3, 1e-6),
+    ((8, 128, 4, 4), 20, 1e-6),
+    ((2, 256, 8, 8), 20, 1e-4),
 )
+DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def make_inputs(shape, dtype, device, num_iterations, eps):
+    generator = torch.Generator().manual_seed(6472)
+    input_logits = (
+        torch.randn(shape, generator=generator)
+        .to(device=device, dtype=dtype)
+        .contiguous()
+    )
+    return input_logits, num_iterations, eps
+
+
+def _project(input_logits, num_iterations, eps):
+    matrix = input_logits.softmax(dim=-1) + eps
+    matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(1, num_iterations):
+        matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + eps)
+        matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + eps)
+    return matrix
+
+
+_compiled_project = torch.compile(_project, fullgraph=True)
+
+
+@lru_cache(maxsize=1)
+def _ascend_project():
+    from torch_npu.dynamo import torchair
+
+    # TorchAir's AOT partitioner needs static shapes for this recomputed graph.
+    return torch.compile(
+        _project, backend=torchair.get_npu_backend(), fullgraph=True, dynamic=False
+    )
+
+
+def _run_compiled(input_logits, num_iterations, eps):
+    project = (
+        _ascend_project() if input_logits.device.type == "npu" else _compiled_project
+    )
+    # Each workload may specialize both a no-grad and a grad-enabled graph.
+    # Keep enough cached graphs for the suite, with no silent eager fallback.
+    with dynamo_config.patch(recompile_limit=2 * len(CASES) * len(DTYPES)):
+        return project(input_logits, num_iterations, eps)
+
+
+class _FusedSinkhornReference(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_logits, num_iterations, eps):
+        ctx.save_for_backward(input_logits)
+        ctx.num_iterations = num_iterations
+        ctx.eps = eps
+        return _run_compiled(input_logits.detach(), num_iterations, eps)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (input_logits,) = ctx.saved_tensors
+        with torch.enable_grad():
+            logits = input_logits.detach().requires_grad_(True)
+            projected = _run_compiled(logits, ctx.num_iterations, ctx.eps)
+            projected.backward(grad_output)
+        return logits.grad, None, None
+
+
+def reference(input_logits, num_iterations, eps):
+    return _FusedSinkhornReference.apply(input_logits, num_iterations, eps)
 
 
 @pytest.mark.fused_sinkhorn
