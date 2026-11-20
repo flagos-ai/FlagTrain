@@ -11,8 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Megatron-LM Tanh Soft Clamp activation.
+
+The Triton kernel covers real floating-point accelerator tensors with a real
+scalar scale. CPU tensors, integer/unsigned/bool tensors and tensor scales use
+Megatron's exact eager composition; complex inputs are not supported.
+"""
 
 import logging
+import numbers
 from dataclasses import replace
 
 import torch
@@ -30,6 +37,23 @@ _CONFIG = get_codegen_config()
 if runtime_device.vendor_name == "ascend":
     _CONFIG = replace(_CONFIG, max_tile_size=4096, max_grid_size=(512, 1, 1))
 
+# Floating dtypes handled by the Triton kernel. Other real dtypes follow the
+# eager composition, including integer/unsigned/bool and CPU tensors.
+_KERNEL_DTYPES = tuple(
+    dtype
+    for dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+)
+
 
 @pointwise_dynamic(
     is_tensor=[True, False],
@@ -45,19 +69,37 @@ def _tanh_soft_clamp_kernel(x, scale):
     return scale_fp32 * tl_extra_shim.tanh(x_fp32 * inv_scale)
 
 
+def _torch_tanh_soft_clamp(x, scale):
+    """Megatron's exact eager composition, kept forward-only like the kernel."""
+    with torch.no_grad():
+        return (scale * torch.tanh(x.float() / scale)).to(x.dtype)
+
+
 def tanh_soft_clamp(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Return Megatron's ``(scale * tanh(x.float() / scale)).to(x.dtype)``.
+
+    Supports real floating-point, integer, unsigned and bool tensors on the
+    accelerator or CPU. Complex inputs are rejected. Floating-point accelerator
+    tensors with a real scalar scale use the Triton kernel; all other supported
+    inputs, including CPU tensors and broadcastable tensor scales, use the
+    equivalent eager composition. No backward operator is provided.
+    """
     logger.debug("TRAIN TANH_SOFT_CLAMP")
     if not isinstance(x, torch.Tensor):
         raise TypeError(f"tanh_soft_clamp expects a tensor, got {type(x).__name__}")
-    if not x.is_floating_point():
+    if x.is_complex():
         raise TypeError(
-            f"tanh_soft_clamp only supports floating-point tensors, got {x.dtype}"
+            f"tanh_soft_clamp does not support complex tensors, got {x.dtype}"
         )
-    if x.device.type != runtime_device.name:
+    if x.device.type not in ("cpu", runtime_device.name):
         raise ValueError(
-            f"tanh_soft_clamp only supports {runtime_device.name} tensors, "
+            f"tanh_soft_clamp supports CPU or {runtime_device.name} tensors, "
             f"got {x.device.type}"
         )
-    if not x.is_contiguous():
-        x = x.contiguous()
+    if (
+        x.device.type == "cpu"
+        or x.dtype not in _KERNEL_DTYPES
+        or not isinstance(scale, numbers.Real)
+    ):
+        return _torch_tanh_soft_clamp(x, scale)
     return _tanh_soft_clamp_kernel(x, float(scale))
