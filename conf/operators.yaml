@@ -14,9 +14,8 @@
 
 ops:
 - id: bias_geglu_impl
-  description: 'Bias plus GeGLU fusion: bias add, gate/linear split, and GELU or
-    QuickGELU gating in one kernel. Forward only; the activation variant is selected
-    by arguments.'
+  description: 'Bias plus GeGLU fusion: bias add, gate/linear split, and GELU
+    gating in one kernel. Forward only.'
   for:
   - bias_geglu_impl
   labels:
@@ -27,6 +26,21 @@ ops:
   kind:
   - Activation
   source: megatron.core.fusions.fused_bias_geglu
+  stages:
+  - beta: '0.0.0'
+- id: bias_gelu_impl
+  description: 'Fused bias addition and tanh-approximate GELU. Forward only; bias
+    addition rounds to the input dtype before FP32 activation arithmetic.'
+  for:
+  - bias_gelu_impl
+  labels:
+  - megatron
+  - activation
+  from:
+  - megatron
+  kind:
+  - Activation
+  source: megatron.core.fusions.fused_bias_gelu
   stages:
   - beta: '0.0.0'
 - id: bias_swiglu_impl
@@ -283,8 +297,23 @@ ops:
   source: megatron.core.transformer.hyper_connection
   stages:
   - beta: '0.0.0'
+- id: fused_sinkhorn
+  description: Sinkhorn projection and its first-order input gradient.
+  for:
+  - fused_sinkhorn
+  labels:
+  - megatron
+  - normalization
+  from:
+  - megatron
+  kind:
+  - Normalization
+  source: megatron.core.transformer.hyper_connection
+  stages:
+  - beta: '0.0.0'
 - id: lamb
-  description: Fused LAMB optimizer update.
+  description: 'Fused LAMB optimizer update. Supports fp32 or fp64 master weights
+    and moments; fp16 gradients against fp32 master weights are also supported.'
   for:
   - fused_lamb
   labels:
@@ -454,6 +483,21 @@ ops:
   source: megatron.core.fusions.fused_softmax
   stages:
   - beta: '0.0.0'
+- id: scaled_upper_triang_masked_softmax_backward
+  description: Gradient of the scaled upper-triangular masked softmax; masked positions are zero.
+  for:
+  - ScaledUpperTriangMaskedSoftmax
+  labels:
+  - megatron
+  - attention
+  - softmax
+  from:
+  - megatron
+  kind:
+  - Attention
+  source: megatron.core.fusions.fused_softmax
+  stages:
+  - beta: '0.0.0'
 - id: scaled_upper_triang_masked_softmax_forward
   description: Scaled softmax with Megatron's upper-triangular causal mask; masked entries are zero.
   for:
@@ -509,5 +553,19 @@ ops:
   kind:
   - Activation
   source: megatron.core.fusions.fused_weighted_squared_relu
+  stages:
+  - beta: '0.0.0'
+- id: weighted_swiglu_funciton
+  description: Weighted SwiGLU activation with per-token weights and first-order gradients.
+  for:
+  - WeightedSwiGLUFunction
+  labels:
+  - megatron
+  - activation
+  from:
+  - megatron
+  kind:
+  - Activation
+  source: megatron.core.fusions.fused_bias_swiglu
   stages:
   - beta: '0.0.0'

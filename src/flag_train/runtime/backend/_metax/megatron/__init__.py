@@ -24,4 +24,10 @@ To specialise an operator, define it under this package, re-export it here
 overrides.
 """
 
-__all__ = []
+from .fused_gated_norm import fused_gated_norm
+from .weighted_swiglu_funciton import weighted_swiglu_funciton
+
+__all__ = [
+    "fused_gated_norm",
+    "weighted_swiglu_funciton",
+]

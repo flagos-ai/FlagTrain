@@ -22,7 +22,10 @@ which is what ``SpecOpRegistrar`` registers.
 from .blocked_flash import blocked_flash
 from .cuda_wf6af16_linear import cuda_wf6af16_linear
 from .evoformer_attn import evoformer_attn
+from .lamb import lamb
 from .mixed_moe_gemm import mixed_moe_gemm
+from .multi_tensor_adam import multi_tensor_adam
+from .multi_tensor_lion import multi_tensor_lion
 from .packbits import packbits
 from .unpackbits import unpackbits
 
@@ -30,7 +33,10 @@ __all__ = [
     "blocked_flash",
     "cuda_wf6af16_linear",
     "evoformer_attn",
+    "lamb",
     "mixed_moe_gemm",
+    "multi_tensor_adam",
+    "multi_tensor_lion",
     "packbits",
     "unpackbits",
 ]

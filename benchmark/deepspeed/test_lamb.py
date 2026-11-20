@@ -38,6 +38,7 @@ import torch
 
 import flag_train
 from flag_train.deepspeed import lamb
+from flag_train.runtime import device as runtime_device
 
 from .. import base
 
@@ -191,8 +192,11 @@ def test_lamb_perf():
         # then skips the baseline timing (N/A) and leaves the comparison to
         # --base-data.
         torch_op=torch_op,
-        # fused_lamb only supports float32 parameters/state.
-        dtypes=[torch.float32],
+        # fp32 is the common baseline; fp64 is measured where the device
+        # declares fp64 support (NVIDIA/Hygon).  The fp16-gradient + fp32-master
+        # combination is correctness-only, so it is not benchmarked here.
+        dtypes=[torch.float32]
+        + ([torch.float64] if runtime_device.support_fp64 else []),
     )
     bench.set_train(train_op)
     bench.run()

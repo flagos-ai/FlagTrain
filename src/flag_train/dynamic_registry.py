@@ -477,7 +477,9 @@ class DynamicOpOverride:
             return False
         return self._restore_target(target.full_name)
 
-    def restore_all(self, module_name: str = "flag_train"):
+    def restore_all(
+        self, module_name: str = "flag_train", *, allow_unused: bool = False
+    ):
         """
         Restore all overridden operators in the specified module.
 
@@ -487,11 +489,12 @@ class DynamicOpOverride:
 
         Args:
             module_name: Module name (default: "flag_train")
+            allow_unused: Restore overrides even if they were never called.
 
         Raises:
             AssertionError: If any override loaded via ``override_from_file``
                 (i.e. through the CLI/config path) was registered but never
-                actually invoked before being restored.
+                actually invoked before being restored, unless allow_unused is set.
         """
         prefix = f"{module_name.rstrip('.')}."
         ops_to_restore = [
@@ -507,7 +510,7 @@ class DynamicOpOverride:
             except AssertionError as e:
                 unused_errors.append(str(e))
 
-        if unused_errors:
+        if unused_errors and not allow_unused:
             raise AssertionError("; ".join(unused_errors))
 
     def list_overrides(self) -> List[str]:

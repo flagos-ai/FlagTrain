@@ -133,9 +133,10 @@ class MultiTensorLionBenchmark(base.GenericBenchmark):
         """The default structured form, for ``--base-data`` matching.
 
         ``record_shapes`` above is the compact report line; the baseline
-        lookup needs the per-tensor dimensions to build its signature.
+        lookup needs the per-tensor dimensions and dtypes to build its
+        signature.
         """
-        return super().record_shapes(*args, **kwargs)
+        return super().baseline_shape_detail(*args, **kwargs)
 
 
 def multi_tensor_lion_input_fn(shape, dtype, device):
