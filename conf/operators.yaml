@@ -311,6 +311,20 @@ ops:
   source: megatron.core.transformer.hyper_connection
   stages:
   - beta: '0.0.0'
+- id: l2_normalization_backward
+  description: Input gradient for L2 normalization using the saved inverse norm.
+  for:
+  - l2normalization_backward_fused
+  labels:
+  - transformer_engine
+  - normalization
+  from:
+  - transformer_engine
+  kind:
+  - Normalization
+  source: transformer_engine.pytorch.jit
+  stages:
+  - beta: '0.0.0'
 - id: lamb
   description: 'Fused LAMB optimizer update. Supports fp32 or fp64 master weights
     and moments; fp16 gradients against fp32 master weights are also supported.'
@@ -366,6 +380,20 @@ ops:
   - deepspeed
   kind:
   - MoE
+  stages:
+  - beta: '0.0.0'
+- id: mtp_loss_auto_scaler
+  description: Scales the MTP loss gradient using an explicit scale buffer per autograd graph.
+  for:
+  - MTPLossAutoScaler
+  labels:
+  - megatron
+  - tensor
+  from:
+  - megatron
+  kind:
+  - Tensor
+  source: megatron.core.transformer.multi_token_prediction
   stages:
   - beta: '0.0.0'
 - id: multi_modal_rotary_embedding
