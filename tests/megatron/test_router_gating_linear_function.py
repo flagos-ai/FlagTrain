@@ -37,16 +37,28 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _matmul_precision(monkeypatch):
-    # Compare against Megatron's Torch path with full-precision accumulation.
+def _matmul_precision():
+    # Save and restore cuBLAS settings through their accessors.
     matmul = torch_backend_device.matmul
-    monkeypatch.setattr(matmul, "allow_tf32", False)
-    for setting in (
-        "allow_fp16_reduced_precision_reduction",
-        "allow_bf16_reduced_precision_reduction",
-    ):
-        if hasattr(matmul, setting):
-            monkeypatch.setattr(matmul, setting, False)
+    fp32_precision = torch.get_float32_matmul_precision()
+    saved = {}
+    try:
+        torch.set_float32_matmul_precision("highest")
+        for setting in (
+            "allow_fp16_reduced_precision_reduction",
+            "allow_bf16_reduced_precision_reduction",
+        ):
+            if not hasattr(matmul, setting):
+                continue
+            previous = getattr(matmul, setting)
+            split_k = getattr(matmul, setting + "_split_k", None)
+            saved[setting] = previous if split_k is None else (previous, split_k)
+            setattr(matmul, setting, False)
+        yield
+    finally:
+        for setting, previous in reversed(saved.items()):
+            setattr(matmul, setting, previous)
+        torch.set_float32_matmul_precision(fp32_precision)
 
 
 def _assert_fp32_reduction_close(actual, expected, reduction_size):
