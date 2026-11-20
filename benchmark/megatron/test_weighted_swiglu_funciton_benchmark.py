@@ -20,7 +20,7 @@ import pytest
 import flag_train
 from benchmark.base import GenericBenchmark
 from benchmark.cases import BenchmarkCasePlan
-from tests.megatron._weighted_swiglu_reference import (
+from tests.megatron.test_weighted_swiglu_funciton import (
     DTYPES,
     OP_NAME,
     SHAPES,
