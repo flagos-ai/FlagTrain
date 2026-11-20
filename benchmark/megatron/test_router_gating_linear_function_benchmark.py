@@ -19,7 +19,7 @@ import pytest
 import flag_train
 from benchmark.base import GenericBenchmark
 from benchmark.cases import BenchmarkCasePlan
-from tests.megatron._router_gating_linear_reference import (
+from tests.megatron.test_router_gating_linear_function import (
     BIAS_DTYPE,
     DTYPES,
     INPUT_DTYPE,

@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Check Megatron's Torch router branch, including the mixed-dtype bias epilogue."""
+"""Check Megatron's Torch router branch, including the mixed-dtype bias epilogue.
+
+Megatron router Torch fallback at d2b0e35cc4f05bc6b70734d558617050fbbb51ed.
+"""
 
 import math
 
@@ -23,13 +26,77 @@ import flag_train
 from flag_train.reference_candidate import get_candidate
 from flag_train.runtime import torch_backend_device
 from flag_train.testing import assert_close
-from tests.megatron._router_gating_linear_reference import (
-    DTYPES,
-    OVERRIDE_KEY,
-    WORKLOADS,
-    make_inputs,
-    reference,
+
+OP_NAME = "router_gating_linear_function"
+OVERRIDE_KEY = f"megatron.{OP_NAME}"
+WORKLOADS = (
+    ((16, 32), 13),
+    ((2, 5, 32), 13),
+    ((1, 64), 1),
+    ((33, 127), 17),
+    ((128, 768), 32),
+    ((4, 128, 2048), 64),
+    ((1024, 4096), 128),
 )
+DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+INPUT_DTYPE = torch.bfloat16
+WEIGHT_DTYPE = torch.float16
+BIAS_DTYPE = torch.float32
+
+
+def make_inputs(shape, router_dtype, device, with_bias, num_experts):
+    generator = torch.Generator().manual_seed(421)
+    inp = torch.randn(shape, generator=generator)
+    weight = torch.randn((num_experts, shape[-1]), generator=generator)
+    bias = None
+    if with_bias:
+        bias = torch.randn(num_experts, generator=generator)
+        # This first logit loses the 2**-14 residual when GEMM rounds before adding bias.
+        first_row = inp.reshape(-1, shape[-1])[0]
+        first_row.zero_()
+        first_row[0] = 1 + 2**-7
+        weight[0].zero_()
+        weight[0, 0] = 1 + 2**-7
+        bias[0] = -(1 + 2**-6)
+        bias = bias.to(device=device, dtype=BIAS_DTYPE)
+    return (
+        inp.to(device=device, dtype=INPUT_DTYPE),
+        weight.to(device=device, dtype=WEIGHT_DTYPE),
+        bias,
+        router_dtype,
+    )
+
+
+class _RouterGatingLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inp, weight, bias, router_dtype):
+        ctx.save_for_backward(inp, weight, bias)
+        ctx.router_dtype = router_dtype
+        rows = inp.flatten(end_dim=-2).to(router_dtype)
+        columns = weight.t().to(router_dtype)
+        if bias is None:
+            logits = torch.mm(rows, columns)
+        else:
+            logits = torch.addmm(bias.to(router_dtype), rows, columns)
+        return logits.reshape(*inp.shape[:-1], weight.size(0))
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inp, weight, bias = ctx.saved_tensors
+        router_dtype = ctx.router_dtype
+        grad_rows = grad_output.reshape(-1, weight.size(0))
+        input_rows = inp.reshape(-1, inp.size(-1)).to(router_dtype)
+        grad_input = torch.mm(grad_rows, weight.to(router_dtype)).to(inp.dtype)
+        grad_weight = torch.mm(grad_rows.t(), input_rows).to(weight.dtype)
+        # Megatron rounds the bias gradient to weight.dtype before autograd
+        # converts it to the original bias tensor's dtype.
+        grad_bias = grad_rows.sum(dim=0).to(weight.dtype) if bias is not None else None
+        return grad_input.reshape_as(inp), grad_weight, grad_bias, None
+
+
+def reference(inp, weight, bias, router_dtype):
+    return _RouterGatingLinear.apply(inp, weight, bias, router_dtype)
+
 
 pytestmark = pytest.mark.skipif(
     flag_train.vendor_name != "nvidia", reason="NVIDIA Router kernel"
