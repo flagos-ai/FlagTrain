@@ -491,7 +491,7 @@ def test_weighted_squared_relu_accepts_integer_input():
     x = torch.randint(0, 4, (16, 64), dtype=torch.int32, device=flag_train.device)
     weights = torch.rand((16, 1), dtype=torch.float32, device=flag_train.device)
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
-    expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
     assert y.shape == x.shape and y.dtype == x.dtype
     utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
@@ -512,7 +512,7 @@ def test_weighted_squared_relu_accepts_cpu_input():
     x = torch.randn((16, 64), dtype=torch.float32, device="cpu")
     weights = torch.rand((16, 1), dtype=torch.float32, device="cpu")
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
-    expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
     assert y.device.type == "cpu"
     utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
@@ -525,7 +525,7 @@ def test_weighted_squared_relu_accepts_complex_weights():
     # the device stores and multiplies them.
     weights = torch.rand((16, 1), dtype=torch.complex64).to(flag_train.device)
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
-    expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
     utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
 
@@ -550,6 +550,14 @@ def test_weighted_squared_relu_accepts_complex_clamp(clamp_shape):
 
 
 @pytest.mark.weighted_squared_relu_impl
+# Megatron's baseline is the reference here, and its own ``mul`` rejects
+# unsigned 16/32/64-bit operands on Ascend (``mul_out_npu_no_check``), so there
+# is nothing to compare against on that vendor.
+@pytest.mark.skipif(
+    flag_train.vendor_name == "ascend",
+    reason="Megatron's baseline mul rejects unsigned 16/32/64-bit weights "
+    "on Ascend (mul_out_npu_no_check)",
+)
 @pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
 def test_weighted_squared_relu_accepts_unsigned_weights(dtype):
     """Unsigned 16/32/64-bit weights are valid torch operands for Megatron."""
@@ -557,10 +565,7 @@ def test_weighted_squared_relu_accepts_unsigned_weights(dtype):
     # Drawn on the CPU: some device RNGs reject unsigned 16/32/64-bit dtypes.
     weights = torch.randint(0, 4, (16, 1), dtype=dtype).to(flag_train.device)
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
-    # torch promotes an integer weight to the activation dtype before the
-    # multiply, which not every device's ``mul`` spells out for unsigned ints.
-    promoted = torch.promote_types(x.dtype, weights.dtype)
-    expected = (torch.pow(torch.relu(x), 2) * weights.to(promoted)).to(x.dtype)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
     utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
 
@@ -570,7 +575,7 @@ def test_weighted_squared_relu_uint8_wraps_like_torch():
     x = torch.tensor([[1, 2, 3]], dtype=torch.uint8, device=flag_train.device)
     weights = torch.tensor([[-3.1]], dtype=torch.float32, device=flag_train.device)
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
-    expected = (torch.pow(torch.relu(x), 2) * weights).to(x.dtype)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
     utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
 
@@ -589,9 +594,7 @@ def test_weighted_squared_relu_accepts_extra_weight_dims(shape, weights_shape):
     x = torch.randn(shape, dtype=torch.float32, device=flag_train.device)
     weights = torch.rand(weights_shape, dtype=torch.float32, device=flag_train.device)
     y = flag_train.megatron.weighted_squared_relu_impl(x, weights)
-    expected = (torch.pow(torch.relu(x.view(-1, x.shape[-1])), 2) * weights).to(x.dtype)
-    if x.dim() == 3:
-        expected = expected.view(x.shape[0], x.shape[1], -1)
+    expected = _megatron_weighted_squared_relu(x, weights, None)
     assert y.shape == expected.shape
     utils.train_assert_close(y, utils.to_reference(expected), x.dtype)
 
@@ -637,7 +640,13 @@ def weighted_squared_relu_ref(x, weights=None, clamp_scale=None):
         act = torch.pow(torch.relu(flat), 2)
     if weights is not None:
         act = act * weights
-    return act.to(x.dtype).reshape(ori_shape)
+    act = act.to(x.dtype)
+    # Megatron returns the broadcast result as-is for a 2-D input and only
+    # reshapes the token axis back for 3-D; mirror that so this composition can
+    # stand in for it as an oracle when Megatron is unavailable.
+    if len(ori_shape) == 2:
+        return act
+    return act.view(ori_shape[0], ori_shape[1], -1)
 
 
 # Two of the benchmark's core shapes, one 2-D and one 3-D. The comparison is
