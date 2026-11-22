@@ -395,26 +395,6 @@ def _dsa_final_kernel(
     tl.store(out_ptr, res)
 
 
-def _map_strides(t, dims, orders):
-    """Map tensor strides onto the axis order orders[0]."""
-    shape = tuple(t.shape)
-    for order in orders:
-        if len(shape) != len(order):
-            continue
-        fine = True
-        for ax, ch in enumerate(order):
-            if shape[ax] != dims[ch] and shape[ax] != 1:
-                fine = False
-                break
-        if fine:
-            st = t.stride()
-            table = {}
-            for ax, ch in enumerate(order):
-                table[ch] = st[ax]
-            return tuple(table[ch] for ch in orders[0])
-    return None
-
-
 def _scalar_arg(x, device):
     if torch.is_tensor(x):
         if x.numel() == 1:
@@ -471,6 +451,18 @@ def fused_dsa_indexer_loss(
         if query_valid_rows.shape not in ((Sq,), (1, Sq), (B, Sq)):
             raise ValueError("Expected one validity flag per query row")
         query_valid_rows = query_valid_rows.to(device=device, dtype=torch.bool)
+    if non_compressed_lse is not None:
+        heads = query.shape[-2]
+        batches = query.shape[1] if query.ndim == 4 else 1
+        if (
+            non_compressed_lse.shape != (batches, heads, Sq)
+            or non_compressed_lse.device != device
+            or non_compressed_lse.requires_grad
+        ):
+            raise ValueError(
+                "External LSE must be detached [B, H, Sq] on the input device"
+            )
+        non_compressed_lse = non_compressed_lse.float()
     # Wide score rows cannot be materialized in one Triton program.
     if Sk > 1024:
         return _wide_indexer_loss(
@@ -498,7 +490,6 @@ def fused_dsa_indexer_loss(
         query = query.unsqueeze(1)
         key = key.unsqueeze(1)
     _, _, H, Dh = query.shape
-    bt_q = query.shape[1]
     s_tq_s, s_tq_b, s_tq_h, s_tq_d = query.stride()
     s_tk_t, s_tk_b, s_tk_h, s_tk_d = key.stride()
     tk_head = key.shape[2] != 1 or H == 1
@@ -541,29 +532,8 @@ def fused_dsa_indexer_loss(
         vr = torch.empty(1, device=device, dtype=torch.int8)
         s_v_b, s_v_s = 0, 0
 
-    # ---- optional external teacher normalizer ----
     has_lse = non_compressed_lse is not None
-    if has_lse:
-        dims = {"b": bt_q, "h": H, "s": Sq}
-        got = _map_strides(
-            non_compressed_lse, dims, ["bhs", "bsh", "sbh", "shb", "hbs", "hsb"]
-        )
-        if got is not None:
-            s_l_b, s_l_h, s_l_s = got
-        else:
-            got = _map_strides(non_compressed_lse, dims, ["hs"])
-            if got is not None:
-                s_l_b, s_l_h, s_l_s = 0, got[0], got[1]
-            else:
-                got = _map_strides(non_compressed_lse, dims, ["s"])
-                if got is None:
-                    raise ValueError(
-                        "unsupported non_compressed_lse shape %s"
-                        % (tuple(non_compressed_lse.shape),)
-                    )
-                s_l_b, s_l_h, s_l_s = 0, 0, got[0]
-    else:
-        s_l_b = s_l_h = s_l_s = 0
+    s_l_b, s_l_h, s_l_s = non_compressed_lse.stride() if has_lse else (0, 0, 0)
 
     scale_v, scale_ptr, scale_is_ptr = _scalar_arg(softmax_scale, device)
     coeff_v, coeff_ptr, coeff_is_ptr = _scalar_arg(loss_coeff, device)
@@ -716,7 +686,9 @@ def _wide_indexer_loss(
     else:
         loss_mask = mask
         if loss_mask is None:
-            loss_mask = torch.full((sq, sk), -torch.inf, device=q.device).triu(1)
+            loss_mask = torch.full(
+                (sq, sk), -torch.inf, dtype=torch.float32, device=q.device
+            ).triu(1)
         else:
             scores = scores + mask
         valid = torch.isfinite(loss_mask)

@@ -126,7 +126,7 @@ def reference(
     if non_compressed_lse is not None:
         compressed_lse = teacher.logsumexp(-1)
         log_mass = (
-            compressed_lse - torch.logaddexp(compressed_lse, non_compressed_lse)
+            compressed_lse - torch.logaddexp(compressed_lse, non_compressed_lse.float())
         ).masked_fill(~live.squeeze(-1)[:, None], -torch.inf)
         row_max = log_mass.amax(dim=1, keepdim=True)
         shift = torch.where(
@@ -396,9 +396,14 @@ def test_fused_dsa_indexer_loss_wide_context():
     q = torch.ones((1, 1, 1, 16), device=device)
     k = torch.zeros((65537, 1, 16), device=device)
     k[-1, 0, 0] = 2
-    indices, loss = _candidate()(
-        q, q[..., 0], k, q.clone(), k.unsqueeze(2).clone(), 1.0, 1, 1.0
-    )
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        indices, loss = _candidate()(
+            q, q[..., 0], k, q.clone(), k.unsqueeze(2).clone(), 1.0, 1, 1.0
+        )
+    finally:
+        torch.set_default_dtype(previous_dtype)
     torch.testing.assert_close(indices, torch.tensor([[[65536]]], device=device))
     torch.testing.assert_close(loss, torch.zeros((), device=device), rtol=0, atol=0)
 
@@ -411,3 +416,14 @@ def test_fused_dsa_indexer_loss_boolean_cpu_valid_rows():
     args[13] = torch.ones(17, dtype=torch.int32)
     args[13][:2] = torch.tensor([0, 2], dtype=torch.int32)
     _compare(_observe(_candidate(), args), _observe(reference, args))
+
+
+@pytest.mark.fused_dsa_indexer_loss
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
+def test_fused_dsa_indexer_loss_normalizes_external_lse(dtype):
+    args = list(_review_inputs("underflow-lse", flag_train.device))
+    args[-1] = args[-1].to(dtype)
+    actual = _candidate()(*args)
+    expected = reference(*args)
+    _compare(actual, expected)
+    assert actual[1].dtype == torch.float32
