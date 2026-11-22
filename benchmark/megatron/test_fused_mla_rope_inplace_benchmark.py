@@ -19,9 +19,13 @@ import math
 import statistics
 import time
 
-import flag_train
 import pytest
 import torch
+
+import flag_train
+from benchmark.base import GenericBenchmark
+from benchmark.cases import BenchmarkCasePlan
+from benchmark.conftest import Config
 from tests.megatron.test_fused_mla_rope_inplace import (
     CASES,
     DTYPES,
@@ -30,12 +34,23 @@ from tests.megatron.test_fused_mla_rope_inplace import (
     reference,
 )
 
-from benchmark.base import GenericBenchmark
-from benchmark.cases import BenchmarkCasePlan
-from benchmark.conftest import Config
-
 
 class OperatorBenchmark(GenericBenchmark):
+    def _prepare_profile_call(self, case):
+        args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
+        buffers = [args[0].clone() for _ in range(Config.profile_iterations)]
+        captures = iter(buffers)
+        return lambda: self.train_op(next(captures), *args[1:], **kwargs)
+
+    def _warmup_profile_case(self, case):
+        args, kwargs = self.unpack_to_args_kwargs(self.build_inputs(case))
+        tensor = args[0]
+        original = tensor.clone()
+        for _ in range(Config.profile_warmup):
+            tensor.copy_(original)
+            self.train_op(*args, **kwargs)
+        torch.get_device_module(tensor.device).synchronize()
+
     def get_latency(self, op, *args, _reference_candidate=False, **kwargs):
         t = args[0]
         original = t.clone()
@@ -144,6 +159,9 @@ def _build(plan, dtype, device):
     return args
 
 
+@pytest.mark.skipif(
+    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
+)
 @pytest.mark.fused_mla_rope_inplace
 def test_fused_mla_rope_inplace_benchmark():
     bench = OperatorBenchmark(

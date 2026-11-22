@@ -17,9 +17,10 @@
 
 from dataclasses import dataclass
 
-import flag_train
 import pytest
 import torch
+
+import flag_train
 from flag_train.reference_candidate import get_candidate
 
 
