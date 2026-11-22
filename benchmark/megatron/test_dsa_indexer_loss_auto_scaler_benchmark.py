@@ -15,8 +15,11 @@
 
 """Time dsa_indexer_loss_auto_scaler using the same workload and reference as correctness."""
 
-import flag_train
 import pytest
+
+import flag_train
+from benchmark.base import GenericBenchmark
+from benchmark.cases import BenchmarkCasePlan
 from tests.megatron.test_dsa_indexer_loss_auto_scaler import (
     CASES,
     DTYPES,
@@ -24,9 +27,6 @@ from tests.megatron.test_dsa_indexer_loss_auto_scaler import (
     make_inputs,
     reference,
 )
-
-from benchmark.base import GenericBenchmark
-from benchmark.cases import BenchmarkCasePlan
 
 
 class OperatorBenchmark(GenericBenchmark):
