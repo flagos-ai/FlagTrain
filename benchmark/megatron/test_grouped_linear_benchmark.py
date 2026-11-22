@@ -15,8 +15,11 @@
 
 """Time grouped_linear using the same workload and reference as correctness."""
 
-import flag_train
 import pytest
+
+import flag_train
+from benchmark.base import GenericBenchmark
+from benchmark.cases import BenchmarkCasePlan
 from tests.megatron.test_grouped_linear import (
     CASES,
     DTYPES,
@@ -24,9 +27,6 @@ from tests.megatron.test_grouped_linear import (
     make_inputs,
     reference,
 )
-
-from benchmark.base import GenericBenchmark
-from benchmark.cases import BenchmarkCasePlan
 
 
 class OperatorBenchmark(GenericBenchmark):
@@ -69,6 +69,9 @@ def _build(plan, dtype, device):
     return args
 
 
+@pytest.mark.skipif(
+    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
+)
 @pytest.mark.grouped_linear
 def test_grouped_linear_benchmark():
     bench = OperatorBenchmark(

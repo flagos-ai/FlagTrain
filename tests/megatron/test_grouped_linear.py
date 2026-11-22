@@ -17,10 +17,11 @@
 
 from dataclasses import dataclass
 
-import flag_train
 import pytest
 import torch
 import torch.nn.functional as F
+
+import flag_train
 from flag_train.reference_candidate import get_candidate
 
 
@@ -222,3 +223,30 @@ def test_grouped_linear_review_regressions(case):
         _observe(_candidate(), _review_inputs(case, flag_train.device)),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
+
+
+@pytest.mark.grouped_linear
+def test_grouped_linear_large_row_offset():
+    if torch.cuda.mem_get_info()[0] < 8 * 1024**3:
+        pytest.skip("Requires at least 8 GiB free on the test device")
+    inputs = torch.zeros((524289, 4096), device=flag_train.device, dtype=torch.float16)
+    inputs[-1, 0] = 1
+    weights = inputs.new_ones((1, 1, 4096))
+    actual = _candidate()(inputs, [len(inputs)], weights)
+    expected = inputs.new_zeros((len(inputs), 1))
+    expected[-1, 0] = 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.grouped_linear
+@pytest.mark.parametrize(
+    "first_dtype,second_dtype", [(torch.int64, torch.int32), (torch.int32, torch.int64)]
+)
+def test_grouped_linear_switch_split_dtype(first_dtype, second_dtype):
+    device = flag_train.device
+    inp = torch.arange(128, dtype=torch.float32, device=device).reshape(8, 16)
+    weights = torch.ones((2, 4, 16), device=device)
+    fn = _candidate()
+    for dtype in (first_dtype, second_dtype):
+        args = (inp, torch.tensor([3, 5], dtype=dtype, device=device), weights)
+        _compare(_observe(fn, args), _observe(reference, args))

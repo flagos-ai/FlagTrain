@@ -78,14 +78,14 @@ def _grouped_linear_kernel(
         return
 
     local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rows = st + local
-    rmask = (local < cnt) & (rows < T)
+    rows = st.to(tl.int64) + local
+    rmask = (local < cnt) & (rows >= 0) & (rows < T)
     cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = cols < N
     offs_k = tl.arange(0, BLOCK_K)
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-    w_base = w_ptr + (g * N + cols[:, None]) * K
+    w_base = w_ptr + (g.to(tl.int64) * N + cols[:, None]) * K
     for kk in range(0, K, BLOCK_K):
         ks = kk + offs_k
         kmask = ks < K
@@ -109,7 +109,9 @@ def _grouped_linear_kernel(
         acc = tl.dot(a, tl.trans(w), acc)
 
     if HAS_BIAS:
-        bias = tl.load(b_ptr + g * N + cols, mask=mask_n, other=0).to(tl.float32)
+        bias = tl.load(b_ptr + g.to(tl.int64) * N + cols, mask=mask_n, other=0).to(
+            tl.float32
+        )
         acc = acc + bias[None, :]
 
     tl.store(
@@ -139,98 +141,6 @@ def _blocks(n_rows, N, K):
     return 32, bn, bk
 
 
-# Launcher cache: for one (shape, dtype, specialisation) key it holds a launch
-# closure that only needs the live tensors plus T/K/N.  It retains no tensor,
-# no output and no input-derived value; the group offsets are baked in as the
-# constants they already were as kernel arguments.  Any change of shape, dtype,
-# split values or pointer alignment produces a different key and therefore a
-# full, ordinary JIT launch, which also refreshes the entry.
-_LAUNCHERS = {}
-_lget = _LAUNCHERS.get
-
-
-def _make_launcher(kern, grid, consts, dev_idx, T, K, N):
-    try:
-        raw = torch._C._cuda_getCurrentRawStream
-    except AttributeError:  # pragma: no cover - older torch builds
-        raw = None
-    gx, gy, gz = grid
-    di = int(dev_idx)
-    lw = kern.run
-    fn = kern.function
-    pm = kern.packed_metadata
-    # T, K, N are part of the cache key, so they are constants here
-    try:
-        if raw is not None:
-            # CudaLauncher.__call__ allocates global/profile scratch on every
-            # call; both sizes are 0 for this kernel, so the C entry can be
-            # reached directly with None scratch slots (verified bit-exact).
-            if lw.global_scratch_size == 0 and lw.profile_scratch_size == 0:
-                claunch = lw.launch
-                coop = lw.launch_cooperative_grid
-                pdl = lw.launch_pdl
-
-                def launch(inp, w, b, out, splits):
-                    claunch(
-                        gx,
-                        gy,
-                        gz,
-                        raw(di),
-                        fn,
-                        coop,
-                        pdl,
-                        None,
-                        None,
-                        pm,
-                        None,
-                        None,
-                        None,
-                        inp,
-                        w,
-                        b,
-                        out,
-                        splits,
-                        T,
-                        K,
-                        N,
-                        *consts,
-                    )
-
-                return launch
-
-            def launch(inp, w, b, out, splits):
-                lw(
-                    gx,
-                    gy,
-                    gz,
-                    raw(di),
-                    fn,
-                    pm,
-                    None,
-                    None,
-                    None,
-                    inp,
-                    w,
-                    b,
-                    out,
-                    splits,
-                    T,
-                    K,
-                    N,
-                    *consts,
-                )
-
-            return launch
-        runner = kern[grid]
-
-        def launch(inp, w, b, out, splits):
-            runner(inp, w, b, out, splits, T, K, N, *consts)
-
-        return launch
-    except Exception:  # pragma: no cover
-        return None
-
-
 def grouped_linear(inp, m_splits, weights, biases=None):
     with torch.cuda.device(inp.device):
         return _run_contiguous(
@@ -252,66 +162,12 @@ def _run_contiguous(inp, m_splits, weights, biases):
     K = shp[1]
 
     dt = inp.dtype
-    dt_w = weights.dtype
-    if biases is None:
-        b_arg = inp
-        has_bias = False
-        dt_b = dt
-        ptr_low = (inp.data_ptr() | out.data_ptr() | weights.data_ptr()) & 15
-    else:
-        b_arg = biases
-        has_bias = True
-        dt_b = biases.dtype
-        ptr_low = (
-            inp.data_ptr() | out.data_ptr() | weights.data_ptr() | biases.data_ptr()
-        ) & 15
-
-    if type(m_splits) is torch.Tensor and m_splits.is_cuda:
-        dev_splits = m_splits
-        splits_arg = m_splits
-        key = (
-            1,
-            shp,
-            wshp,
-            dt,
-            dt_b,
-            dt_w,
-            has_bias,
-            inp.get_device(),
-            ptr_low | (m_splits.data_ptr() & 15),
-        )
-    else:
-        dev_splits = None
-        splits_arg = inp
-        hsplits = (
-            m_splits
-            if type(m_splits) is tuple
-            else (
-                tuple(m_splits)
-                if type(m_splits) is list
-                else tuple(_seq_from(m_splits))
-            )
-        )
-        key = (
-            0,
-            shp,
-            wshp,
-            dt,
-            dt_b,
-            dt_w,
-            has_bias,
-            inp.get_device(),
-            ptr_low,
-            hsplits,
-        )
-
-    launch = _lget(key)
-    if launch is not None:
-        try:
-            launch(inp, weights, b_arg, out, splits_arg)
-            return out
-        except Exception:  # pragma: no cover - fall back to the JIT path
-            _LAUNCHERS.pop(key, None)
+    has_bias = biases is not None
+    b_arg = biases if has_bias else inp
+    dev_splits = m_splits if torch.is_tensor(m_splits) and m_splits.is_cuda else None
+    splits_arg = m_splits if dev_splits is not None else inp
+    if dev_splits is None:
+        hsplits = _seq_from(m_splits)
 
     if dev_splits is None:
         G = len(hsplits)
@@ -347,7 +203,7 @@ def _run_contiguous(inp, m_splits, weights, biases):
     grid = (-(-n_rows // bm), -(-N // bn), G)
     dev_flag = dev_splits is not None
     consts = vals + (bm, bn, bk, G, has_bias, dev_flag, is_fp32)
-    kern = _grouped_linear_kernel[grid](
+    _grouped_linear_kernel[grid](
         inp,
         weights,
         b_arg,
@@ -360,9 +216,6 @@ def _run_contiguous(inp, m_splits, weights, biases):
         num_warps=2 if bm * bn <= 2048 else 4,
         num_stages=3,
     )
-    launcher = _make_launcher(kern, grid, consts, inp.device.index, T, K, N)
-    if launcher is not None:
-        _LAUNCHERS[key] = launcher
     return out
 
 
