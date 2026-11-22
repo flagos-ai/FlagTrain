@@ -17,10 +17,11 @@
 
 from dataclasses import dataclass
 
-import flag_train
 import pytest
 import torch
 import torch.nn.functional as F
+
+import flag_train
 from flag_train.reference_candidate import get_candidate
 
 
@@ -87,7 +88,7 @@ def reference(
         -1, chosen, selected * (1.0 if scaling_factor is None else scaling_factor)
     )
     routes = torch.zeros_like(raw, dtype=torch.bool).scatter_(-1, chosen, True)
-    if routing_map_format == "bitmap_u8":
+    if getattr(routing_map_format, "value", routing_map_format) in (1, "bitmap_u8"):
         bits = 2 ** torch.arange(8, device=logits.device)
         n = routes.size(-1)
         routes = (
@@ -296,4 +297,14 @@ def test_fused_topk_with_score_function_review_regressions(case):
     _compare(
         _observe(_candidate(), _review_inputs(case, flag_train.device)),
         _observe(reference, _review_inputs(case, flag_train.device)),
+    )
+
+
+@pytest.mark.fused_topk_with_score_function
+@pytest.mark.parametrize("format", [0, 1])
+def test_fused_topk_numeric_routing_format(format):
+    args = _review_inputs("warp-ties-k9", flag_train.device)
+    _compare(
+        _observe(_candidate(), (*args[:-1], format)),
+        _observe(reference, (*args[:-1], format)),
     )

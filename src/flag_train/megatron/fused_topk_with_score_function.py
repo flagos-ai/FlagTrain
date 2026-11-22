@@ -16,7 +16,7 @@
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
+from triton.language.extra import libdevice
 
 _BIG = tl.constexpr(1073741824)
 _EPS = tl.constexpr(1e-20)
@@ -241,15 +241,35 @@ def fused_topk_with_score_function(
         num_tokens = x.shape[0]
 
     has_bias = expert_bias is not None
-    if routing_map_format is None or routing_map_format == "bytemap":
-        is_bitmap = False
-    else:
-        is_bitmap = str(routing_map_format).lower() not in ("bytemap", "byte", "bool")
+    route_format = getattr(routing_map_format, "value", routing_map_format)
+    names = {None: False, 0: False, 1: True, "bytemap": False, "bitmap_u8": True}
+    if route_format not in names:
+        raise ValueError(f"Unsupported routing map format: {routing_map_format}")
+    is_bitmap = names[route_format]
     sf = _score_id(score_function)
-
+    if has_bias and (
+        sf == 0
+        or expert_bias.shape != (num_experts,)
+        or expert_bias.device != logits.device
+        or expert_bias.dtype != torch.float32
+        or not expert_bias.is_contiguous()
+    ):
+        raise ValueError(
+            "Expert bias requires sigmoid or sqrtsoftplus and a contiguous FP32 vector on the input device"
+        )
     groups = int(num_groups or 0)
     selected_groups = int(group_topk or 0)
     k = int(topk)
+    if not 0 < k <= num_experts:
+        raise ValueError("topk must be positive and cannot exceed num_experts")
+    if groups or selected_groups:
+        if not (
+            0 < selected_groups <= groups <= num_experts
+            and num_experts % groups == 0
+            and k % selected_groups == 0
+            and k <= (num_experts // groups) * selected_groups
+        ):
+            raise ValueError("Invalid expert grouping and group topk")
     ckey = (num_experts, groups)
     plan = _PLANS.get(ckey)
     if plan is None:
