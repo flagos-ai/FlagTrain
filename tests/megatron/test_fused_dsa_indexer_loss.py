@@ -18,9 +18,10 @@
 import math
 from dataclasses import dataclass
 
-import flag_train
 import pytest
 import torch
+
+import flag_train
 from flag_train.reference_candidate import get_candidate
 
 
@@ -144,7 +145,9 @@ def reference(
     )
     rows = (p * (p.clamp_min(1e-10).log() - index_logp)).sum(-1)
     if query_valid_rows is not None:
-        query_valid_rows = query_valid_rows.expand_as(rows)
+        query_valid_rows = query_valid_rows.to(
+            device=rows.device, dtype=torch.bool
+        ).expand_as(rows)
         rows = rows * query_valid_rows
     denominator = (
         1
@@ -366,3 +369,45 @@ def test_fused_dsa_indexer_loss_review_regressions(case):
         _observe(_candidate(), _review_inputs(case, flag_train.device)),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
+
+
+@pytest.mark.fused_dsa_indexer_loss
+def test_fused_dsa_indexer_loss_on_noncurrent_cuda_device():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two CUDA devices")
+    with torch.cuda.device(0):
+        got = _observe(_candidate(), _review_inputs("implicit-causal", "cuda:1"))
+        expected = _observe(reference, _review_inputs("implicit-causal", "cuda:1"))
+        assert torch.cuda.current_device() == 0
+    _compare(got, expected)
+
+
+@pytest.mark.fused_dsa_indexer_loss
+def test_fused_dsa_indexer_loss_packed_cpu_metadata():
+    args = list(make_inputs(Case(17, 16, "packed"), torch.float32, flag_train.device))
+    for index in (10, 11, 12):
+        args[index] = args[index].cpu()
+    _compare(_observe(_candidate(), args), _observe(reference, args))
+
+
+@pytest.mark.fused_dsa_indexer_loss
+def test_fused_dsa_indexer_loss_wide_context():
+    device = flag_train.device
+    q = torch.ones((1, 1, 1, 16), device=device)
+    k = torch.zeros((65537, 1, 16), device=device)
+    k[-1, 0, 0] = 2
+    indices, loss = _candidate()(
+        q, q[..., 0], k, q.clone(), k.unsqueeze(2).clone(), 1.0, 1, 1.0
+    )
+    torch.testing.assert_close(indices, torch.tensor([[[65536]]], device=device))
+    torch.testing.assert_close(loss, torch.zeros((), device=device), rtol=0, atol=0)
+
+
+@pytest.mark.fused_dsa_indexer_loss
+def test_fused_dsa_indexer_loss_boolean_cpu_valid_rows():
+    args = list(
+        make_inputs(Case(17, 16, "external-lse"), torch.float32, flag_train.device)
+    )
+    args[13] = torch.ones(17, dtype=torch.int32)
+    args[13][:2] = torch.tensor([0, 2], dtype=torch.int32)
+    _compare(_observe(_candidate(), args), _observe(reference, args))

@@ -25,6 +25,8 @@ Two launches:
     loss_coeff and the mean / per-token denominator.
 """
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -212,6 +214,7 @@ def _dsa_row_kernel(
     sel = (gt | eq) & (gpos < K)
 
     # ---------------- replay the reference post-topk ordering ----------------
+    tl.debug_barrier()
     gval = tl.load(vbuf + off2, mask=ms[:, None], other=_NEG_INF)
     gid = tl.load(ibuf + off2, mask=ms[:, None], other=-2)
     gvalid = gid != -2
@@ -443,6 +446,53 @@ def fused_dsa_indexer_loss(
     Sk = k.shape[0]
     device = q.device
 
+    if varlen_starts is not None:
+        if mask is not None or varlen_ends is None:
+            raise ValueError(
+                "Packed bounds require starts and ends without an additive mask"
+            )
+        if varlen_starts.shape != (Sq,) or varlen_ends.shape != (Sq,):
+            raise ValueError("Packed bounds must have one entry per query")
+        varlen_starts = varlen_starts.to(device=device, dtype=torch.int64)
+        varlen_ends = varlen_ends.to(device=device, dtype=torch.int64)
+        if key_positions is not None:
+            if key_positions.shape != (Sk,):
+                raise ValueError("Packed key positions must have one entry per key")
+            key_positions = key_positions.to(device=device, dtype=torch.int64)
+    if mask is not None and (
+        mask.device != device
+        or mask.dtype != torch.float32
+        or mask.shape not in ((Sq, Sk), (B, Sq, Sk))
+    ):
+        raise ValueError(
+            "Additive mask must be float32 on the input device with shape [Sq, Sk] or [B, Sq, Sk]"
+        )
+    if query_valid_rows is not None:
+        if query_valid_rows.shape not in ((Sq,), (1, Sq), (B, Sq)):
+            raise ValueError("Expected one validity flag per query row")
+        query_valid_rows = query_valid_rows.to(device=device, dtype=torch.bool)
+    # Wide score rows cannot be materialized in one Triton program.
+    if Sk > 1024:
+        return _wide_indexer_loss(
+            q,
+            weights,
+            k,
+            query,
+            key,
+            softmax_scale,
+            topk,
+            loss_coeff,
+            mask,
+            sparse_loss,
+            varlen_starts,
+            varlen_ends,
+            key_positions,
+            query_valid_rows,
+            calculate_per_token_loss,
+            use_relu,
+            non_compressed_lse,
+        )
+
     # teacher query/key: the reference inserts a head axis for the 3-d form
     if query.dim() == 3:
         query = query.unsqueeze(1)
@@ -456,49 +506,23 @@ def fused_dsa_indexer_loss(
     K = min(int(topk), Sk)
     dummy = torch.empty(1, device=device, dtype=torch.float32)
 
-    # ---- additive teacher mask ----
     mask_ok = mask is not None
     if mask_ok:
-        dims = {"b": B, "s": Sq, "t": Sk}
-        got = _map_strides(mask, dims, ["bst", "bts", "sbt", "stb", "tbs", "tsb"])
-        if got is not None:
-            s_m_b, s_m_s, s_m_t = got
-        else:
-            got = _map_strides(mask, dims, ["st"])
-            if got is not None:
-                s_m_b, s_m_s, s_m_t = 0, got[0], got[1]
-            else:
-                got = _map_strides(mask, dims, ["bt"])
-                if got is None:
-                    raise ValueError("unsupported mask shape %s" % (tuple(mask.shape),))
-                s_m_b, s_m_s, s_m_t = got[0], 0, got[1]
+        s_m_b, s_m_s, s_m_t = (0, *mask.stride()) if mask.ndim == 2 else mask.stride()
     else:
         s_m_b = s_m_s = s_m_t = 0
 
-    # ---- varlen bounds (indexed by the query-row axis, as the reference does)
     varlen = varlen_starts is not None
     if varlen:
-        s_vs_s = varlen_starts.stride(0) if varlen_starts.dim() > 0 else 0
-        has_ends = varlen_ends is not None
-        if has_ends:
-            s_ve_s = varlen_ends.stride(0) if varlen_ends.dim() > 0 else 0
-        else:
-            s_ve_s = 0
-            varlen_ends = varlen_starts
+        (s_vs_s,) = varlen_starts.stride()
+        (s_ve_s,) = varlen_ends.stride()
     else:
-        varlen_starts = dummy
-        varlen_ends = dummy
+        varlen_starts = varlen_ends = dummy
         s_vs_s = s_ve_s = 0
-        has_ends = False
 
-    # ---- key positions ----
-    has_keypos = key_positions is not None
-    if has_keypos:
-        kp = key_positions.reshape(-1)
-        s_kp_t = kp.stride(0)
-    else:
-        kp = dummy
-        s_kp_t = 0
+    has_keypos = key_positions is not None and varlen
+    kp = key_positions if has_keypos else dummy
+    s_kp_t = kp.stride(0) if has_keypos else 0
 
     # ---- valid query rows ----
     has_valid = query_valid_rows is not None
@@ -560,93 +584,190 @@ def fused_dsa_indexer_loss(
     BLOCK_DH = max(16, triton.next_power_of_2(Dh))
 
     grid = (triton.cdiv(Sq, BLOCK_S), B)
-    _dsa_row_kernel[grid](
-        q,
-        weights,
-        k,
-        query,
-        key,
-        mask if mask_ok else dummy,
-        non_compressed_lse if has_lse else dummy,
-        varlen_starts,
-        varlen_ends,
-        kp,
-        topk_indices,
-        part,
-        vbuf,
-        ibuf,
-        Sq,
-        Sk,
-        Di,
-        Dh,
-        K,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        weights.stride(0),
-        weights.stride(1),
-        weights.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        s_tq_s,
-        s_tq_b,
-        s_tq_h,
-        s_tq_d,
-        s_tk_t,
-        s_tk_b,
-        s_tk_h,
-        s_tk_d,
-        s_m_b,
-        s_m_s,
-        s_m_t,
-        s_l_b,
-        s_l_h,
-        s_l_s,
-        s_vs_s,
-        s_ve_s,
-        s_kp_t,
-        topk_indices.stride(0),
-        topk_indices.stride(1),
-        topk_indices.stride(2),
-        scale_v,
-        scale_ptr,
-        I=I,
-        H=H,
-        PAD=PAD,
-        LOGPAD=LOGPAD,
-        BLOCK_S=BLOCK_S,
-        BLOCK_T=BLOCK_T,
-        BLOCK_DI=BLOCK_DI,
-        BLOCK_DH=BLOCK_DH,
-        USE_RELU=bool(use_relu),
-        HAS_MASK=mask_ok,
-        VARLEN=varlen,
-        HAS_KEYPOS=has_keypos,
-        HAS_LSE=has_lse,
-        TK_HEAD=tk_head,
-        SPARSE=bool(sparse_loss),
-        SCALE_IS_PTR=scale_is_ptr,
-        num_warps=4,
-        num_stages=1,
-    )
+    with torch.cuda.device(q.device):
+        _dsa_row_kernel[grid](
+            q,
+            weights,
+            k,
+            query,
+            key,
+            mask if mask_ok else dummy,
+            non_compressed_lse if has_lse else dummy,
+            varlen_starts,
+            varlen_ends,
+            kp,
+            topk_indices,
+            part,
+            vbuf,
+            ibuf,
+            Sq,
+            Sk,
+            Di,
+            Dh,
+            K,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            weights.stride(0),
+            weights.stride(1),
+            weights.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            s_tq_s,
+            s_tq_b,
+            s_tq_h,
+            s_tq_d,
+            s_tk_t,
+            s_tk_b,
+            s_tk_h,
+            s_tk_d,
+            s_m_b,
+            s_m_s,
+            s_m_t,
+            s_l_b,
+            s_l_h,
+            s_l_s,
+            s_vs_s,
+            s_ve_s,
+            s_kp_t,
+            topk_indices.stride(0),
+            topk_indices.stride(1),
+            topk_indices.stride(2),
+            scale_v,
+            scale_ptr,
+            I=I,
+            H=H,
+            PAD=PAD,
+            LOGPAD=LOGPAD,
+            BLOCK_S=BLOCK_S,
+            BLOCK_T=BLOCK_T,
+            BLOCK_DI=BLOCK_DI,
+            BLOCK_DH=BLOCK_DH,
+            USE_RELU=bool(use_relu),
+            HAS_MASK=mask_ok,
+            VARLEN=varlen,
+            HAS_KEYPOS=has_keypos,
+            HAS_LSE=has_lse,
+            TK_HEAD=tk_head,
+            SPARSE=bool(sparse_loss),
+            SCALE_IS_PTR=scale_is_ptr,
+            num_warps=4,
+            num_stages=1,
+        )
 
-    _dsa_final_kernel[(1,)](
-        part,
-        vr,
-        out,
-        B * Sq,
-        Sq,
-        s_v_b,
-        s_v_s,
-        coeff_v,
-        coeff_ptr,
-        HAS_VALID=has_valid,
-        PER_TOKEN=bool(calculate_per_token_loss),
-        COEFF_IS_PTR=coeff_is_ptr,
-        BLOCK=1024,
-        num_warps=4,
-        num_stages=1,
-    )
+        _dsa_final_kernel[(1,)](
+            part,
+            vr,
+            out,
+            B * Sq,
+            Sq,
+            s_v_b,
+            s_v_s,
+            coeff_v,
+            coeff_ptr,
+            HAS_VALID=has_valid,
+            PER_TOKEN=bool(calculate_per_token_loss),
+            COEFF_IS_PTR=coeff_is_ptr,
+            BLOCK=1024,
+            num_warps=4,
+            num_stages=1,
+        )
     return topk_indices, out
+
+
+@torch.no_grad()
+def _wide_indexer_loss(
+    q,
+    weights,
+    k,
+    query,
+    key,
+    softmax_scale,
+    topk,
+    loss_coeff,
+    mask,
+    sparse_loss,
+    starts,
+    ends,
+    key_positions,
+    query_valid_rows,
+    per_token,
+    use_relu,
+    external_lse,
+):
+    # The wide path keeps the same two stages as Megatron: routing, then KL.
+    sq, batch = q.shape[:2]
+    sk = k.shape[0]
+    scores = torch.einsum("sbhd,tbd->bsht", q.float(), k.float())
+    if use_relu:
+        scores.clamp_min_(0)
+    scores = (scores * weights.float().transpose(0, 1).unsqueeze(-1)).sum(dim=2)
+    if starts is not None:
+        positions = (
+            torch.arange(sk, device=q.device)
+            if key_positions is None
+            else key_positions
+        )
+        valid = (positions >= starts[:, None]) & (positions < ends[:, None])
+        scores = scores.masked_fill(~valid, -torch.inf)
+        loss_mask = None
+    else:
+        loss_mask = mask
+        if loss_mask is None:
+            loss_mask = torch.full((sq, sk), -torch.inf, device=q.device).triu(1)
+        else:
+            scores = scores + mask
+        valid = torch.isfinite(loss_mask)
+    best, indices = scores.topk(min(int(topk), sk))
+    indices = indices.masked_fill(best == -torch.inf, -1)
+    if sparse_loss:
+        selected = torch.zeros_like(scores, dtype=torch.int32)
+        selected.scatter_add_(-1, indices.clamp_min(0), (indices >= 0).int())
+        valid = valid & (selected != 0)
+    valid = valid.expand(batch, sq, sk)
+    live = valid.any(dim=-1, keepdim=True)
+    if loss_mask is not None:
+        scores = scores + loss_mask
+    scores = scores.masked_fill(~valid, -torch.inf).masked_fill(~live, 0)
+    log_index = scores.log_softmax(dim=-1).masked_fill(~valid, 0)
+    if query.ndim == 3:
+        query, key = query.unsqueeze(1), key.unsqueeze(1)
+    teacher = (
+        torch.einsum("sbhd,tbhd->bhst", query.float(), key.float()) * softmax_scale
+    )
+    if loss_mask is not None:
+        teacher = teacher + loss_mask.unsqueeze(-3)
+    teacher = teacher.masked_fill(~valid[:, None], -torch.inf).masked_fill(
+        ~live[:, None], 0
+    )
+    probs = teacher.softmax(dim=-1).masked_fill(~valid[:, None], 0)
+    if external_lse is not None:
+        lse = teacher.logsumexp(dim=-1)
+        logmass = (lse - torch.logaddexp(lse, external_lse)).masked_fill(
+            ~live.squeeze(-1)[:, None], -torch.inf
+        )
+        max_mass = logmass.amax(dim=1, keepdim=True)
+        shift = torch.where(
+            torch.isfinite(max_mass)
+            & (max_mass < math.log(torch.finfo(torch.float32).tiny)),
+            max_mass,
+            0,
+        )
+        probs = probs * (logmass - shift).exp().unsqueeze(-1)
+    probs = probs.sum(dim=1)
+    mass = probs.sum(dim=-1, keepdim=True)
+    denom = (
+        mass.clamp_min(1e-10)
+        if external_lse is None
+        else torch.where(mass > 0, mass, 1)
+    )
+    probs = probs / denom
+    loss = (probs * (probs.clamp_min(1e-10).log() - log_index)).sum(dim=-1)
+    count = loss.numel()
+    if query_valid_rows is not None:
+        rows = query_valid_rows.expand_as(loss)
+        loss = loss * rows
+        count = rows.sum().clamp_min(1)
+    return indices, loss.sum() * loss_coeff / (1 if per_token else count)
