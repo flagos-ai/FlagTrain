@@ -10,6 +10,7 @@ from .fused_h_aggregate_forward import fused_h_aggregate_forward
 from .fused_h_post_bda_backward import fused_h_post_bda_backward
 from .fused_h_post_bda_forward import fused_h_post_bda_forward
 from .fused_indices_to_multihot import fused_indices_to_multihot
+from .fused_mla_rope_inplace import fused_mla_rope_inplace
 from .fused_pad_routing_map import fused_pad_routing_map
 from .fused_proj_rms_backward import fused_proj_rms_backward
 from .fused_proj_rms_compute_h_backward import fused_proj_rms_compute_h_backward
@@ -44,6 +45,7 @@ __all__ = [
     "fused_h_post_bda_backward",
     "fused_h_post_bda_forward",
     "fused_indices_to_multihot",
+    "fused_mla_rope_inplace",
     "fused_pad_routing_map",
     "fused_proj_rms_backward",
     "fused_proj_rms_compute_h_backward",
