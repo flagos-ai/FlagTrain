@@ -15,8 +15,11 @@
 
 """Time moe_chunk_sort using the same workload and reference as correctness."""
 
-import flag_train
 import pytest
+
+import flag_train
+from benchmark.base import GenericBenchmark
+from benchmark.cases import BenchmarkCasePlan
 from tests.megatron.test_moe_chunk_sort import (
     CASES,
     DTYPES,
@@ -24,9 +27,6 @@ from tests.megatron.test_moe_chunk_sort import (
     make_inputs,
     reference,
 )
-
-from benchmark.base import GenericBenchmark
-from benchmark.cases import BenchmarkCasePlan
 
 
 class OperatorBenchmark(GenericBenchmark):
@@ -71,6 +71,9 @@ def _build(plan, dtype, device):
     return args
 
 
+@pytest.mark.skipif(
+    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
+)
 @pytest.mark.moe_chunk_sort
 def test_moe_chunk_sort_benchmark():
     bench = OperatorBenchmark(

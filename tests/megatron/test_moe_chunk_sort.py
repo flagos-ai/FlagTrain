@@ -18,13 +18,19 @@
 from dataclasses import dataclass
 from itertools import accumulate
 
-import flag_train
 import pytest
 import torch
+
+import flag_train
 from flag_train.reference_candidate import get_candidate
 
 
 def reference(inp, split_sizes, sorted_idxs, probs):
+    if not inp.numel():
+        reordered = (
+            inp.new_empty(0, dtype=torch.float32) if probs is None else probs.clone()
+        )
+        return inp.clone(), reordered, inp.new_empty(0, dtype=torch.int32)
     sizes, order = split_sizes.tolist(), sorted_idxs.tolist()
     starts = [0, *list(accumulate(sizes))]
     permutation = torch.tensor(
@@ -203,3 +209,28 @@ def test_moe_chunk_sort_review_regressions(case):
         _observe(_candidate(), _review_inputs(case, flag_train.device)),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
+
+
+@pytest.mark.moe_chunk_sort
+def test_moe_chunk_sort_offset_and_fresh_empty():
+    device = flag_train.device
+    fn = _candidate()
+    splits = torch.tensor([1, 2], device=device, dtype=torch.int32)
+    order = torch.tensor([1, 0], device=device, dtype=torch.int32)
+    base = torch.arange(3 * 128 + 1, device=device, dtype=torch.float32)
+    first = fn(base[:-1].view(3, 128), splits, order, None)
+    first[1].resize_(1)
+    args = (base[1:].view(3, 128), splits, order, None)
+    _compare(fn(*args), reference(*args))
+
+
+@pytest.mark.moe_chunk_sort
+def test_moe_chunk_sort_zero_hidden_width():
+    device = flag_train.device
+    args = (
+        torch.empty((2, 0), device=device),
+        torch.tensor([1, 1], dtype=torch.int32, device=device),
+        torch.tensor([1, 0], dtype=torch.int32, device=device),
+        torch.tensor([3.0, 4.0], device=device),
+    )
+    _compare(_observe(_candidate(), args), _observe(reference, args))
