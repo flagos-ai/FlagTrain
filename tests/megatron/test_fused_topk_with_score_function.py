@@ -308,3 +308,11 @@ def test_fused_topk_numeric_routing_format(format):
         _observe(_candidate(), (*args[:-1], format)),
         _observe(reference, (*args[:-1], format)),
     )
+
+
+@pytest.mark.fused_topk_with_score_function
+def test_fused_topk_without_group_topk_ignores_num_groups():
+    args = list(_review_inputs("warp-ties-k9", flag_train.device))
+    expected = _observe(reference, args)
+    args[3] = 4
+    _compare(_observe(_candidate(), args), expected)

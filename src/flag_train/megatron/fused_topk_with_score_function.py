@@ -262,7 +262,7 @@ def fused_topk_with_score_function(
     k = int(topk)
     if not 0 < k <= num_experts:
         raise ValueError("topk must be positive and cannot exceed num_experts")
-    if groups or selected_groups:
+    if selected_groups > 0:
         if not (
             0 < selected_groups <= groups <= num_experts
             and num_experts % groups == 0
@@ -270,6 +270,8 @@ def fused_topk_with_score_function(
             and k <= (num_experts // groups) * selected_groups
         ):
             raise ValueError("Invalid expert grouping and group topk")
+    else:
+        groups = selected_groups = 0
     ckey = (num_experts, groups)
     plan = _PLANS.get(ckey)
     if plan is None:
