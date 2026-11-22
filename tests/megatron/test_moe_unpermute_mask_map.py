@@ -17,9 +17,10 @@
 
 from dataclasses import dataclass
 
-import flag_train
 import pytest
 import torch
+
+import flag_train
 from flag_train.reference_candidate import get_candidate
 
 
@@ -263,3 +264,18 @@ def test_moe_unpermute_mask_map_on_noncurrent_cuda_device():
         expected = _observe(reference, _review_inputs("strided-activation", "cuda:1"))
         assert torch.cuda.current_device() == 0
     _compare(got, expected)
+
+
+@pytest.mark.moe_unpermute_mask_map
+def test_moe_unpermute_no_routed_input():
+    device = flag_train.device
+    args = (
+        torch.empty((0, 5), device=device),
+        torch.zeros((3, 3), device=device, dtype=torch.int32),
+        None,
+        3,
+        1,
+        5,
+        None,
+    )
+    _compare(_observe(_candidate(), args), _observe(reference, args))

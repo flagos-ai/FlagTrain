@@ -79,6 +79,8 @@ def _unpermute_kernel(
 def moe_unpermute_mask_map(
     inp, row_id_map, merging_probs, num_tokens, num_experts, hidden_size, pad_offsets
 ):
+    if not inp.numel():
+        return inp.clone()
     out = inp.new_empty((num_tokens, hidden_size))
     if not out.numel():
         return out
