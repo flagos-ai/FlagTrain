@@ -17,13 +17,16 @@
 
 from dataclasses import dataclass
 
-import flag_train
 import pytest
 import torch
+
+import flag_train
 from flag_train.reference_candidate import get_candidate
 
 
-def reference(grad_output, aux_loss, loss_scale):
+def reference(grad_output, aux_loss, loss_scale=None):
+    if loss_scale is None:
+        loss_scale = torch.tensor(1.0, device=aux_loss.device)
     return grad_output, torch.ones_like(aux_loss) * loss_scale
 
 
@@ -182,3 +185,11 @@ def test_aux_scale_changes_between_calls():
     grad, aux, _ = _review_inputs("vector-promotion", flag_train.device)
     for scale in (2.5, 1.0, 3.0, 1.0):
         _compare(fn(grad, aux, scale), reference(grad, aux, scale))
+
+
+@pytest.mark.moe_aux_loss_auto_scaler_backward
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_moe_aux_loss_unset_scale(dtype):
+    grad = torch.ones(2, device=flag_train.device, dtype=dtype)
+    aux = torch.zeros((), device=grad.device, dtype=dtype)
+    _compare(_candidate()(grad, aux), reference(grad, aux))

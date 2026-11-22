@@ -15,8 +15,11 @@
 
 """Time moe_aux_loss_auto_scaler_backward using the same workload and reference as correctness."""
 
-import flag_train
 import pytest
+
+import flag_train
+from benchmark.base import GenericBenchmark
+from benchmark.cases import BenchmarkCasePlan
 from tests.megatron.test_moe_aux_loss_auto_scaler_backward import (
     CASES,
     DTYPES,
@@ -24,9 +27,6 @@ from tests.megatron.test_moe_aux_loss_auto_scaler_backward import (
     make_inputs,
     reference,
 )
-
-from benchmark.base import GenericBenchmark
-from benchmark.cases import BenchmarkCasePlan
 
 
 class OperatorBenchmark(GenericBenchmark):

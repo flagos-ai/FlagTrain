@@ -21,7 +21,9 @@ _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def moe_aux_loss_auto_scaler_backward(grad_output, aux_loss, loss_scale=None):
-    scale = 1.0 if loss_scale is None else loss_scale
+    scale = (
+        torch.tensor(1.0, device=aux_loss.device) if loss_scale is None else loss_scale
+    )
     if (
         torch.is_tensor(scale)
         and scale.ndim == 0
