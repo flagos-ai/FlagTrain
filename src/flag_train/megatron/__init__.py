@@ -4,6 +4,7 @@ from .bias_geglu_impl import bias_geglu_impl
 from .bias_gelu_impl import bias_gelu_impl
 from .bias_swiglu_impl import bias_swiglu_impl
 from .fast_gelu import fast_gelu
+from .fused_dsa_indexer_loss import fused_dsa_indexer_loss
 from .fused_gated_norm import fused_gated_norm
 from .fused_h_aggregate_backward import fused_h_aggregate_backward
 from .fused_h_aggregate_forward import fused_h_aggregate_forward
@@ -38,6 +39,7 @@ __all__ = [
     "bias_gelu_impl",
     "bias_swiglu_impl",
     "fast_gelu",
+    "fused_dsa_indexer_loss",
     "fused_gated_norm",
     "fused_h_aggregate_backward",
     "fused_h_aggregate_forward",
