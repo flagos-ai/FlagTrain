@@ -179,7 +179,7 @@ def _run_contiguous(inp, routing_map, num_out_tokens, probs, pad_offsets):
     if inp.numel() == 0:
         return (
             inp.clone(),
-            torch.zeros((T, 2 * E + 1), dtype=torch.int32, device=inp.device),
+            inp.new_empty((0, 2 * E + 1), dtype=torch.int32),
             inp.new_empty(0, dtype=probs.dtype if has_probs else torch.float32),
         )
 

@@ -17,9 +17,10 @@
 
 from dataclasses import dataclass
 
-import flag_train
 import pytest
 import torch
+
+import flag_train
 from flag_train.reference_candidate import get_candidate
 
 
@@ -31,7 +32,7 @@ def reference(inp, routing_map, num_out_tokens, probs, pad_offsets):
     if not inp.numel():
         return (
             inp.clone(),
-            row_map,
+            inp.new_empty((0, 2 * experts + 1), dtype=torch.int32),
             inp.new_empty(0, dtype=probs.dtype if probs is not None else torch.float32),
         )
     dest = (routing_map.T.flatten().cumsum(0) - 1).reshape(experts, tokens).T
@@ -233,3 +234,16 @@ def test_moe_permute_mask_map_review_regressions(case):
         _observe(_candidate(), _review_inputs(case, flag_train.device)),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
+
+
+@pytest.mark.moe_permute_mask_map
+def test_moe_permute_zero_hidden_width():
+    device = flag_train.device
+    args = (
+        torch.empty((2, 0), device=device),
+        torch.ones((2, 1), device=device, dtype=torch.int32),
+        2,
+        None,
+        None,
+    )
+    _compare(_observe(_candidate(), args), _observe(reference, args))
