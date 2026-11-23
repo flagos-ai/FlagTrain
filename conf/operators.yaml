@@ -297,6 +297,34 @@ ops:
   source: megatron.core.transformer.hyper_connection
   stages:
   - beta: '0.0.0'
+- id: fused_sinkhorn
+  description: Sinkhorn projection and its first-order input gradient.
+  for:
+  - fused_sinkhorn
+  labels:
+  - megatron
+  - normalization
+  from:
+  - megatron
+  kind:
+  - Normalization
+  source: megatron.core.transformer.hyper_connection
+  stages:
+  - stable: '0.0.0'
+- id: l2_normalization_backward
+  description: Input gradient for L2 normalization using the saved inverse norm.
+  for:
+  - l2normalization_backward_fused
+  labels:
+  - transformer_engine
+  - normalization
+  from:
+  - transformer_engine
+  kind:
+  - Normalization
+  source: transformer_engine.pytorch.jit
+  stages:
+  - stable: '0.0.0'
 - id: lamb
   description: 'Fused LAMB optimizer update. Supports fp32 or fp64 master weights
     and moments; fp16 gradients against fp32 master weights are also supported.'
@@ -354,6 +382,34 @@ ops:
   - MoE
   stages:
   - beta: '0.0.0'
+- id: mtp_loss_auto_scaler
+  description: Scales the MTP loss gradient using an explicit scale buffer per autograd graph.
+  for:
+  - MTPLossAutoScaler
+  labels:
+  - megatron
+  - tensor
+  from:
+  - megatron
+  kind:
+  - Tensor
+  source: megatron.core.transformer.multi_token_prediction
+  stages:
+  - stable: '0.0.0'
+- id: multi_modal_rotary_embedding
+  description: Generates non-interleaved multimodal rotary frequencies with optional sequence interpolation.
+  for:
+  - MultimodalRotaryEmbedding
+  labels:
+  - megatron
+  - attention
+  from:
+  - megatron
+  kind:
+  - Attention
+  source: megatron.core.models.common.embeddings.rotary_pos_embedding
+  stages:
+  - stable: '0.0.0'
 - id: multi_tensor_adam
   description: Fused Adam/AdamW optimizer update over multiple parameter tensors.
   for:
@@ -423,6 +479,20 @@ ops:
   source: megatron.core.activations
   stages:
   - beta: '0.0.0'
+- id: router_gating_linear_function
+  description: Project Megatron router logits with optional bias and first-order gradients.
+  for:
+  - RouterGatingLinearFunction
+  labels:
+  - megatron
+  - moe
+  from:
+  - megatron
+  kind:
+  - MoE
+  source: megatron.core.transformer.moe.moe_utils.RouterGatingLinearFunction
+  stages:
+  - stable: '0.0.0'
 - id: scaled_masked_softmax_cuda_backward
   description: 'Gradient of the scaled masked softmax with respect to the scores:
     scale * y * (dy - sum(dy * y)) over the key axis.'
@@ -527,3 +597,17 @@ ops:
   source: megatron.core.fusions.fused_weighted_squared_relu
   stages:
   - beta: '0.0.0'
+- id: weighted_swiglu_funciton
+  description: Weighted SwiGLU activation with per-token weights and first-order gradients.
+  for:
+  - WeightedSwiGLUFunction
+  labels:
+  - megatron
+  - activation
+  from:
+  - megatron
+  kind:
+  - Activation
+  source: megatron.core.fusions.fused_bias_swiglu
+  stages:
+  - stable: '0.0.0'

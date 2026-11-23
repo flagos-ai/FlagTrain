@@ -15,8 +15,12 @@ from .fused_proj_rms_backward import fused_proj_rms_backward
 from .fused_proj_rms_compute_h_backward import fused_proj_rms_compute_h_backward
 from .fused_proj_rms_compute_h_forward import fused_proj_rms_compute_h_forward
 from .fused_proj_rms_forward import fused_proj_rms_forward
+from .fused_sinkhorn import fused_sinkhorn
+from .mtp_loss_auto_scaler import mtp_loss_auto_scaler
+from .multi_modal_rotary_embedding import multi_modal_rotary_embedding
 from .quick_geglu import quick_geglu
 from .quick_gelu import quick_gelu
+from .router_gating_linear_function import router_gating_linear_function
 from .scaled_masked_softmax_cuda_backward import scaled_masked_softmax_cuda_backward
 from .scaled_masked_softmax_cuda_forward import scaled_masked_softmax_cuda_forward
 from .scaled_upper_triang_masked_softmax_backward import (
@@ -27,6 +31,7 @@ from .scaled_upper_triang_masked_softmax_forward import (
 )
 from .tanh_soft_clamp import tanh_soft_clamp
 from .weighted_squared_relu_impl import weighted_squared_relu_impl
+from .weighted_swiglu_funciton import weighted_swiglu_funciton
 
 __all__ = [
     "bias_geglu_impl",
@@ -44,14 +49,19 @@ __all__ = [
     "fused_proj_rms_compute_h_backward",
     "fused_proj_rms_compute_h_forward",
     "fused_proj_rms_forward",
+    "fused_sinkhorn",
+    "mtp_loss_auto_scaler",
+    "multi_modal_rotary_embedding",
     "quick_geglu",
     "quick_gelu",
+    "router_gating_linear_function",
     "scaled_masked_softmax_cuda_backward",
     "scaled_masked_softmax_cuda_forward",
     "scaled_upper_triang_masked_softmax_backward",
     "scaled_upper_triang_masked_softmax_forward",
     "tanh_soft_clamp",
     "weighted_squared_relu_impl",
+    "weighted_swiglu_funciton",
 ]
 
 # The vendor-operator registration for these names runs in flag_train/__init__.py
