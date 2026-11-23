@@ -31,12 +31,22 @@ pytest_plugins = ["pytester"]
 def test_candidate_defaults_to_live_operator(monkeypatch):
     candidate = lambda: "candidate"
     monkeypatch.setattr(flag_train, "megatron", SimpleNamespace(probe=candidate))
-    assert get_candidate("megatron.probe") is candidate
+    with pytest.warns(
+        DeprecationWarning, match="define a callable.*reference"
+    ) as warnings:
+        assert (
+            get_candidate("megatron.probe", reference=lambda: "reference") is candidate
+        )
+    assert warnings[0].filename == __file__
 
 
 def test_reference_mode_selects_explicit_reference():
     with reference_test_mode(True) as state:
-        candidate = get_candidate("megatron.missing", reference=lambda: "reference")
+        with pytest.warns(
+            DeprecationWarning, match="public operator entry point"
+        ) as warnings:
+            candidate = get_candidate("megatron.missing", reference=lambda: "reference")
+        assert warnings[0].filename == __file__
         assert candidate() == "reference"
         assert state.candidate_calls == state.reference_calls == 1
 
@@ -242,3 +252,90 @@ def test_probe():
     assert candidate(2) == 3
 """)
     suite.runpytest_inprocess("--ref-as-candidate").assert_outcomes(passed=1)
+
+
+@pytest.mark.parametrize("skip_second", [False, True])
+def test_reference_requires_a_call_for_each_selected_operator(
+    automatic_reference_suite, monkeypatch, skip_second
+):
+    suite, original = automatic_reference_suite
+    monkeypatch.setattr(
+        flag_train.megatron, "reference_other_probe", original, raising=False
+    )
+    monkeypatch.setattr(
+        flag_train.megatron,
+        "__all__",
+        [*flag_train.megatron.__all__, "reference_other_probe"],
+    )
+    suite.makeini(
+        "[pytest]\nmarkers =\n    reference_other_probe: declare another operator"
+    )
+    suite.makepyfile(f"""
+import pytest
+
+import flag_train
+
+
+def reference(value):
+    return value + 1
+
+
+@pytest.mark.reference_probe
+def test_called():
+    assert flag_train.megatron.reference_probe(2) == 3
+
+
+@pytest.mark.reference_probe
+@pytest.mark.skip(reason="individual case is unsupported")
+def test_skipped_case():
+    raise AssertionError("setup did not skip the case")
+
+
+@pytest.mark.reference_other_probe
+@pytest.mark.skipif({skip_second}, reason="operator is unsupported")
+def test_distinct_operator():
+    assert flag_train.megatron.reference_other_probe(2) == 3
+""")
+    result = suite.runpytest_inprocess(
+        "-m", "reference_probe or reference_other_probe", "--ref-as-candidate"
+    )
+    if skip_second:
+        result.assert_outcomes(passed=1, skipped=2)
+        assert result.ret == pytest.ExitCode.TESTS_FAILED
+        assert "flag_train.megatron.reference_other_probe" in result.stdout.str()
+    else:
+        result.assert_outcomes(passed=2, skipped=1)
+        assert result.ret == pytest.ExitCode.OK
+
+
+@pytest.mark.parametrize("prefix", ["megatron", "flag_train.megatron"])
+def test_qualified_op_name_with_automatic_and_legacy_reference(
+    automatic_reference_suite, prefix
+):
+    suite, original = automatic_reference_suite
+    component = suite.path / "tests" / "megatron"
+    component.mkdir(parents=True)
+    (component / "test_qualified_reference.py").write_text(f"""
+import pytest
+
+import flag_train
+from flag_train.reference_candidate import get_candidate
+
+OP_NAME = "{prefix}.reference_probe"
+
+
+def reference(value):
+    return value + 1
+
+
+def test_auto():
+    assert flag_train.megatron.reference_probe(2) == 3
+
+
+def test_legacy():
+    with pytest.warns(DeprecationWarning):
+        candidate = get_candidate(OP_NAME, reference=reference)
+    assert candidate(2) == 3
+""")
+    suite.runpytest_inprocess("--ref-as-candidate").assert_outcomes(passed=2)
+    assert flag_train.megatron.reference_probe is original

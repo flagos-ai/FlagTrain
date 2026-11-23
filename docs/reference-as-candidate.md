@@ -41,8 +41,12 @@ module when calling it so the replacement is visible. The explicit reference
 must match the candidate's signature, outputs, and mutation contract.
 A missing reference, ambiguous target, or test that never calls the replaced
 operator fails with `ReferenceContractError`. Calls to the oracle directly and
-calls made by fixtures do not count. Existing `get_candidate(..., reference=...)`
-calls still work.
+calls made by fixtures do not count. Each selected operator needs at least one
+successful candidate-side call. Individual cases for that operator may skip.
+
+Existing `get_candidate(..., reference=...)` calls still work and emit
+`DeprecationWarning`. Migrate them by declaring `reference` at module level
+and calling the public operator entry point.
 
 ```sh
 pytest tests -m "<operator>" --ref-as-candidate
