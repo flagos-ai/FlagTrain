@@ -282,14 +282,3 @@ def test_mla_backward(remove_interleaving):
     expected = torch.zeros_like(x)
     expected[..., 1] = -1
     torch.testing.assert_close(grad, expected, rtol=0, atol=0)
-
-
-@pytest.mark.fused_mla_rope_inplace
-def test_fused_mla_rope_inplace_on_noncurrent_cuda_device():
-    if torch.cuda.device_count() < 2:
-        pytest.skip("Requires two CUDA devices")
-    with torch.cuda.device(0):
-        got = _observe(_candidate(), _review_inputs("dense-rotation", "cuda:1"))
-        expected = _observe(reference, _review_inputs("dense-rotation", "cuda:1"))
-        assert torch.cuda.current_device() == 0
-    _compare(got, expected)

@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.runtime import torch_device_fn
+
 
 @triton.jit
 def _mla_rope_inplace_kernel(
@@ -144,7 +146,7 @@ def _rotate(
     use_cu = cu_seqlens_q is not None and not use_pos
     positions = position_ids.contiguous() if use_pos else t
     sequences = cu_seqlens_q.contiguous() if use_cu else t
-    with torch.cuda.device(t.device):
+    with torch_device_fn.device(t.device):
         _mla_rope_inplace_kernel[(rows, heads)](
             t,
             cos,
