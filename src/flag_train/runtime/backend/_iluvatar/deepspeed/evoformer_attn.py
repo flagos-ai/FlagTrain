@@ -71,7 +71,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_train.runtime import device, torch_device_fn
+from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 
 logger = logging.getLogger(__name__)
@@ -285,31 +285,6 @@ def _evoformer_fwd_kernel(
     )
 
 
-# Vendors whose ``torch_device_fn`` answers with a *CUDA* compute capability.
-# The threshold below is written in sm_XX, so it is only a statement about a
-# device that reports in that scale. Every other vendor answers in its own:
-# MUSA reports its architecture generation -- which is why FlagGems' own
-# _mthreads backend gates its tensor-core ops on ``>= 3`` -- and reading a 3
-# as an sm_3x is how a port rejects a device that was fine.
-_CAPABILITY_VENDORS = {"nvidia"}
-
-
-def _device_capability():
-    """``(major, minor)`` of the current device, or ``None`` if it will not say.
-
-    ``None`` means "cannot tell", and the caller then leaves the device alone
-    rather than guessing a limit it did not state. A vendor that reports in
-    another scale counts as "cannot tell" for the same reason -- the number is a
-    true answer to a different question, and the caller's limit is an sm_XX one.
-    """
-    if device.vendor_name not in _CAPABILITY_VENDORS:
-        return None
-    try:
-        return torch_device_fn.get_device_capability(torch_device_fn.current_device())
-    except Exception:
-        return None
-
-
 # The per-dimension grid limit. A launch's z axis cannot be wider than this on
 # any backend's driver, which is what makes it the flattened (batch, pair)
 # dimension's ceiling for a kernel that puts that dimension in the grid.
@@ -323,14 +298,10 @@ def _check_launch_arguments(q, k, v, bias1, bias2, max_slices=_GRID_Z_MAX):
     the C++ ``check_supported`` it calls -- so a caller gets the same diagnosis
     upstream gives rather than a failure inside the Triton compiler.
 
-    Three of them cannot be literal on a port that runs on several vendors:
+    Two of them cannot be literal on a port that runs on several vendors:
 
     * upstream asserts tensors are CUDA; here the test is that they are not on
       the CPU, which is what "must be a device tensor" means anywhere else;
-    * upstream asserts Ampere-or-newer through ``CheckArch``. That still holds,
-      but it is only checked when the device actually reports a capability -- a
-      backend that will not say keeps working, because inventing a limit it never
-      stated is how a port rejects a device that was fine;
     * upstream predicates on pointer and stride alignment (``check_supported``)
       because its kernel loads 128-bit vectors. This port's Triton loads do not
       need that, but it *does* require contiguous operands (see the docstring of
@@ -410,13 +381,6 @@ def _check_launch_arguments(q, k, v, bias1, bias2, max_slices=_GRID_Z_MAX):
         raise ValueError(
             "head_size must be <= 64; upstream's kernels fix kMaxK at 64 "
             f"(got {q.shape[-1]})"
-        )
-
-    capability = _device_capability()
-    if capability is not None and capability[0] < 7:
-        raise ValueError(
-            "evoformer attention needs tensor cores (compute capability 7.0 or "
-            "newer); this device reports %d.%d" % capability
         )
 
     _check_bias_shapes(q, bias1, bias2)
