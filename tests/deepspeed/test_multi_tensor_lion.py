@@ -534,21 +534,29 @@ def test_multi_tensor_lion_channels_last():
     accepts; the elementwise kernel can read it as a flat buffer."""
     shape = (2, 4, 8, 16)
     device = flag_train.device
-    gs = [
-        torch.randn(shape, dtype=torch.float32, device=device).to(
-            memory_format=torch.channels_last
-        )
-    ]
-    ps = [
-        torch.randn(shape, dtype=torch.float32, device=device).to(
-            memory_format=torch.channels_last
-        )
-    ]
-    ms = [
-        torch.zeros(shape, dtype=torch.float32, device=device).to(
-            memory_format=torch.channels_last
-        )
-    ]
+    try:
+        gs = [
+            torch.randn(shape, dtype=torch.float32, device=device).to(
+                memory_format=torch.channels_last
+            )
+        ]
+        ps = [
+            torch.randn(shape, dtype=torch.float32, device=device).to(
+                memory_format=torch.channels_last
+            )
+        ]
+        ms = [
+            torch.zeros(shape, dtype=torch.float32, device=device).to(
+                memory_format=torch.channels_last
+            )
+        ]
+    except RuntimeError as exc:
+        # Some backends only implement contiguous storage (torch-npu:
+        # "Only contiguous_format or preserve_format is supported"), so the
+        # layout this case pins cannot exist there at all.
+        if "contiguous_format" not in str(exc):
+            raise
+        pytest.skip(f"channels_last tensors cannot be created on {device!r}: {exc}")
     assert not gs[0].is_contiguous()
     assert gs[0].is_contiguous(memory_format=torch.channels_last)
 
