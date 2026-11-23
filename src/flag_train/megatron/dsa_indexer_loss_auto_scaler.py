@@ -34,7 +34,8 @@ class _DSAScaler(torch.autograd.Function):
         if (
             torch.is_tensor(scale)
             and scale.ndim == 0
-            and loss.is_cuda
+            and loss.layout == torch.strided
+            and scale.layout == torch.strided
             and scale.device == loss.device
             and loss.dtype in _FLOAT_DTYPES
             and scale.dtype in _FLOAT_DTYPES
