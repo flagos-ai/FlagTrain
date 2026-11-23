@@ -23,9 +23,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.megatron.router_gating_linear_function import (
-    router_gating_linear_function as _nvidia_router,
-)
 from flag_train.reference_candidate import get_candidate
 from flag_train.runtime import torch_backend_device
 from flag_train.testing import assert_close
@@ -101,15 +98,8 @@ def reference(inp, weight, bias, router_dtype):
     return _RouterGatingLinear.apply(inp, weight, bias, router_dtype)
 
 
-def skip_unsupported_candidate(candidate):
-    if candidate is _nvidia_router and flag_train.vendor_name != "nvidia":
-        pytest.skip(f"No router gating linear kernel for {flag_train.vendor_name}")
-
-
 def _candidate():
-    candidate = get_candidate(OVERRIDE_KEY, reference=reference)
-    skip_unsupported_candidate(candidate)
-    return candidate
+    return get_candidate(OVERRIDE_KEY, reference=reference)
 
 
 @pytest.fixture(autouse=True)
