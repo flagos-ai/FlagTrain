@@ -15,7 +15,6 @@
 
 """TransformerEngine mask-map unpermute for ordinary floating tensors."""
 
-import torch
 import triton
 import triton.language as tl
 
