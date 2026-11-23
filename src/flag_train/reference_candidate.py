@@ -264,12 +264,6 @@ def _test_operator_target(item):
         owner = importlib.import_module(target.module_name)
         return target if callable(vars(owner).get(target.attr_name)) else None
 
-    filename = item.path.stem
-    if filename.startswith("test_"):
-        target = exported_target(filename.removeprefix("test_"))
-        if target is not None:
-            return target
-
     targets = {
         target
         for mark in item.iter_markers()
@@ -281,6 +275,13 @@ def _test_operator_target(item):
         )
     if targets:
         return targets.pop()
+
+    filename = item.path.stem
+    if filename.startswith("test_"):
+        target = exported_target(filename.removeprefix("test_"))
+        if target is not None:
+            return target
+
     if prefix and filename.startswith("test_"):
         # A conventional component test may validate a reference before its
         # public candidate has been added to the package.

@@ -270,7 +270,7 @@ def test_reference_requires_a_call_for_each_selected_operator(
     suite.makeini(
         "[pytest]\nmarkers =\n    reference_other_probe: declare another operator"
     )
-    suite.makepyfile(f"""
+    suite.makepyfile(test_reference_probe=f"""
 import pytest
 
 import flag_train
