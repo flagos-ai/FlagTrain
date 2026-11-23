@@ -450,14 +450,22 @@ def test_multi_tensor_adam_channels_last():
     shape = (2, 4, 8, 16)
     dtype = torch.float32
     device = flag_train.device
-    g, p, m, v = [
-        [
-            torch.randn(shape, dtype=dtype, device=device).to(
-                memory_format=torch.channels_last
-            )
+    try:
+        g, p, m, v = [
+            [
+                torch.randn(shape, dtype=dtype, device=device).to(
+                    memory_format=torch.channels_last
+                )
+            ]
+            for _ in range(4)
         ]
-        for _ in range(4)
-    ]
+    except RuntimeError as exc:
+        # Some backends only implement contiguous storage (torch-npu:
+        # "Only contiguous_format or preserve_format is supported"), so the
+        # layout this case pins cannot exist there at all.
+        if "contiguous_format" not in str(exc):
+            raise
+        pytest.skip(f"channels_last tensors cannot be created on {device!r}: {exc}")
     m[0].zero_()
     v[0].zero_()
     assert not g[0].is_contiguous()
