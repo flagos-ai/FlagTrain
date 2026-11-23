@@ -11,37 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ascend tuned ``weighted_squared_relu_impl``.
-
-Same contract and activation formula as
-``flag_train.megatron.weighted_squared_relu_impl``; only the launch shape and
-how the clamp operands reach the kernel change. Calls the row-weight kernel
-cannot express delegate to the generic Triton implementation, never to torch.
-Measured on 910B4 (card 6):
-
-* **Programs are the unit of cost, not lanes.**  A program touching 1024 lanes
-  costs the same fixed overhead as one touching 8192, so each program gets
-  ``_TILE_LANES`` consecutive lanes (8192 is the measured plateau; 16384
-  overflows the 192 KB UB budget).
-* **A program can own more than one tile.**  A runtime loop over its rows'
-  column blocks cuts the program count by ``hidden / BLOCK``. The trip count
-  is derived from ``hidden`` so the loop is not unrolled, which also keeps
-  ``hidden`` the only runtime scalar.
-* **Persistence needs programs, not iterations.**  The walk only engages from
-  ``_WALK_MIN_PROGRAMS`` (32, just under one 40-core wave) up; small inputs
-  keep the plain 2-D grid.
-* **fp32 needs single buffering** (``num_stages=1``) to fit an 8192-lane tile.
-* **Every runtime scalar past the first costs ~40%**, so the clamp operands,
-  token count and tiling are ``tl.constexpr``; the extra compiles are per
-  distinct shape. A dead ``constexpr`` branch is free, so one kernel body
-  keeps both weighted paths.
-
-Training tiling per shape costs a few seconds per kernel (~40 shapes: ~4
-minutes cold, 5 seconds warm). Software pipelining was measured to not help.
-The tanh clamp is compute bound (~50% over the unclamped kernel); ``exp2``,
-a reciprocal form and ``tl.math.tanh`` were all slower, so the formula is
-unchanged.
-"""
 
 import logging
 import math
@@ -62,7 +31,6 @@ _WEIGHTED_SQUARED_RELU_DTYPES = (
     torch.float16,
     torch.bfloat16,
     torch.float32,
-    torch.float64,
 )
 
 # Lanes per program.  This is the measured plateau, and also the largest tile
