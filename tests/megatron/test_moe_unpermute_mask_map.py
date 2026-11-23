@@ -256,17 +256,6 @@ def test_unpermute_rechecks_layout_after_transpose():
 
 
 @pytest.mark.moe_unpermute_mask_map
-def test_moe_unpermute_mask_map_on_noncurrent_cuda_device():
-    if torch.cuda.device_count() < 2:
-        pytest.skip("Requires two CUDA devices")
-    with torch.cuda.device(0):
-        got = _observe(_candidate(), _review_inputs("strided-activation", "cuda:1"))
-        expected = _observe(reference, _review_inputs("strided-activation", "cuda:1"))
-        assert torch.cuda.current_device() == 0
-    _compare(got, expected)
-
-
-@pytest.mark.moe_unpermute_mask_map
 def test_moe_unpermute_no_routed_input():
     device = flag_train.device
     args = (

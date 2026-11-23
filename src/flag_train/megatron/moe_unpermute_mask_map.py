@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.runtime import torch_device_fn
+
 
 @triton.jit
 def _unpermute_kernel(
@@ -91,7 +93,7 @@ def moe_unpermute_mask_map(
     pad = pad_offsets.contiguous() if has_pad else out
     block_h = max(64, min(1024, triton.next_power_of_2(hidden_size)))
     num_hb = triton.cdiv(hidden_size, block_h)
-    with torch.cuda.device(inp.device):
+    with torch_device_fn.device(inp.device):
         _unpermute_kernel[(num_tokens * num_hb,)](
             inp,
             row_id_map,
