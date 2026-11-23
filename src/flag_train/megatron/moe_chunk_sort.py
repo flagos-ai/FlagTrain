@@ -39,6 +39,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.runtime import torch_device_fn
+
 
 @triton.jit
 def _map_in_rows(
@@ -235,7 +237,7 @@ def moe_chunk_sort(inp, split_sizes, sorted_idxs, probs=None):
     grid, params = _plan(
         rows, src.shape[1], splits.numel(), width, *src.stride(), *dst.stride()
     )
-    with torch.cuda.device(inp.device):
+    with torch_device_fn.device(inp.device):
         if width:
             reordered = torch.empty_like(probabilities)
             _chunk_sort_probs_kernel[grid](

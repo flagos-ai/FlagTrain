@@ -51,9 +51,6 @@ def reference(inp, split_sizes, sorted_idxs, probs):
 
 
 OP_NAME = "moe_chunk_sort"
-pytestmark = pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
-)
 DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
