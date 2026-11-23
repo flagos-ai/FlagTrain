@@ -209,17 +209,15 @@ def _bernoulli_map(num_tokens, num_experts, dtype, density=0.2):
 def _assert_matches_mcore(res_out, routing_map, pad_multiple):
     """Hold the operator to Megatron's kernel on the backends that have it.
 
-    Both sides stay on the device, so this is a plain compare rather than one
-    through ``train_assert_equal`` (whose ``--ref cpu`` path requires a CPU ref).
+    Both sides go through ``utils.to_reference``: under ``--ref cpu`` the
+    comparison helper requires its reference on the CPU, and both operands here
+    are produced on the device.
     """
     if _mcore_fused_pad_routing_map is None:
         return
 
     mcore_out = _mcore_fused_pad_routing_map(routing_map, pad_multiple)
-    assert torch.equal(res_out, mcore_out), (
-        f"the Megatron oracle disagrees with the operator on "
-        f"shape={tuple(routing_map.shape)} pad_multiple={pad_multiple}"
-    )
+    utils.train_assert_equal(utils.to_reference(res_out), utils.to_reference(mcore_out))
 
 
 def _check(routing_map, pad_multiple):
@@ -383,9 +381,9 @@ def test_fused_pad_routing_map_dropped_tokens(
     counts_after = res.sum(dim=0)
     # These maps have far more zeros than any column needs, so each column gains
     # exactly the padding its own count asks for -- no more, no less.
-    assert torch.equal(counts_after - counts_before, (-counts_before) % pad_multiple), (
-        counts_before,
-        counts_after,
+    utils.train_assert_equal(
+        utils.to_reference(counts_after - counts_before),
+        utils.to_reference((-counts_before) % pad_multiple),
     )
 
 
@@ -403,7 +401,9 @@ def test_fused_pad_routing_map_non_contiguous(dtype):
     contiguous_out = flag_train.megatron.fused_pad_routing_map(
         routing_map.contiguous(), 32
     )
-    assert torch.equal(res_out, contiguous_out)
+    utils.train_assert_equal(
+        utils.to_reference(res_out), utils.to_reference(contiguous_out)
+    )
 
 
 @pytest.mark.fused_pad_routing_map
@@ -506,8 +506,11 @@ def test_fused_pad_routing_map_pad_forms_match_integer(pad_multiple):
     if _mcore_fused_pad_routing_map is not None:
         # Upstream's acceptance of these forms depends on Triton's argument
         # specialisation, so compare through the integer form it always takes.
-        assert torch.equal(
-            res, _mcore_fused_pad_routing_map(routing_map, int(pad_multiple))
+        utils.train_assert_equal(
+            utils.to_reference(res),
+            utils.to_reference(
+                _mcore_fused_pad_routing_map(routing_map, int(pad_multiple))
+            ),
         )
 
 
@@ -536,7 +539,10 @@ def test_fused_pad_routing_map_casts_like_upstream(dtype):
         utils.train_assert_equal(res, pad_routing_map_ref(ref_map, 8))
 
         if _mcore_fused_pad_routing_map is not None:
-            assert torch.equal(res, _mcore_fused_pad_routing_map(routing_map, 8))
+            utils.train_assert_equal(
+                utils.to_reference(res),
+                utils.to_reference(_mcore_fused_pad_routing_map(routing_map, 8)),
+            )
 
 
 # Values that make the input's conversion to int32 visible: a fraction that
@@ -610,7 +616,9 @@ def test_fused_pad_routing_map_contract(shape):
     assert res.dtype == torch.int32
     assert res.shape == shape
     assert res.stride() == (1, num_tokens), res.stride()
-    assert torch.equal(routing_map, original)
+    utils.train_assert_equal(
+        utils.to_reference(routing_map), utils.to_reference(original)
+    )
 
 
 @pytest.mark.fused_pad_routing_map
@@ -626,8 +634,11 @@ def test_fused_pad_routing_map_replays_deterministically():
 
     first = flag_train.megatron.fused_pad_routing_map(routing_map, 32)
     for _ in range(2):
-        assert torch.equal(
-            first, flag_train.megatron.fused_pad_routing_map(routing_map, 32)
+        utils.train_assert_equal(
+            utils.to_reference(first),
+            utils.to_reference(
+                flag_train.megatron.fused_pad_routing_map(routing_map, 32)
+            ),
         )
 
 
