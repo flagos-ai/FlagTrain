@@ -1,0 +1,325 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Ascend fused bias + SwiGLU (forward only).
+
+Same contract and arithmetic as ``flag_train.megatron.bias_swiglu_impl``; only
+the launch shape differs. The generic kernel launches one program per flattened
+row and loops over that row's column blocks, so a large token count needs one
+grid slot per row and can exceed Ascend's 65535-program ``coreDim`` limit.
+
+Here the grid is one program per vector core and each program walks the
+``(row, column block)`` tiles with a stride, so the launch stays far below that
+limit (the core benchmark's 16384-row case would otherwise launch 16384
+programs). Tiles never cross a row boundary, so the row and column block come
+from one scalar division per tile rather than a vector division per element.
+"""
+
+import logging
+import math
+import numbers
+
+import torch
+import triton
+import triton.language as tl
+
+from flag_train.runtime import device as runtime_device
+from flag_train.runtime import torch_device_fn
+from flag_train.runtime.backend._ascend.utils import CORE_NUM
+from flag_train.utils import libentry, tl_extra_shim
+from flag_train.utils import triton_lang_extension as tle
+
+logger = logging.getLogger(__name__)
+
+_BLOCK_SIZE = 1024
+_MIN_BLOCK_SIZE = 16
+_BIAS_SWIGLU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+_sigmoid = tl.sigmoid
+_tanh = tl_extra_shim.tanh
+
+_MODE_PLAIN = 0
+_MODE_CLAMPED = 1
+_MODE_SITU = 2
+
+_BIAS_NONE = 0
+_BIAS_VECTOR = 1
+_BIAS_FULL = 2
+
+
+def _check_input(tensor, name):
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} needs a tensor, got {type(tensor).__name__}")
+    if tensor.dtype not in _BIAS_SWIGLU_DTYPES:
+        wanted = " / ".join(str(dtype) for dtype in _BIAS_SWIGLU_DTYPES)
+        raise ValueError(f"{name} needs a {wanted} tensor, got {tensor.dtype}")
+    if tensor.device.type == "cpu":
+        raise ValueError(f"{name} needs a device tensor, not one on the CPU")
+    if tensor.device.type != runtime_device.name:
+        raise ValueError(
+            f"{name} needs a {runtime_device.name} tensor, got {tensor.device.type}"
+        )
+
+
+def _positive_scale(value, name):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(f"{name} needs a finite float, got {type(value).__name__}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be finite and greater than zero, got {value}")
+    return value
+
+
+def _resolve_variant(clamp_value, gate_clamp_scale, linear_clamp_scale):
+    """Pick the activation and validate the mutually exclusive clamps."""
+    if gate_clamp_scale is not None and clamp_value is not None:
+        raise ValueError("gate_clamp_scale and clamp_value cannot both be set")
+    if linear_clamp_scale is not None and gate_clamp_scale is None:
+        raise ValueError("linear_clamp_scale requires gate_clamp_scale")
+
+    if gate_clamp_scale is not None:
+        scale = _positive_scale(gate_clamp_scale, "gate_clamp_scale")
+        linear_scale = (
+            None
+            if linear_clamp_scale is None
+            else _positive_scale(linear_clamp_scale, "linear_clamp_scale")
+        )
+        return _MODE_SITU, scale, linear_scale
+
+    if clamp_value is not None:
+        return _MODE_CLAMPED, _positive_scale(clamp_value, "clamp_value"), None
+
+    return _MODE_PLAIN, None, None
+
+
+def _prepare_bias(bias, flat):
+    """Return a kernel bias tensor and a mode.
+
+    Mode vector is one row of ``hidden`` values shared by every token, which is
+    the ``bias`` produced by ``skip_bias_add``. Mode full is a different bias
+    per element and is only used when the tensor really depends on the token
+    index.
+    """
+    if bias is None:
+        return None, _BIAS_NONE
+    _check_input(bias, "bias_swiglu bias")
+    if bias.device != flat.device:
+        raise ValueError(
+            f"bias_swiglu bias is on {bias.device}, expected {flat.device}"
+        )
+    if bias.dtype != flat.dtype:
+        raise ValueError(
+            "bias_swiglu bias must have the input dtype, got "
+            f"{bias.dtype} for {flat.dtype}"
+        )
+
+    n_rows, hidden = flat.shape
+    flat_shape = (n_rows, hidden)
+    try:
+        expanded = torch.broadcast_to(bias, flat_shape)
+    except RuntimeError:
+        raise ValueError(
+            "bias_swiglu bias must broadcast with the flattened input "
+            f"{flat_shape}, got {tuple(bias.shape)}"
+        ) from None
+    # Empty inputs still reach this point so a bad bias is rejected. Keep the
+    # guard before indexing a row: with no rows there is no row 0 to copy.
+    if n_rows == 0 or hidden == 0:
+        return bias, _BIAS_VECTOR
+    if expanded.stride(0) == 0:
+        # Same values on every token. Copy one row, not the whole broadcast.
+        return expanded[0].contiguous(), _BIAS_VECTOR
+    return expanded.contiguous(), _BIAS_FULL
+
+
+@triton.jit
+def _activate(
+    gate,
+    linear,
+    clamp_value,
+    gate_scale,
+    linear_scale,
+    MODE: tl.constexpr,
+    HAS_LINEAR_CLAMP: tl.constexpr,
+):
+    """Forward value of one gate/linear pair, in fp32."""
+    if MODE == 0:
+        return gate * _sigmoid(gate) * linear
+    if MODE == 1:
+        gate_c = tl.minimum(gate, clamp_value)
+        linear_c = tl.minimum(tl.maximum(linear, -clamp_value), clamp_value)
+        # torch.clamp propagates NaN; tl.minimum/maximum default to
+        # minnum/maxnum, which replace NaN with the clamp bound. Restore the
+        # NaN so the clamped variant matches Megatron-LM's clamped_swiglu.
+        gate_c = tl.where(gate != gate, gate, gate_c)
+        linear_c = tl.where(linear != linear, linear, linear_c)
+        return gate_c * _sigmoid(gate_c) * linear_c
+    t = _tanh(gate / gate_scale)
+    gate_v = (gate_scale * t) * _sigmoid(gate)
+    if HAS_LINEAR_CLAMP:
+        lin = linear_scale * _tanh(linear / linear_scale)
+    else:
+        lin = linear
+    return gate_v * lin
+
+
+@libentry()
+@triton.jit
+def _bias_swiglu_forward_kernel(
+    x_ptr,
+    bias_ptr,
+    y_ptr,
+    n_tiles,
+    blocks_per_row,
+    n_cols,
+    clamp_value,
+    gate_scale,
+    linear_scale,
+    BIAS_MODE: tl.constexpr,
+    MODE: tl.constexpr,
+    HAS_LINEAR_CLAMP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    hidden = n_cols * 2
+    num_programs = tl.num_programs(0)
+    # Persistent walk: the grid is bounded by the core count, not by the number
+    # of (row, column block) tiles. Every program visits several tiles.
+    for tile in range(tle.program_id(0), n_tiles, num_programs):
+        row = tile // blocks_per_row
+        cols = (tile % blocks_per_row) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < n_cols
+        x_row = x_ptr + row * hidden
+        gate = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+        linear = tl.load(x_row + n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+        if BIAS_MODE == 1:
+            gate += tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            linear += tl.load(bias_ptr + n_cols + cols, mask=mask, other=0.0).to(
+                tl.float32
+            )
+        elif BIAS_MODE == 2:
+            bias_row = bias_ptr + row * hidden
+            gate += tl.load(bias_row + cols, mask=mask, other=0.0).to(tl.float32)
+            linear += tl.load(bias_row + n_cols + cols, mask=mask, other=0.0).to(
+                tl.float32
+            )
+        out = _activate(
+            gate,
+            linear,
+            clamp_value,
+            gate_scale,
+            linear_scale,
+            MODE,
+            HAS_LINEAR_CLAMP,
+        )
+        tl.store(y_ptr + row * n_cols + cols, out.to(y_ptr.dtype.element_ty), mask=mask)
+
+
+def _block_size(n_cols):
+    """Power-of-two column tile."""
+    return max(_MIN_BLOCK_SIZE, min(_BLOCK_SIZE, triton.next_power_of_2(n_cols)))
+
+
+def _flatten_input(x):
+    _check_input(x, "bias_swiglu")
+    if x.ndim not in (2, 3):
+        raise ValueError(
+            f"bias_swiglu input must have rank 2 or 3, got rank {x.ndim} "
+            f"shape {tuple(x.shape)}"
+        )
+    hidden = x.shape[-1]
+    if hidden % 2 != 0:
+        raise ValueError(
+            f"bias_swiglu input's last dimension must be even, got {hidden}"
+        )
+    flat = x.contiguous().view(-1, hidden)
+    out_shape = (*x.shape[:-1], hidden // 2)
+    return flat, out_shape
+
+
+def _forward(flat, bias, mode, scale, linear_scale):
+    """Run the kernel over a flattened ``[rows, hidden]`` view.
+
+    The bias is validated before the empty-input shortcut, so an empty call
+    rejects a bad bias exactly like a non-empty one.
+    """
+    n_rows, hidden = flat.shape
+    n_cols = hidden // 2
+    bias_tensor, bias_mode = _prepare_bias(bias, flat)
+    if n_rows == 0 or n_cols == 0:
+        return flat.new_empty((n_rows, n_cols))
+
+    block = _block_size(n_cols)
+    blocks_per_row = triton.cdiv(n_cols, block)
+    n_tiles = n_rows * blocks_per_row
+    y = flat.new_empty((n_rows, n_cols))
+    # One program per vector core, far below Ascend's 65535-program coreDim
+    # limit; the kernel's tile walk covers the rest.
+    grid = (min(n_tiles, CORE_NUM),)
+    with torch_device_fn.device(flat.device):
+        _bias_swiglu_forward_kernel[grid](
+            flat,
+            # The constexpr mode stops the kernel from reading this pointer,
+            # but Triton still type-checks the argument, so reuse ``flat``.
+            flat if bias_tensor is None else bias_tensor,
+            y,
+            n_tiles,
+            blocks_per_row,
+            n_cols,
+            0.0 if mode != _MODE_CLAMPED else scale,
+            1.0 if mode != _MODE_SITU else scale,
+            1.0 if linear_scale is None else linear_scale,
+            BIAS_MODE=bias_mode,
+            MODE=mode,
+            HAS_LINEAR_CLAMP=linear_scale is not None,
+            BLOCK=block,
+        )
+    return y
+
+
+def bias_swiglu_impl(
+    input,
+    bias,
+    fp8_input_store=False,
+    cpu_offload_input=False,
+    clamp_value=None,
+    gate_clamp_scale=None,
+    linear_clamp_scale=None,
+):
+    """Bias plus SwiGLU, or SiTU-GLU when ``gate_clamp_scale`` is set.
+
+    Forward only: the backward is a separate operator. Same signature,
+    arithmetic and validation as ``flag_train.megatron.bias_swiglu_impl``; only
+    the launch shape differs -- see this module's docstring.
+    """
+    logger.debug("TRAIN_ASCEND BIAS_SWIGLU_IMPL")
+    if bias is not None and not isinstance(bias, torch.Tensor):
+        raise TypeError(
+            f"bias_swiglu bias needs a tensor or None, got {type(bias).__name__}"
+        )
+    if fp8_input_store or cpu_offload_input:
+        raise NotImplementedError(
+            "bias_swiglu_impl is forward-only; fp8_input_store and "
+            "cpu_offload_input only affected the activations saved for the "
+            "backward"
+        )
+
+    flat, out_shape = _flatten_input(input)
+    mode, scale, linear_scale = _resolve_variant(
+        clamp_value, gate_clamp_scale, linear_clamp_scale
+    )
+    y = _forward(flat, bias, mode, scale, linear_scale)
+    # Megatron-LM restores the 3-D shape with ``view(ori_shape[0],
+    # ori_shape[1], -1)``. The ``-1`` is ambiguous for a 0-element tensor, so a
+    # 3-D input whose leading dimensions contain zero raises RuntimeError.
+    # Keep that behavior: this operator mirrors the upstream entry point.
+    return y if input.ndim == 2 else y.view(out_shape[0], out_shape[1], -1)

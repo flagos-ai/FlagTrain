@@ -14,18 +14,13 @@
 """Performance benchmark for Megatron Quick GELU.
 
 The baseline is Megatron-LM's ``megatron.core.activations.quick_gelu``, the
-vendor implementation this operator ports. Megatron defines it as the torch
-composition ``x * sigmoid(1.702 * x)`` wrapped in ``jit_fuser``
-(``torch.compile``); the composition is the vendor's own implementation, so it
-is a valid on-machine baseline. When Megatron-LM is not installed, that exact
-composition is timed instead. Timing, warmup and synchronization come from
-``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode).
-``--level core`` runs the small, medium and large shapes below;
+vendor implementation this operator ports. When Megatron-LM is unavailable the
+benchmark has no native baseline: ``torch_op`` is ``None`` and ``--base-data``
+is the only comparison, rather than timing a torch composition. Timing, warmup
+and synchronization come from ``benchmark/base.py`` (``triton.testing.do_bench``
+in kernel mode). ``--level core`` runs the small, medium and large shapes below;
 ``--level comprehensive`` adds the extra shapes.
 """
-
-import os
-import warnings
 
 import pytest
 import torch
@@ -46,27 +41,21 @@ _CORE_SHAPES = [
 ]
 
 
-def quick_gelu_ref(x):
-    """Megatron-LM's ``quick_gelu`` body; timed when Megatron is unavailable."""
-    return x * torch.sigmoid(1.702 * x)
-
-
 def _load_mcore_quick_gelu():
-    """Megatron's ``quick_gelu``, or the composition it is defined as."""
+    """Megatron's ``quick_gelu``, or ``None`` when it cannot be imported."""
     try:
         from megatron.core.activations import quick_gelu
-    except ImportError:
-        warnings.warn(
-            "Megatron-LM is unavailable; timing its torch composition as the "
-            "benchmark baseline",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return quick_gelu_ref, "torch composition of megatron-core quick_gelu"
-    return quick_gelu, "megatron-core quick_gelu (@jit_fuser)"
+    except Exception:
+        return None
+    return quick_gelu
 
 
-torch_op, _BASELINE = _load_mcore_quick_gelu()
+torch_op = _load_mcore_quick_gelu()
+_BASELINE = (
+    "megatron-core quick_gelu (@jit_fuser)"
+    if torch_op is not None
+    else "none (no on-machine baseline; --base-data is the only comparison)"
+)
 
 
 def _dtypes():
@@ -104,11 +93,6 @@ def _run(is_backward):
         is_backward=is_backward,
     )
     bench.set_train(flag_train.megatron.quick_gelu)
-    # On Ascend, enable parallel scheduling of all blocks to avoid excessive logical cores
-    # and reduce scheduling overhead when the logical core count exceeds 65,535.
-    # See https://github.com/flagos-ai/FlagGems/pull/7304
-    if flag_train.vendor_name == "ascend":
-        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
     bench.run()
 
 

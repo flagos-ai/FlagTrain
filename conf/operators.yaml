@@ -583,8 +583,9 @@ ops:
   stages:
   - beta: '0.0.0'
 - id: weighted_squared_relu_impl
-  description: Squared-ReLU activation with optional per-token weights and an optional
-    tanh soft clamp. Forward only.
+  description: Squared-ReLU activation with optional broadcastable real-valued weights
+    and an optional real tanh soft clamp. Forward only; complex weights and clamp
+    scales are rejected.
   for:
   - weighted_squared_relu_impl
   labels:

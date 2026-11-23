@@ -121,7 +121,13 @@ def weighted_squared_relu_ref(x, weights=None, clamp_scale=None):
         act = torch.pow(torch.relu(flat), 2)
     if weights is not None:
         act = act * weights
-    return act.to(x.dtype).reshape(ori_shape)
+    act = act.to(x.dtype)
+    # Megatron returns the broadcast result as-is for a 2-D input and only
+    # reshapes the token axis back for 3-D; mirror that so this composition can
+    # stand in for it as an oracle when Megatron is unavailable.
+    if len(ori_shape) == 2:
+        return act
+    return act.view(ori_shape[0], ori_shape[1], -1)
 
 
 # The backends this operator ships on. Megatron-LM is the required baseline
