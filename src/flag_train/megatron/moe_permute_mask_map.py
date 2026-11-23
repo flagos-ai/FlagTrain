@@ -34,6 +34,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.runtime import torch_device_fn
+
 
 @triton.jit
 def _moe_permute_fused(
@@ -159,7 +161,7 @@ def _moe_permute_fused(
 def moe_permute_mask_map(
     inp, routing_map, num_out_tokens, probs=None, pad_offsets=None
 ):
-    with torch.cuda.device(inp.device):
+    with torch_device_fn.device(inp.device):
         return _run_contiguous(
             inp.contiguous(),
             routing_map.contiguous(),
