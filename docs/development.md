@@ -70,3 +70,19 @@ pytest benchmark -m "lamb" --level core --record json \
   `accuracy_result.json` 与 `benchmark_result.json`；`--record log` 则写 `result_*.log`。
 * `--continue-on-collection-errors` 在某个模块导入失败时（例如某平台缺少参考实现所需的包）
   仍继续收集其余用例，`-vs` 打印每个用例名与输出，适合定位单平台问题。
+
+### 单 case profile
+
+对支持 `--list-cases` 的 benchmark，先获取 workload ID，再从清单中选一条回放。
+列举和回放使用同一个 benchmark 文件、`--level` 和 dtype 选择。
+
+```sh
+pytest "$BENCHMARK_FILE" --level core --list-cases --output cases.json
+pytest "$BENCHMARK_FILE" --level core --profile-only --case-id "$CASE_ID" \
+    --profile-warmup 10 --profile-iterations 1
+```
+
+回放使用 benchmark 的 `train_op`，可通过已有的 `--override` 替换公开算子。
+pytest 插件可实现 `pytest_flaggems_profile_scope(backend, case_id)`，返回包住候选调用和
+设备同步的 context manager。输入构造、预热和反向建图都在采集窗口之外。未安装插件时，
+命令会直接回放候选。profile 模式不生成 benchmark 计时或 baseline 报告。
