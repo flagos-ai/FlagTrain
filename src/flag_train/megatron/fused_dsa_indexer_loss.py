@@ -31,6 +31,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.runtime import torch_device_fn
+
 _NEG_INF = tl.constexpr(float("-inf"))
 _TINY = tl.constexpr(1e-10)
 
@@ -554,7 +556,7 @@ def fused_dsa_indexer_loss(
     BLOCK_DH = max(16, triton.next_power_of_2(Dh))
 
     grid = (triton.cdiv(Sq, BLOCK_S), B)
-    with torch.cuda.device(q.device):
+    with torch_device_fn.device(q.device):
         _dsa_row_kernel[grid](
             q,
             weights,

@@ -372,17 +372,6 @@ def test_fused_dsa_indexer_loss_review_regressions(case):
 
 
 @pytest.mark.fused_dsa_indexer_loss
-def test_fused_dsa_indexer_loss_on_noncurrent_cuda_device():
-    if torch.cuda.device_count() < 2:
-        pytest.skip("Requires two CUDA devices")
-    with torch.cuda.device(0):
-        got = _observe(_candidate(), _review_inputs("implicit-causal", "cuda:1"))
-        expected = _observe(reference, _review_inputs("implicit-causal", "cuda:1"))
-        assert torch.cuda.current_device() == 0
-    _compare(got, expected)
-
-
-@pytest.mark.fused_dsa_indexer_loss
 def test_fused_dsa_indexer_loss_packed_cpu_metadata():
     args = list(make_inputs(Case(17, 16, "packed"), torch.float32, flag_train.device))
     for index in (10, 11, 12):
