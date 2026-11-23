@@ -159,9 +159,6 @@ def _build(plan, dtype, device):
     return args
 
 
-@pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
-)
 @pytest.mark.fused_mla_rope_inplace
 def test_fused_mla_rope_inplace_benchmark():
     bench = OperatorBenchmark(

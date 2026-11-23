@@ -79,9 +79,6 @@ def reference(
 
 
 OP_NAME = "fused_mla_rope_inplace"
-pytestmark = pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
-)
 DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
