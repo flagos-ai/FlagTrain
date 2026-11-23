@@ -27,7 +27,8 @@ def moe_aux_loss_auto_scaler_backward(grad_output, aux_loss, loss_scale=None):
     if (
         torch.is_tensor(scale)
         and scale.ndim == 0
-        and aux_loss.is_cuda
+        and aux_loss.layout == torch.strided
+        and scale.layout == torch.strided
         and scale.device == aux_loss.device
         and aux_loss.dtype in _FLOAT_DTYPES
         and scale.dtype in _FLOAT_DTYPES
