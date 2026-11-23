@@ -23,14 +23,11 @@ import torch.nn.functional as F
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.runtime import torch_device_fn
 
 
-def is_ppu(tensor):
-    if tensor.device.type != "cuda":
-        return False
-    from flag_train import vendor_name
-
-    return vendor_name == "thead"
+def _is_ppu(tensor):
+    return flag_train.vendor_name == "thead" and tensor.device.type == flag_train.device
 
 
 def _tf32_rne(a):
@@ -56,7 +53,7 @@ def reference(inp, m_splits, weights, biases=None):
     if isinstance(m_splits, torch.Tensor):
         m_splits = m_splits.tolist()
     chunks = inp.split(m_splits)
-    linear = _ppu_linear if is_ppu(inp) else F.linear
+    linear = _ppu_linear if _is_ppu(inp) else F.linear
     return torch.cat(
         [
             linear(chunk, weights[i], None if biases is None else biases[i])
@@ -66,9 +63,6 @@ def reference(inp, m_splits, weights, biases=None):
 
 
 OP_NAME = "grouped_linear"
-pytestmark = pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
-)
 DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
@@ -227,12 +221,18 @@ def test_grouped_linear_review_regressions(case):
 
 @pytest.mark.grouped_linear
 def test_grouped_linear_large_row_offset():
-    if torch.cuda.mem_get_info()[0] < 8 * 1024**3:
+    candidate = _candidate()
+    device = torch.device(flag_train.device)
+    try:
+        free_memory, _ = torch_device_fn.mem_get_info(device)
+    except (AttributeError, RuntimeError):
+        pytest.skip("Cannot query free memory on the test device")
+    if free_memory < 8 * 1024**3:
         pytest.skip("Requires at least 8 GiB free on the test device")
-    inputs = torch.zeros((524289, 4096), device=flag_train.device, dtype=torch.float16)
+    inputs = torch.zeros((524289, 4096), device=device, dtype=torch.float16)
     inputs[-1, 0] = 1
     weights = inputs.new_ones((1, 1, 4096))
-    actual = _candidate()(inputs, [len(inputs)], weights)
+    actual = candidate(inputs, [len(inputs)], weights)
     expected = inputs.new_zeros((len(inputs), 1))
     expected[-1, 0] = 1
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -242,11 +242,13 @@ def test_grouped_linear_large_row_offset():
 @pytest.mark.parametrize(
     "first_dtype,second_dtype", [(torch.int64, torch.int32), (torch.int32, torch.int64)]
 )
-def test_grouped_linear_switch_split_dtype(first_dtype, second_dtype):
+@pytest.mark.parametrize("host_splits", [False, True], ids=["device", "cpu"])
+def test_grouped_linear_switch_split_dtype(first_dtype, second_dtype, host_splits):
     device = flag_train.device
     inp = torch.arange(128, dtype=torch.float32, device=device).reshape(8, 16)
     weights = torch.ones((2, 4, 16), device=device)
     fn = _candidate()
+    splits_device = "cpu" if host_splits else device
     for dtype in (first_dtype, second_dtype):
-        args = (inp, torch.tensor([3, 5], dtype=dtype, device=device), weights)
+        args = (inp, torch.tensor([3, 5], dtype=dtype, device=splits_device), weights)
         _compare(_observe(fn, args), _observe(reference, args))

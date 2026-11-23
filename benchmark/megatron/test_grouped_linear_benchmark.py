@@ -69,9 +69,6 @@ def _build(plan, dtype, device):
     return args
 
 
-@pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
-)
 @pytest.mark.grouped_linear
 def test_grouped_linear_benchmark():
     bench = OperatorBenchmark(

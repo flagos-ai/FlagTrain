@@ -25,6 +25,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.runtime import torch_device_fn
+
 _HPAD = 4  # host split scalars carried in the kernel signature
 
 
@@ -142,7 +144,7 @@ def _blocks(n_rows, N, K):
 
 
 def grouped_linear(inp, m_splits, weights, biases=None):
-    with torch.cuda.device(inp.device):
+    with torch_device_fn.device(inp.device):
         return _run_contiguous(
             inp.contiguous(),
             m_splits.contiguous() if torch.is_tensor(m_splits) else m_splits,
@@ -164,12 +166,10 @@ def _run_contiguous(inp, m_splits, weights, biases):
     dt = inp.dtype
     has_bias = biases is not None
     b_arg = biases if has_bias else inp
-    dev_splits = m_splits if torch.is_tensor(m_splits) and m_splits.is_cuda else None
-    splits_arg = m_splits if dev_splits is not None else inp
-    if dev_splits is None:
+    dev_splits = torch.is_tensor(m_splits) and m_splits.device == inp.device
+    splits_arg = m_splits if dev_splits else inp
+    if not dev_splits:
         hsplits = _seq_from(m_splits)
-
-    if dev_splits is None:
         G = len(hsplits)
         if G == 0:
             return out
@@ -192,7 +192,7 @@ def _run_contiguous(inp, m_splits, weights, biases):
             return out
         vals = tuple(starts) + (T,) * (_HPAD - G)
     else:
-        G = int(dev_splits.numel())
+        G = m_splits.numel()
         if G == 0:
             return out
         vals = (0,) * _HPAD
@@ -201,8 +201,7 @@ def _run_contiguous(inp, m_splits, weights, biases):
     is_fp32 = dt is torch.float32
     bm, bn, bk = _blocks(n_rows, N, K)
     grid = (-(-n_rows // bm), -(-N // bn), G)
-    dev_flag = dev_splits is not None
-    consts = vals + (bm, bn, bk, G, has_bias, dev_flag, is_fp32)
+    consts = vals + (bm, bn, bk, G, has_bias, dev_splits, is_fp32)
     _grouped_linear_kernel[grid](
         inp,
         weights,
