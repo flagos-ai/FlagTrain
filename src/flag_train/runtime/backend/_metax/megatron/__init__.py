@@ -25,5 +25,9 @@ overrides.
 """
 
 from .fused_gated_norm import fused_gated_norm
+from .weighted_swiglu_funciton import weighted_swiglu_funciton
 
-__all__ = ["fused_gated_norm"]
+__all__ = [
+    "fused_gated_norm",
+    "weighted_swiglu_funciton",
+]

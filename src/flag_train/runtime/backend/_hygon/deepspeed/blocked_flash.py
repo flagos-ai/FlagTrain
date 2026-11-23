@@ -40,7 +40,7 @@ from flag_train.utils import libentry
 logger = logging.getLogger(__name__)
 
 
-_NUM_STAGES = 3
+_NUM_STAGES = 2
 
 
 def _shared_memory_for(block_m, block_n, block_d, element_size, num_stages=_NUM_STAGES):
@@ -106,6 +106,75 @@ def _warp_size(device_index):
     return int(size) if size else 32
 
 
+@triton.jit
+def _kv_tile(
+    q,
+    k_ptr,
+    v_ptr,
+    k_block_row_base,
+    v_block_row_base,
+    offs_n,
+    kv_pos,
+    total_extent,
+    global_q_pos,
+    qk_scale,
+    m_i,
+    l_i,
+    acc,
+    k_row_stride,
+    v_row_stride,
+    hk,
+    offs_d,
+    d_mask,
+    MASKED: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """One ``BLOCK_N``-wide KV tile, folded into the running softmax state.
+
+    ``MASKED`` is false in the peeled loop, where neither the causal nor the
+    extent mask can fire. Both cache tiles are read transposed (contiguous on
+    the head dimension); ``v`` is turned round for the PV dot.
+    """
+    n_mask = kv_pos < total_extent
+
+    kT = tl.load(
+        k_ptr
+        + k_block_row_base
+        + hk * HEAD_SIZE
+        + offs_d[:, None]
+        + offs_n[None, :] * k_row_stride,
+        mask=d_mask[:, None] & n_mask[None, :] if MASKED else d_mask[:, None],
+        other=0.0,
+    )
+
+    qk = tl.dot(q, kT) * qk_scale
+    if MASKED:
+        # A query attends to every KV position up to and including its own.
+        qk = tl.where(kv_pos[None, :] <= global_q_pos[:, None], qk, float("-inf"))
+        qk = tl.where(n_mask[None, :], qk, float("-inf"))
+
+    m_new = tl.maximum(m_i, tl.max(qk, 1))
+    alpha = tl.exp2(m_i - m_new)
+    p = tl.exp2(qk - m_new[:, None])
+
+    v = tl.load(
+        v_ptr
+        + v_block_row_base
+        + hk * HEAD_SIZE
+        + offs_d[:, None]
+        + offs_n[None, :] * v_row_stride,
+        mask=d_mask[:, None] & n_mask[None, :] if MASKED else d_mask[:, None],
+        other=0.0,
+    )
+    v = tl.trans(v)
+
+    l_i = l_i * alpha + tl.sum(p, 1)
+    acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+
+    return m_new, l_i, acc
+
+
 @libentry()
 @triton.jit
 def _blocked_flash_fwd_kernel(
@@ -163,7 +232,13 @@ def _blocked_flash_fwd_kernel(
     l_i = tl.zeros((BLOCK_M,), tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
-    for b in range(0, kv_blocks):
+    # Leading blocks whose extent and causal masks cannot fire are walked by the
+    # unmasked loop below; only the diagonal blocks pay for the masks.
+    peeled = total_extent // KV_BLOCK_SIZE
+    peeled = tl.minimum(peeled, (global_q_idx + 1) // KV_BLOCK_SIZE)
+    peeled = tl.minimum(peeled, kv_blocks)
+
+    for b in range(0, peeled):
         block = tl.load(block_ptr + b)
         k_block_row_base = block * k_row_stride * KV_BLOCK_SIZE
         v_block_row_base = block * v_row_stride * KV_BLOCK_SIZE
@@ -171,38 +246,61 @@ def _blocked_flash_fwd_kernel(
         for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
             offs_n = t0 + tl.arange(0, BLOCK_N)
             kv_pos = b * KV_BLOCK_SIZE + offs_n
-            n_mask = kv_pos < total_extent
-
-            k_ptrs = (
-                k_ptr
-                + k_block_row_base
-                + hk * HEAD_SIZE
-                + offs_d[:, None]
-                + offs_n[None, :] * k_row_stride
+            m_i, l_i, acc = _kv_tile(
+                q,
+                k_ptr,
+                v_ptr,
+                k_block_row_base,
+                v_block_row_base,
+                offs_n,
+                kv_pos,
+                total_extent,
+                global_q_pos,
+                qk_scale,
+                m_i,
+                l_i,
+                acc,
+                k_row_stride,
+                v_row_stride,
+                hk,
+                offs_d,
+                d_mask,
+                MASKED=False,
+                HEAD_SIZE=HEAD_SIZE,
+                BLOCK_N=BLOCK_N,
             )
-            kT = tl.load(k_ptrs, mask=d_mask[:, None] & n_mask[None, :], other=0.0)
 
-            qk = tl.dot(q, kT) * qk_scale
-            # A query attends to every KV position up to and including its own.
-            qk = tl.where(kv_pos[None, :] <= global_q_pos[:, None], qk, float("-inf"))
-            qk = tl.where(n_mask[None, :], qk, float("-inf"))
+    for b in range(peeled, kv_blocks):
+        block = tl.load(block_ptr + b)
+        k_block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        v_block_row_base = block * v_row_stride * KV_BLOCK_SIZE
 
-            m_new = tl.maximum(m_i, tl.max(qk, 1))
-            alpha = tl.exp2(m_i - m_new)
-            p = tl.exp2(qk - m_new[:, None])
-
-            v_ptrs = (
-                v_ptr
-                + v_block_row_base
-                + offs_n[:, None] * v_row_stride
-                + hk * HEAD_SIZE
-                + offs_d[None, :]
+        for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
+            offs_n = t0 + tl.arange(0, BLOCK_N)
+            kv_pos = b * KV_BLOCK_SIZE + offs_n
+            m_i, l_i, acc = _kv_tile(
+                q,
+                k_ptr,
+                v_ptr,
+                k_block_row_base,
+                v_block_row_base,
+                offs_n,
+                kv_pos,
+                total_extent,
+                global_q_pos,
+                qk_scale,
+                m_i,
+                l_i,
+                acc,
+                k_row_stride,
+                v_row_stride,
+                hk,
+                offs_d,
+                d_mask,
+                MASKED=True,
+                HEAD_SIZE=HEAD_SIZE,
+                BLOCK_N=BLOCK_N,
             )
-            v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
-
-            l_i = l_i * alpha + tl.sum(p, 1)
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-            m_i = m_new
 
     # A row whose keys were all masked out has no contribution to renormalize.
     l_i = tl.where(l_i == 0.0, 1.0, l_i)

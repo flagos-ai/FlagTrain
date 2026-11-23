@@ -65,6 +65,9 @@ _GRAD_STAGES = 2
 
 _GRAD_BLOCK_M = 32
 _GRAD_BLOCK_K = 128
+# Merged M tiles: 4x fewer dots, amortized per-dot overhead.
+_GRAD_WEIGHT_BLOCK_M = 128
+_GRAD_X_BLOCK_M = 128
 
 # Triton allocates one shared buffer per pipelined tile per stage; keep the
 # matmul kernels within the smallest limit among the supported platforms.
@@ -73,6 +76,20 @@ _TARGET_GRAD_WEIGHT_PROGRAMS = 128
 
 _MIN_BLOCK_N = 16
 _BACKWARD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+_AICORE_NUM = None
+
+
+def _aicore_num():
+    """Physical AI-core count."""
+    global _AICORE_NUM
+    if _AICORE_NUM is None:
+        import torch_npu
+        import triton.runtime.driver as driver
+
+        device = torch_npu.npu.current_device()
+        _AICORE_NUM = driver.active.utils.get_device_properties(device)["num_aicore"]
+    return _AICORE_NUM
 
 
 def _check_input(tensor, name, dtypes=None):
@@ -275,6 +292,7 @@ def _grad_x_kernel(
     M,
     K,
     N: tl.constexpr,
+    NUM_K_TILES: tl.constexpr,
     FP32_INPUT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -283,49 +301,58 @@ def _grad_x_kernel(
 ):
     """grad_x = grad_proj @ weight + grad_r_total * x / (r * K).
 
-    Grid: (ceil(M / BLOCK_M), ceil(K / BLOCK_K)); each tile is independent.
+    Persistent 1-D grid capped at the AI-core count.
     """
-    pid_m = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = rows < M
-    cols = tl.arange(0, BLOCK_N)
-    col_mask = cols < N
-    ks = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    k_mask = ks < K
-    rows64 = rows.to(tl.int64)
+    pid = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+    num_m_tiles = tl.cdiv(M, BLOCK_M)
+    total_tiles = num_m_tiles * NUM_K_TILES
+    tiles_per_prog = tl.cdiv(total_tiles, num_progs)
+    start = pid * tiles_per_prog
+    end = tl.minimum(total_tiles, start + tiles_per_prog)
 
-    grad_proj = tl.load(
-        grad_proj_ptr + rows64[:, None] * N + cols[None, :],
-        mask=row_mask[:, None] & col_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    weight_tile = tl.load(
-        weight_ptr + cols[:, None] * K + ks[None, :],
-        mask=col_mask[:, None] & k_mask[None, :],
-        other=0.0,
-    )
-    if FP32_INPUT:
-        acc = tl.dot(grad_proj, weight_tile.to(tl.float32))
-    else:
-        acc = tl.dot(grad_proj.to(weight_tile.dtype), weight_tile)
+    for tile in tl.range(start, end, num_stages=1):
+        pid_m = tile // NUM_K_TILES
+        pid_k = tile - pid_m * NUM_K_TILES
+        rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        row_mask = rows < M
+        cols = tl.arange(0, BLOCK_N)
+        col_mask = cols < N
+        ks = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = ks < K
+        rows64 = rows.to(tl.int64)
 
-    grad_r_total = tl.load(grad_r_total_ptr + rows, mask=row_mask, other=0.0).to(
-        tl.float32
-    )
-    r = tl.load(r_ptr + rows, mask=row_mask, other=1.0).to(tl.float32)
-    coef = grad_r_total / (r * K.to(tl.float32))
-    x_tile = tl.load(
-        x_ptr + rows64[:, None] * K + ks[None, :],
-        mask=row_mask[:, None] & k_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    acc += coef[:, None] * x_tile
-    tl.store(
-        grad_x_ptr + rows64[:, None] * K + ks[None, :],
-        acc,
-        mask=row_mask[:, None] & k_mask[None, :],
-    )
+        grad_proj = tl.load(
+            grad_proj_ptr + rows64[:, None] * N + cols[None, :],
+            mask=row_mask[:, None] & col_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        weight_tile = tl.load(
+            weight_ptr + cols[:, None] * K + ks[None, :],
+            mask=col_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        if FP32_INPUT:
+            acc = tl.dot(grad_proj, weight_tile.to(tl.float32))
+        else:
+            acc = tl.dot(grad_proj.to(weight_tile.dtype), weight_tile)
+
+        grad_r_total = tl.load(grad_r_total_ptr + rows, mask=row_mask, other=0.0).to(
+            tl.float32
+        )
+        r = tl.load(r_ptr + rows, mask=row_mask, other=1.0).to(tl.float32)
+        coef = grad_r_total / (r * K.to(tl.float32))
+        x_tile = tl.load(
+            x_ptr + rows64[:, None] * K + ks[None, :],
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += coef[:, None] * x_tile
+        tl.store(
+            grad_x_ptr + rows64[:, None] * K + ks[None, :],
+            acc,
+            mask=row_mask[:, None] & k_mask[None, :],
+        )
 
 
 @libentry()
@@ -459,6 +486,32 @@ def _dot_config(N, K, x_itemsize, weight_itemsize):
     while stages > 1 and shared(block_k, stages) > _SHARED_MEMORY_BUDGET:
         stages -= 1
     return block_m, block_n, block_k, stages
+
+
+def _grad_x_block_m(block_n, block_k, x_itemsize, weight_itemsize, stages):
+    """BLOCK_M for ``_grad_x_kernel`` under the shared-memory budget."""
+    block_m = _GRAD_X_BLOCK_M
+    while block_m > _GRAD_BLOCK_M:
+        per_stage = (
+            block_m * block_k * x_itemsize
+            + block_k * block_n * weight_itemsize
+            + block_m * block_n * 4
+        )
+        if stages * per_stage <= _SHARED_MEMORY_BUDGET:
+            break
+        block_m //= 2
+    return block_m
+
+
+def _grad_weight_block_m(block_n, block_k, x_itemsize, stages):
+    """BLOCK_M for ``_grad_weight_kernel`` under the shared-memory budget."""
+    block_m = _GRAD_WEIGHT_BLOCK_M
+    while block_m > _GRAD_BLOCK_M:
+        per_stage = block_m * block_k * x_itemsize + block_m * block_n * 4
+        if stages * per_stage <= _SHARED_MEMORY_BUDGET:
+            break
+        block_m //= 2
+    return block_m
 
 
 def _grad_weight_split(M, K, block_m, block_k):
@@ -605,7 +658,11 @@ def fused_proj_rms_compute_h_backward(
     block_m, block_n, block_k, stages = _dot_config(
         N, K, x.element_size(), weight.element_size()
     )
-    split_m = _grad_weight_split(M, K, block_m, block_k)
+    weight_block_m = _grad_weight_block_m(block_n, block_k, x.element_size(), stages)
+    x_block_m = _grad_x_block_m(
+        block_n, block_k, x.element_size(), weight.element_size(), stages
+    )
+    split_m = _grad_weight_split(M, K, weight_block_m, block_k)
 
     num_blocks = triton.cdiv(M, block_m)
     grad_proj = torch.empty(M, N, dtype=torch.float32, device=device)
@@ -649,7 +706,10 @@ def fused_proj_rms_compute_h_backward(
             BLOCK_N=block_n,
             num_warps=_NUM_WARPS,
         )
-        _grad_x_kernel[(triton.cdiv(M, block_m), triton.cdiv(K, block_k))](
+        # Persistent 1-D grid capped at the AI-core count.
+        num_k_tiles = triton.cdiv(K, block_k)
+        grid_x = min(triton.cdiv(M, x_block_m) * num_k_tiles, _aicore_num())
+        _grad_x_kernel[(grid_x,)](
             x,
             weight,
             grad_proj,
@@ -659,8 +719,9 @@ def fused_proj_rms_compute_h_backward(
             M,
             K,
             N=N,
+            NUM_K_TILES=num_k_tiles,
             FP32_INPUT=fp32_input,
-            BLOCK_M=block_m,
+            BLOCK_M=x_block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             STAGES=stages,
@@ -675,7 +736,7 @@ def fused_proj_rms_compute_h_backward(
             K,
             N=N,
             FP32_INPUT=fp32_input,
-            BLOCK_M=block_m,
+            BLOCK_M=weight_block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             STAGES=stages,
