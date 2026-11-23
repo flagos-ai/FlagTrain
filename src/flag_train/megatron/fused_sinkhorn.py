@@ -20,7 +20,13 @@ from operator import index
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
+
+# CUDA Triton ships libdevice under extra.cuda; FlagTree (Hygon/BW1000)
+# only provides the backend-neutral extra.libdevice.
+try:
+    from triton.language.extra.cuda import libdevice
+except ImportError:
+    from triton.language.extra import libdevice
 
 from flag_train.runtime import torch_device_fn
 
