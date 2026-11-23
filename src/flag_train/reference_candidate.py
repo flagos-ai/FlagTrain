@@ -14,11 +14,10 @@
 
 """Opt-in support for running an explicit reference as the candidate.
 
-Correctness tests opt in by calling :func:`get_candidate` with the reference
-they already trust. Benchmarks opt in through their shared timing path, which
-selects the benchmark's explicit ``torch_op``. Both paths call the single
-:func:`select_candidate`, so there is one definition of what
-``--ref-as-candidate`` changes.
+Correctness tests declare a module-level ``reference``. The pytest plugin
+temporarily installs it at the public operator entry point for the test call.
+Benchmarks use their explicit ``torch_op`` through the shared timing path.
+Both paths use :func:`select_candidate` to observe candidate-side calls.
 
 This module is imported only by the pytest/benchmark integration. Importing
 ``flag_train`` itself must not require pytest.
@@ -32,6 +31,8 @@ from functools import wraps
 from pathlib import Path
 
 import pytest
+
+from .dynamic_registry import OverrideResolutionError, resolve_operator_target
 
 _MODE = ContextVar("flag_train_reference_candidate_mode", default=None)
 
@@ -216,9 +217,9 @@ def add_reference_candidate_argument(parser):
             action="store_true",
             default=False,
             help=(
-                "Run the explicit reference supplied by each correctness test "
-                "as the candidate, and time the benchmark's explicit torch_op "
-                "as the candidate. Requires an explicit reference."
+                "Run the correctness test module's explicit reference as the "
+                "public operator, and time the benchmark's explicit torch_op "
+                "as the candidate."
             ),
         )
     except ValueError:
@@ -235,6 +236,69 @@ def configure_reference_candidate(config):
     plugin = _ReferenceCandidatePlugin()
     config._reference_candidate_plugin = plugin
     config.pluginmanager.register(plugin, "flag-train-reference-candidate")
+
+
+def _test_operator_target(item):
+    module = item.module
+    if hasattr(module, "OVERRIDE_KEY"):
+        return resolve_operator_target(module.OVERRIDE_KEY)
+
+    component = item.path.parent.name
+    prefix = f"{component}." if component in _OPERATOR_ROOTS else ""
+    if hasattr(module, "OP_NAME"):
+        return resolve_operator_target(f"{prefix}{module.OP_NAME}")
+
+    def exported_target(name):
+        target = resolve_operator_target(f"{prefix}{name}")
+        owner = importlib.import_module(target.module_name)
+        return target if callable(vars(owner).get(target.attr_name)) else None
+
+    filename = item.path.stem
+    if filename.startswith("test_"):
+        target = exported_target(filename.removeprefix("test_"))
+        if target is not None:
+            return target
+
+    targets = {
+        target
+        for mark in item.iter_markers()
+        if (target := exported_target(mark.name)) is not None
+    }
+    if len(targets) > 1:
+        raise OverrideResolutionError(
+            "Multiple public operators match the test marks. Declare OVERRIDE_KEY."
+        )
+    if targets:
+        return targets.pop()
+    if prefix and filename.startswith("test_"):
+        # A conventional component test may validate a reference before its
+        # public candidate has been added to the package.
+        return resolve_operator_target(prefix + filename.removeprefix("test_"))
+    return None
+
+
+def _patch_test_reference(item, patch):
+    reference = getattr(item.module, "reference", None)
+    try:
+        target = _test_operator_target(item)
+    except OverrideResolutionError as error:
+        raise ReferenceContractError(f"{item.nodeid}: {error}") from error
+    if target is None:
+        return
+
+    def missing_reference(*args, **kwargs):
+        raise ReferenceContractError(
+            f"{item.nodeid}: No predefined reference for {target.full_name}. "
+            "Define a callable reference in the test module."
+        )
+
+    owner = importlib.import_module(target.module_name)
+    candidate = (
+        select_candidate(None, reference, target.full_name)
+        if callable(reference)
+        else missing_reference
+    )
+    patch.setattr(owner, target.attr_name, candidate, raising=False)
 
 
 class _ReferenceCandidatePlugin:
@@ -270,7 +334,10 @@ class _ReferenceCandidatePlugin:
         state.candidate_derivative_calls = 0
         state.completed_timings = 0
         state.selection_empty = False
-        outcome = yield
+        with pytest.MonkeyPatch.context() as patch:
+            if self._is_correctness(item) and isinstance(item, pytest.Function):
+                _patch_test_reference(item, patch)
+            outcome = yield
         interrupted = outcome.excinfo and issubclass(
             outcome.excinfo[0],
             (KeyboardInterrupt, SystemExit, pytest.exit.Exception),
@@ -289,15 +356,22 @@ class _ReferenceCandidatePlugin:
             return
         if self._is_correctness(item):
             if state.candidate_calls == 0:
-                if not state.reference_selected:
-                    message = (
-                        f"{item.nodeid}: No predefined reference selected; "
-                        "explicitly pass a callable reference to get_candidate."
-                    )
-                else:
+                if state.reference_selected:
                     message = (
                         f"{item.nodeid}: explicit reference contract did not "
                         "complete a candidate-side call."
+                    )
+                elif callable(
+                    getattr(getattr(item, "module", None), "reference", None)
+                ):
+                    message = (
+                        f"{item.nodeid}: Cannot resolve the public operator for reference. "
+                        "Declare OVERRIDE_KEY with its qualified path."
+                    )
+                else:
+                    message = (
+                        f"{item.nodeid}: No predefined reference selected; "
+                        "define a callable reference in the test module."
                     )
                 outcome.force_exception(ReferenceContractError(message))
             return
@@ -326,6 +400,7 @@ class _ReferenceCandidatePlugin:
             correctness
             and report.skipped
             and not state.reference_selected
+            and not callable(getattr(getattr(item, "module", None), "reference", None))
             and not state.contract_errors
         ):
             # A skip (including a fixture skip or xfail) must not hide a test
