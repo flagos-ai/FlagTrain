@@ -19,6 +19,8 @@ import pytest
 import flag_train
 from benchmark.base import GenericBenchmark
 from benchmark.cases import BenchmarkCasePlan
+from benchmark.conftest import Config
+from flag_train.reference_candidate import reference_mode_enabled
 from tests.megatron.test_router_gating_linear_function import (
     BIAS_DTYPE,
     DTYPES,
@@ -28,6 +30,7 @@ from tests.megatron.test_router_gating_linear_function import (
     WORKLOADS,
     make_inputs,
     reference,
+    skip_unsupported_candidate,
 )
 
 
@@ -64,9 +67,12 @@ def _build_inputs(plan, dtype, device):
     return make_inputs(shape, dtype, device, with_bias, num_experts)
 
 
-@pytest.mark.skipif(flag_train.vendor_name != "nvidia", reason="NVIDIA Router kernel")
 @pytest.mark.router_gating_linear_function
 def test_router_gating_linear_function_perf():
+    candidate = flag_train.megatron.router_gating_linear_function
+    if not (Config.list_cases or Config.query or reference_mode_enabled()):
+        skip_unsupported_candidate(candidate)
+
     bench = RouterGatingLinearBenchmark(
         op_name=OP_NAME,
         torch_op=reference,
@@ -74,5 +80,5 @@ def test_router_gating_linear_function_perf():
         case_fn=_cases,
         build_inputs_fn=_build_inputs,
     )
-    bench.set_train(flag_train.megatron.router_gating_linear_function)
+    bench.set_train(candidate)
     bench.run()
