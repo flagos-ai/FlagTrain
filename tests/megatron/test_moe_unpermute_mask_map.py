@@ -76,9 +76,6 @@ def permute_mask_map(inp, routing_map, num_out_tokens, probs, pad_offsets):
 
 
 OP_NAME = "moe_unpermute_mask_map"
-pytestmark = pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
-)
 DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 

@@ -77,9 +77,6 @@ def _build(plan, dtype, device):
     return args
 
 
-@pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
-)
 @pytest.mark.moe_unpermute_mask_map
 def test_moe_unpermute_mask_map_benchmark():
     bench = OperatorBenchmark(
