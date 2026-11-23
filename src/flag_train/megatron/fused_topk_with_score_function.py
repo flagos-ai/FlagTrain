@@ -18,6 +18,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from flag_train.runtime import torch_device_fn
+
 _BIG = tl.constexpr(1073741824)
 _EPS = tl.constexpr(1e-20)
 
@@ -290,7 +292,7 @@ def fused_topk_with_score_function(
 
     grid = ((num_tokens + block_t - 1) // block_t,)
     if num_tokens:
-        with torch.cuda.device(device):
+        with torch_device_fn.device(device):
             _router_kernel[grid](
                 x,
                 expert_bias if has_bias else x,

@@ -73,9 +73,6 @@ def _build(plan, dtype, device):
     return args
 
 
-@pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
-)
 @pytest.mark.fused_topk_with_score_function
 def test_fused_topk_with_score_function_benchmark():
     bench = OperatorBenchmark(
