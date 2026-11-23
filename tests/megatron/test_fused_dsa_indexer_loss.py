@@ -25,12 +25,8 @@ import flag_train
 from flag_train.reference_candidate import get_candidate
 
 
-def is_ppu(tensor):
-    if tensor.device.type != "cuda":
-        return False
-    from flag_train import vendor_name
-
-    return vendor_name == "thead"
+def _is_ppu(tensor):
+    return flag_train.vendor_name == "thead" and tensor.device.type == flag_train.device
 
 
 def _ppu_teacher_scores(query, key):
@@ -90,7 +86,7 @@ def reference(
     if query.ndim == 3:
         query, key = query.unsqueeze(1), key.unsqueeze(1)
     query, key = query.detach().float(), key.detach().float()
-    if is_ppu(query):
+    if _is_ppu(query):
         teacher = _ppu_teacher_scores(query, key)
     else:
         teacher = torch.einsum("sbhd,tbhd->bhst", query, key)
@@ -162,9 +158,6 @@ def reference(
 
 
 OP_NAME = "fused_dsa_indexer_loss"
-pytestmark = pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA kernel validation"
-)
 DTYPES = (torch.float32, torch.bfloat16)
 
 
