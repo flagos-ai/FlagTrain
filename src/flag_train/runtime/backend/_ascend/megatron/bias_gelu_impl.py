@@ -49,13 +49,13 @@ import triton
 import triton.language as tl
 
 from flag_train.megatron.bias_gelu_impl import (
+    _INTEGRAL_DTYPES,
+    _NUM_WARPS,
+    _OPERAND_DTYPES,
     _accelerator_device,
     _as_scalar_tensor,
     _bias_gelu_tile,
     _check_devices,
-    _INTEGRAL_DTYPES,
-    _NUM_WARPS,
-    _OPERAND_DTYPES,
     _resolve_dtypes,
 )
 from flag_train.runtime import torch_device_fn
