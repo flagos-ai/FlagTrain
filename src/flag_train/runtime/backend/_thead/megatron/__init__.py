@@ -24,4 +24,6 @@ To specialise an operator, define it under this package, re-export it here
 overrides.
 """
 
-__all__ = []
+from .router_gating_linear_function import router_gating_linear_function
+
+__all__ = ["router_gating_linear_function"]

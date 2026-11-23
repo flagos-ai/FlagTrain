@@ -25,9 +25,11 @@ overrides.
 """
 
 from .fused_gated_norm import fused_gated_norm
+from .router_gating_linear_function import router_gating_linear_function
 from .weighted_swiglu_funciton import weighted_swiglu_funciton
 
 __all__ = [
     "fused_gated_norm",
+    "router_gating_linear_function",
     "weighted_swiglu_funciton",
 ]
