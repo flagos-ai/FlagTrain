@@ -205,6 +205,7 @@ def test_router_gating_linear_function(shape, num_experts, router_dtype, with_bi
         torch.testing.assert_close(actual_input, original, rtol=0, atol=0)
 
 
+@pytest.mark.router_gating_linear_function
 def test_router_gating_linear_noncontiguous():
     candidate = _candidate()
 
@@ -214,17 +215,25 @@ def test_router_gating_linear_noncontiguous():
     inp, weight, bias, dtype = make_inputs(
         (2, 5, 32), torch.float32, flag_train.device, True, 13
     )
-    inputs = tuple(strided(tensor).requires_grad_() for tensor in (inp, weight, bias))
-    actual = candidate(*inputs, dtype)
-    expected = reference(*inputs, dtype)
+    originals = (inp, weight, bias)
+    candidate_inputs = tuple(strided(tensor).requires_grad_() for tensor in originals)
+    reference_inputs = tuple(strided(tensor).requires_grad_() for tensor in originals)
+    actual = candidate(*candidate_inputs, dtype)
+    expected = reference(*reference_inputs, dtype)
     torch.testing.assert_close(actual, expected)
-    grad = strided(torch.randn_like(expected))
+    grad = torch.randn_like(expected)
+    candidate_grad = strided(grad)
     torch.testing.assert_close(
-        torch.autograd.grad(actual, inputs, grad),
-        torch.autograd.grad(expected, inputs, grad),
+        torch.autograd.grad(actual, candidate_inputs, candidate_grad),
+        torch.autograd.grad(expected, reference_inputs, strided(grad)),
     )
+    for actual_value, original_value in zip(
+        (*candidate_inputs, candidate_grad), (*originals, grad)
+    ):
+        torch.testing.assert_close(actual_value, original_value, rtol=0, atol=0)
 
 
+@pytest.mark.router_gating_linear_function
 def test_router_gating_linear_empty_reduction_with_bias():
     candidate = _candidate()
     device = flag_train.device
