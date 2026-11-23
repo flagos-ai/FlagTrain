@@ -22,8 +22,6 @@ in kernel mode). ``--level core`` runs the small, medium and large shapes below;
 ``--level comprehensive`` adds the extra shapes.
 """
 
-import os
-
 import pytest
 import torch
 

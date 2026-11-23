@@ -221,9 +221,7 @@ def _bias_swiglu_forward_kernel(
             MODE,
             HAS_LINEAR_CLAMP,
         )
-        tl.store(
-            y_ptr + row * n_cols + cols, out.to(y_ptr.dtype.element_ty), mask=mask
-        )
+        tl.store(y_ptr + row * n_cols + cols, out.to(y_ptr.dtype.element_ty), mask=mask)
 
 
 def _block_size(n_cols):
