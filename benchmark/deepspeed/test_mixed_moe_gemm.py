@@ -13,13 +13,9 @@
 # limitations under the License.
 """Performance benchmark for the mixed_moe_gemm operator.
 
-The baseline is DeepSpeed's CUTLASS ``mixed_moe_gemm`` binding on the backends
-that ship it -- the kernel this port is a port *of*. When it cannot be loaded,
-there is no on-machine baseline: a dequantization plus per-expert PyTorch GEMM
-is a correct implementation, not a competitor, so it is not timed;
-``torch_op`` is ``None`` and ``--base-data`` is the only comparison. The same
-composition is still used as an untimed correctness check in the input
-builder.
+NVIDIA times DeepSpeed's CUTLASS binding when available and can also compare
+against ``--base-data``. Other backends time the same-device PyTorch composition
+used by the input builder to check candidate outputs.
 """
 
 import math
@@ -52,19 +48,6 @@ class MixedMoEGEMMBenchmark(base.GenericBenchmark):
 
     def set_more_shapes(self):
         return []
-
-
-# Backends on which DeepSpeed's CUTLASS MoE GEMM is expected to be usable.
-# It ships as a CUDA extension, so only a backend that can compile and execute
-# one can host it.
-_DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
-
-_DEEPSPEED_UNAVAILABLE_MSG = (
-    "Its kernel ships prebuilt in DeepSpeed's CUTLASS extension "
-    "(InferenceCutlassBuilder), which has to carry this GPU's compute "
-    "capability. Install a build that does, or drop the backend from "
-    "_DEEPSPEED_BASELINE_VENDORS."
-)
 
 
 def _deepspeed_weight_buffer(weights, num_bits, n):
@@ -165,9 +148,6 @@ def _probe_deepspeed_mixed_moe_gemm(op):
 
 def _load_deepspeed_mixed_moe_gemm():
     """``(op, reason)`` -- ``op`` is ``None`` when there is not a usable one."""
-    if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
-        return None, None
-
     try:
         from deepspeed.ops.op_builder import InferenceCutlassBuilder
 
@@ -183,30 +163,8 @@ def _load_deepspeed_mixed_moe_gemm():
     return op, None
 
 
-# Resolved once, at module import time.
-_DEEPSPEED_ORACLE, _DEEPSPEED_REASON = _load_deepspeed_mixed_moe_gemm()
-
-_WHY = (
-    f"{flag_train.vendor_name!r} is expected to use DeepSpeed's mixed_moe_gemm "
-    f"as its baseline, which {_DEEPSPEED_REASON}. {_DEEPSPEED_UNAVAILABLE_MSG}"
-)
-
-if _DEEPSPEED_ORACLE is not None:
-    _BASELINE = "deepspeed mixed_moe_gemm"
-    torch_op = _DeepSpeedBaseline(_DEEPSPEED_ORACLE)
-else:
-    _BASELINE = "none (no on-machine baseline; --base-data is the only comparison)"
-    if flag_train.vendor_name in _DEEPSPEED_BASELINE_VENDORS:
-        warnings.warn(
-            f"{_WHY} This run has no on-machine baseline; a torch composition "
-            f"is not timed, so --base-data is the only comparison.",
-            stacklevel=2,
-        )
-    torch_op = None
-
-
 def _reference(output, x, weights, scales, biases, rows, num_bits, activation):
-    """Untimed oracle: unpacking, dequantization, bias, and activation.
+    """Unpack, dequantize, and compute the per-expert GEMMs with bias and activation.
 
     Benchmark workloads allocate equally many tokens to every expert, so row
     boundaries are known from shapes; no device-to-host copies are timed.
@@ -235,6 +193,25 @@ def _reference(output, x, weights, scales, biases, rows, num_bits, activation):
             result = F.silu(result)
         output[start:end].copy_(result)
     return output
+
+
+def _select_baseline():
+    if flag_train.vendor_name != "nvidia":
+        return _reference, "PyTorch composition"
+
+    op, reason = _load_deepspeed_mixed_moe_gemm()
+    if op is not None:
+        return _DeepSpeedBaseline(op), "deepspeed mixed_moe_gemm"
+
+    warnings.warn(
+        f"DeepSpeed's CUTLASS mixed_moe_gemm {reason}. The extension must "
+        "support this GPU's compute capability. Use --base-data for comparison.",
+        stacklevel=2,
+    )
+    return None, "none (no on-machine baseline; --base-data is the only comparison)"
+
+
+torch_op, _BASELINE = _select_baseline()
 
 
 def input_fn(shape, dtype, device, num_bits, activation):
