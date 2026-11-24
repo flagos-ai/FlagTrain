@@ -452,7 +452,7 @@ def test_bias_swiglu_impl_ignores_forward_only_flags():
     expected = flag_train.megatron.bias_swiglu_impl(x, None)
     for name in ("fp8_input_store", "cpu_offload_input"):
         y = flag_train.megatron.bias_swiglu_impl(x, None, **{name: True})
-        assert torch.equal(y, expected)
+        utils.train_assert_equal(utils.to_reference(y), utils.to_reference(expected))
 
 
 @pytest.mark.bias_swiglu_impl
