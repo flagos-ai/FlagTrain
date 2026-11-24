@@ -27,7 +27,6 @@ from flag_train.testing import RESOLUTION
 
 from .. import accuracy_utils as utils
 
-pytestmark = pytest.mark.bias_gelu_impl
 _SHAPES = [(), (0,), (0, 17), (3, 0), (1,), (17,), (2, 19, 7), (64, 128)]
 if not utils.QUICK_MODE:
     _SHAPES += [
@@ -84,6 +83,7 @@ def _check(x, b):
     utils.train_assert_close(result, ref, x.dtype)
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_gelu_impl(shape, dtype):
@@ -93,6 +93,7 @@ def test_bias_gelu_impl(shape, dtype):
     _check(x, b)
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 @pytest.mark.parametrize("bias_shape", [(), (7,), (1, 7), (2, 1, 7), (2, 3, 7)])
 def test_bias_gelu_broadcast(dtype, bias_shape):
@@ -104,6 +105,7 @@ def test_bias_gelu_broadcast(dtype, bias_shape):
     _check(b, x)
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_gelu_noncontiguous(dtype):
     utils.init_seed(2)
@@ -114,6 +116,7 @@ def test_bias_gelu_noncontiguous(dtype):
     _check(x[:, ::2], b[::2])
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_gelu_values_and_empty(dtype):
     values = [-1000, -20, -8, -3, -1, -1e-4, 0, 1e-4, 1, 3, 8, 20, 1000]
@@ -129,6 +132,7 @@ def test_bias_gelu_values_and_empty(dtype):
     )
 
 
+@pytest.mark.bias_gelu_impl
 def test_bias_gelu_bad_arguments():
     x = torch.randn((4, 8), device=flag_train.device)
     for a, b in [(None, x), (x, None)]:
@@ -239,6 +243,7 @@ def _assert_matches_megatron(x, b):
     return y, expected
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize("dtype", _EXTENDED_DTYPES, ids=lambda d: str(d).split(".")[-1])
 def test_bias_gelu_extended_dtypes(dtype):
     """Megatron promotes integer/bool sums to FP32."""
@@ -254,6 +259,7 @@ def test_bias_gelu_extended_dtypes(dtype):
     _assert_matches_megatron(x, b)
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize(
     "dtype,values",
     [
@@ -277,6 +283,7 @@ def test_bias_gelu_integral_edges(dtype, values):
     _assert_matches_megatron(x, torch.zeros((), device=x.device, dtype=dtype))
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize(
     "dtype,input, bias",
     [
@@ -292,6 +299,7 @@ def test_bias_gelu_integral_add_wraps(dtype, input, bias):
     _assert_matches_megatron(x, b)
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize(
     "input_dtype, bias_dtype",
     [
@@ -322,6 +330,7 @@ def test_bias_gelu_dtype_promotion(input_dtype, bias_dtype):
     _assert_matches_megatron(make(input_dtype, (4, 8)), make(bias_dtype, (8,)))
 
 
+@pytest.mark.bias_gelu_impl
 def test_bias_gelu_cpu_input():
     """CPU operands are staged through the accelerator and returned on CPU."""
     megatron_impl = _load_megatron()
@@ -335,6 +344,7 @@ def test_bias_gelu_cpu_input():
     utils.train_assert_close(y, expected, y.dtype)
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize("scalar", [1.0, 1, True, 300, -1])
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.float32, torch.int8, torch.uint8, torch.int32]
@@ -346,6 +356,7 @@ def test_bias_gelu_scalar_operand(dtype, scalar):
     _assert_matches_megatron(scalar, x)
 
 
+@pytest.mark.bias_gelu_impl
 def test_bias_gelu_cpu_scalar_tensor():
     """A 0-dim CPU tensor pairs with an accelerator tensor, as torch does."""
     megatron_impl = _load_megatron()
@@ -379,6 +390,7 @@ def test_bias_gelu_cpu_scalar_tensor():
         )
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_gelu_nonfinite(dtype):
     x = torch.tensor(
@@ -392,6 +404,7 @@ def test_bias_gelu_nonfinite(dtype):
     assert torch.isnan(y[1:]).all()
 
 
+@pytest.mark.bias_gelu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_gelu_installed_megatron(dtype):
     if _load_megatron() is None:
