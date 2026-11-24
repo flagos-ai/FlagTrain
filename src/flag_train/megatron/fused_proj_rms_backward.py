@@ -14,9 +14,15 @@
 """Fused projection + RMS normalization (backward).
 
 The counterpart of :func:`flag_train.megatron.fused_proj_rms_forward`. Given
-``x`` ``[M, K]``, ``weight`` ``[N, K]``, the gradients ``grad_proj`` ``[M, N]``
-and ``grad_r`` ``[M, 1]`` of the forward's outputs, and the forward's saved
-``r``, it returns ``grad_x`` ``[M, K]`` and ``grad_weight`` ``[N, K]``.
+``x`` ``[..., K]``, ``weight`` ``[N, K]``, the gradients ``grad_proj``
+``[..., N]`` and ``grad_r`` ``[..., 1]`` of the forward's outputs, and the
+forward's saved ``r``, it returns ``grad_x`` ``[..., K]`` and ``grad_weight``
+``[N, K]``. Leading axes are flattened into the 2-D kernels; CPU inputs are
+staged through the accelerator, and legacy fp64 runs in the same Triton kernels
+in fp64. A CPU-only environment is not supported. Inputs are limited to real
+fp16/bf16/fp32/fp64; complex, float8 and integer tensors are rejected. The
+explicit backward is likewise independent of ambient autocast and uses the
+compute dtype selected by ``fp32_output``.
 
 With ``proj = x @ weight^T`` and ``r = 1 / (||x|| / sqrt(K) + eps)``:
 
@@ -27,6 +33,10 @@ With ``proj = x @ weight^T`` and ``r = 1 / (||x|| / sqrt(K) + eps)``:
     grad_x = grad_{proj} @ weight
              - \\frac{grad_r \\cdot r^2}{\\sqrt{K} \\lVert x \\rVert} \\, x
 
+With ``eps_inside_sqrt=True`` (Megatron main) the norm term instead uses
+``r = rsqrt(mean(x**2) + eps)`` and its derivative is
+``-grad_r \\cdot r^3 / K \\cdot x``.
+
 The oracle is Megatron-LM's ``native_proj_rms`` differentiated by autograd, so
 the formulas above are the reference's own gradient rather than a hand-written
 approximation of it. As in PyTorch's norm backward, a row whose norm is zero
@@ -34,9 +44,11 @@ contributes no ``grad_r`` term -- the norm is not differentiable there -- while
 its ``grad_proj`` term is unaffected.
 
 ``grad_x`` comes back in ``x``'s dtype and ``grad_weight`` in ``weight``'s,
-matching what autograd produces through the promotion the forward applies.
-Inputs are promoted to ``torch.promote_types(x.dtype, weight.dtype)`` for the
-computation, exactly as in the forward.
+matching what autograd produces through the forward's promotion or fp32 cast.
+The legacy contract promotes inputs to
+``torch.promote_types(x.dtype, weight.dtype)`` for the computation -- including
+fp64, which stays fp64 -- exactly as in the forward; the Megatron-main contract
+computes in fp32.
 
 Two or three launches, because the work has three different shapes of
 parallelism: the row coefficient (a reduction over K), ``grad_proj @ weight``
@@ -76,19 +88,23 @@ wrapper is free, which is why the forward keeps it.
 import functools
 import logging
 from contextlib import nullcontext
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from flag_train.megatron.fused_proj_rms_forward import (
+    _accelerator_device,
+    _resolve_fp32_output,
+)
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
 # Row block of a coefficient program. The reduction streams ``x`` and nothing
 # else, so this is only about how many programs the read is spread over: four
@@ -145,32 +161,49 @@ def _check_dtype_and_device(tensor, name):
     if tensor.dtype not in _SUPPORTED_DTYPES:
         supported = ", ".join(str(dtype) for dtype in _SUPPORTED_DTYPES)
         raise ValueError(f"{name} must have dtype {supported}, got {tensor.dtype}")
+    # CPU inputs are staged to the active accelerator before any kernel runs;
+    # non-CPU tensors must belong to the active accelerator backend.
     if tensor.device.type == "cpu":
-        raise ValueError(f"{name} must be a device tensor, not a CPU tensor")
+        return
     if tensor.device.type != runtime_device.name:
         raise ValueError(
-            f"{name} must be a {runtime_device.name} tensor, got {tensor.device.type}"
+            f"{name} must be a {runtime_device.name} or CPU tensor, got "
+            f"{tensor.device.type}"
         )
 
 
-def _check_tensor(tensor, name, ndim):
+def _check_tensor(tensor, name, ndim, exact=True):
     _check_dtype_and_device(tensor, name)
-    if tensor.dim() != ndim:
+    if exact and tensor.dim() != ndim:
         raise ValueError(f"{name} must be {ndim}-D, got shape {tuple(tensor.shape)}")
+    if not exact and tensor.dim() < ndim:
+        raise ValueError(
+            f"{name} must be at least {ndim}-D, got shape {tuple(tensor.shape)}"
+        )
 
 
-def _check_vector(tensor, name, length, device):
-    """``r`` and ``grad_r`` are row vectors: ``[M, 1]`` or ``[M]``."""
+def _check_vector(tensor, name, length, device, expected_shape=None):
+    """``r``/``grad_r``: the forward's ``[..., 1]`` shape or any 1-D/2-D container.
+
+    ``[M]``, ``[M, 1]`` and a caller's ``[1, M]`` row vector all hold the same
+    ``M`` values in row-major order and flatten identically, as they did before
+    the N-D support landed.
+    """
     _check_dtype_and_device(tensor, name)
-    if tensor.dim() not in (1, 2) or tensor.numel() != length:
+    if tensor.numel() != length:
         raise ValueError(
             f"{name} must have {length} elements, got shape {tuple(tensor.shape)}"
         )
     if tensor.device != device:
         raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    if tensor.dim() == 1:
-        return tensor if tensor.is_contiguous() else tensor.contiguous()
-    return tensor.reshape(-1).contiguous()
+    if expected_shape is not None and tuple(tensor.shape) == tuple(expected_shape):
+        return tensor.reshape(-1).contiguous()
+    if tensor.dim() in (1, 2):
+        return tensor.reshape(-1).contiguous()
+    raise ValueError(
+        f"{name} must have shape {tuple(expected_shape)}, or be 1-D/2-D with "
+        f"{length} elements, got {tuple(tensor.shape)}"
+    )
 
 
 def _block_k(cap, block_m, block_n, K, dtype, stages):
@@ -215,16 +248,16 @@ def _grad_x_config(M, N, K, dtype):
     Four warps on the half-precision tiles, not eight: this launch re-reads
     ``x`` for the ``coef * x`` term rather than feeding the tensor core off a
     wide operand tile, so the extra warps buy nothing -- eight measured 7%
-    behind at N=80 and within noise everywhere else, up to N=4096. fp32 keeps
-    them, because there each tile carries twice the bytes per thread and eight
-    warps are worth 3-4%.
+    behind at N=80 and within noise everywhere else, up to N=4096. fp32 and
+    fp64 keep them, because there each tile carries more bytes per thread and
+    eight warps are worth 3-4%.
     """
     block_m = 64 if M >= _SMALL_M else 16
     block_n = max(16, min(32, triton.next_power_of_2(max(N, 1))))
     if N > _GRAD_X_WIDE_N:
         block_n = 64
     block_k = _block_k(_GRAD_X_BLOCK_K, block_m, block_n, K, dtype, _GRAD_X_STAGES)
-    num_warps = 8 if dtype == torch.float32 else 4
+    num_warps = 8 if dtype in (torch.float32, torch.float64) else 4
     num_stages = _GRAD_X_STAGES if K >= block_k else 1
     return block_m, block_n, block_k, num_warps, num_stages
 
@@ -289,33 +322,59 @@ def _coef_tile(
     pid,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    FP64: tl.constexpr,
+    EPS_INSIDE_SQRT: tl.constexpr,
 ):
-    """``-grad_r * r^2 / (sqrt(K) * ||x||)`` for one block of rows.
+    """``-grad_r * r^2 / (sqrt(K) * ||x||)`` or ``-grad_r * r^3 / K``.
 
-    Shared by ``_coef_kernel`` and the merged launch, which is why the program
-    index is handed in rather than read.
+    The first form is 0.17.x/Megatron's default
+    ``1 / (||x|| / sqrt(K) + eps)``; the second is main's
+    ``rsqrt(mean(x^2) + eps)`` mode. Shared by ``_coef_kernel`` and the merged
+    launch, which is why the program index is handed in rather than read.
     """
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offs_m < M
 
-    sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    for k_start in range(0, K, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-        mask_k = offs_k < K
-        x = tl.load(
-            x_ptr + offs_m[:, None] * K + offs_k[None, :],
-            mask=mask_m[:, None] & mask_k[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        sum_sq += tl.sum(x * x, axis=1)
+    r = tl.load(r_ptr + offs_m, mask=mask_m, other=0.0)
+    grad_r = tl.load(grad_r_ptr + offs_m, mask=mask_m, other=0.0)
+    if FP64:
+        r = r.to(tl.float64)
+        grad_r = grad_r.to(tl.float64)
+    else:
+        r = r.to(tl.float32)
+        grad_r = grad_r.to(tl.float32)
 
-    norm = tl.sqrt(sum_sq)
-    r = tl.load(r_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
-    grad_r = tl.load(grad_r_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)
+    if EPS_INSIDE_SQRT:
+        # d rsqrt(mean(x^2)+eps) / dx = -r^3 * x / K; the x factor is applied
+        # by the callers, so only the scalar coefficient is stored here.
+        coef = -grad_r * r * r * r / (K * 1.0)
+    else:
+        if FP64:
+            sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float64)
+        else:
+            sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < K
+            x = tl.load(
+                x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            )
+            if FP64:
+                x = x.to(tl.float64)
+            else:
+                x = x.to(tl.float32)
+            sum_sq += tl.sum(x * x, axis=1)
 
-    # A zero row has no norm direction: PyTorch's norm backward yields zero
-    # there, so this where() does too, and it keeps 0 / 0 from becoming NaN.
-    coef = tl.where(norm > 0.0, -grad_r * r * r / (norm * tl.sqrt(K * 1.0)), 0.0)
+        norm = tl.sqrt(sum_sq)
+        # A zero row has no norm direction: PyTorch's norm backward yields zero
+        # there, so this where() does too, and it keeps 0 / 0 from becoming NaN.
+        coef = tl.where(
+            norm > 0.0,
+            -grad_r * r * r / (norm * tl.sqrt(K * 1.0)),
+            tl.zeros_like(norm),
+        )
     tl.store(coef_ptr + offs_m, coef, mask=mask_m)
 
 
@@ -329,9 +388,21 @@ def _coef_kernel(
     K,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    FP64: tl.constexpr,
+    EPS_INSIDE_SQRT: tl.constexpr,
 ):
     _coef_tile(
-        x_ptr, r_ptr, grad_r_ptr, coef_ptr, M, K, tle.program_id(0), BLOCK_M, BLOCK_K
+        x_ptr,
+        r_ptr,
+        grad_r_ptr,
+        coef_ptr,
+        M,
+        K,
+        tle.program_id(0),
+        BLOCK_M,
+        BLOCK_K,
+        FP64,
+        EPS_INSIDE_SQRT,
     )
 
 
@@ -349,6 +420,7 @@ def _grad_x_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     IEEE: tl.constexpr,
+    FP64: tl.constexpr,
 ):
     """``grad_proj @ weight`` for one ``[BLOCK_M, BLOCK_K]`` tile, plus ``coef * x``."""
     pid_m = tle.program_id(0)
@@ -359,7 +431,10 @@ def _grad_x_kernel(
     mask_m = offs_m < M
     mask_k = offs_k < K
 
-    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    if FP64:
+        acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float64)
+    else:
+        acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
     for n_start in range(0, N, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
@@ -382,7 +457,11 @@ def _grad_x_kernel(
         x_ptr + offs_m[:, None] * K + offs_k[None, :],
         mask=mask_m[:, None] & mask_k[None, :],
         other=0.0,
-    ).to(tl.float32)
+    )
+    if FP64:
+        x = x.to(tl.float64)
+    else:
+        x = x.to(tl.float32)
     coef = tl.load(coef_ptr + offs_m, mask=mask_m, other=0.0)
     acc += coef[:, None] * x
 
@@ -406,6 +485,7 @@ def _grad_weight_tile(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     IEEE: tl.constexpr,
+    FP64: tl.constexpr,
 ):
     """``grad_proj^T @ x`` for one ``[BLOCK_N, BLOCK_K]`` tile of grad_weight.
 
@@ -422,7 +502,10 @@ def _grad_weight_tile(
     mask_n = offs_n < N
     mask_k = offs_k < K
 
-    acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    if FP64:
+        acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float64)
+    else:
+        acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
     for m_start in range(0, M, BLOCK_M):
         offs_m = m_start + tl.arange(0, BLOCK_M)
         mask_m = offs_m < M
@@ -460,6 +543,7 @@ def _grad_weight_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     IEEE: tl.constexpr,
+    FP64: tl.constexpr,
 ):
     _grad_weight_tile(
         grad_proj_ptr,
@@ -473,6 +557,7 @@ def _grad_weight_kernel(
         BLOCK_N,
         BLOCK_K,
         IEEE,
+        FP64,
     )
 
 
@@ -492,8 +577,10 @@ def _coef_grad_weight_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     IEEE: tl.constexpr,
+    FP64: tl.constexpr,
     COEF_BLOCK_M: tl.constexpr,
     COEF_BLOCK_K: tl.constexpr,
+    EPS_INSIDE_SQRT: tl.constexpr,
 ):
     """``grad_weight`` and the row coefficient out of one launch.
 
@@ -519,6 +606,7 @@ def _coef_grad_weight_kernel(
             BLOCK_N,
             BLOCK_K,
             IEEE,
+            FP64,
         )
     else:
         _coef_tile(
@@ -531,6 +619,8 @@ def _coef_grad_weight_kernel(
             pid - num_gw,
             COEF_BLOCK_M,
             COEF_BLOCK_K,
+            FP64,
+            EPS_INSIDE_SQRT,
         )
 
 
@@ -543,6 +633,7 @@ def _scale_rows_kernel(
     K,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    FP64: tl.constexpr,
 ):
     """``grad_x = coef * x``, for the degenerate ``N == 0`` case."""
     pid_m = tle.program_id(0)
@@ -557,11 +648,30 @@ def _scale_rows_kernel(
         x_ptr + offs_m[:, None] * K + offs_k[None, :],
         mask=mask_m[:, None] & mask_k[None, :],
         other=0.0,
-    ).to(tl.float32)
+    )
+    if FP64:
+        x = x.to(tl.float64)
+    else:
+        x = x.to(tl.float32)
     tl.store(
         grad_x_ptr + offs_m[:, None] * K + offs_k[None, :],
         (coef[:, None] * x).to(grad_x_ptr.dtype.element_ty),
         mask=mask_m[:, None] & mask_k[None, :],
+    )
+
+
+@triton.jit
+def _fill_zero_kernel(out_ptr, n_elements, BLOCK: tl.constexpr):
+    """Write zeros for a degenerate output that has no reduction to run.
+
+    ``M == 0`` still has to return an ``[N, K]`` ``grad_weight`` of zeros, and
+    the no-torch-arithmetic contract means that fill stays in a kernel too.
+    """
+    offs = tle.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(
+        out_ptr + offs,
+        tl.zeros((BLOCK,), dtype=out_ptr.dtype.element_ty),
+        mask=offs < n_elements,
     )
 
 
@@ -571,62 +681,123 @@ def fused_proj_rms_backward(
     grad_proj: torch.Tensor,
     grad_r: torch.Tensor,
     r: torch.Tensor,
+    eps_inside_sqrt: bool = False,
+    *,
+    fp32_output: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Gradients of :func:`fused_proj_rms_forward` with respect to ``x`` and
     ``weight``.
 
     Args:
-        x (Tensor): ``[M, K]`` forward input. A non-contiguous input is copied.
+        x (Tensor): ``[..., K]`` forward input. CPU inputs are copied to the
+            active accelerator for the Triton launches and the gradients copied
+            back; legacy fp64 runs in the same kernels in fp64. A
+            non-contiguous input is copied.
         weight (Tensor): ``[N, K]`` forward weight. Its dtype may differ from
             ``x``'s; both are promoted to
-            ``torch.promote_types(x.dtype, weight.dtype)`` for the computation.
-        grad_proj (Tensor): ``[M, N]`` gradient of the forward's ``proj``. A
+            ``torch.promote_types(x.dtype, weight.dtype)`` in the legacy
+            contract, or computed in fp32 in the Megatron-main contract.
+        grad_proj (Tensor): ``[..., N]`` gradient of the forward's ``proj``. A
             non-contiguous input is copied.
-        grad_r (Tensor): ``[M, 1]`` or ``[M]`` gradient of the forward's ``r``.
-        r (Tensor): the ``[M, 1]`` or ``[M]`` RMS scale the forward returned.
+        grad_r (Tensor): ``[..., 1]``, a flat ``[M]``, or ``[M, 1]`` gradient
+            of the forward's ``r``.
+        r (Tensor): the same shapes accepted for ``grad_r``; the RMS scale the
+            forward returned.
+        eps_inside_sqrt (bool): the mode the forward ran in. ``False`` is
+            ``1 / (||x|| / sqrt(K) + eps)``; ``True`` is Megatron main's
+            ``rsqrt(mean(x**2) + eps)`` and uses ``-grad_r * r**3 / K`` for the
+            norm term instead of ``-grad_r * r**2 / (sqrt(K) * ||x||)``.
+        fp32_output (Optional[bool]): forward-dtype compatibility mode. ``None``
+            follows the installed Megatron; ``True``/``False`` force the
+            Megatron-main / 0.17.x contract.
 
     Returns:
-        Tuple[Tensor, Tensor]: ``grad_x`` ``[M, K]`` in ``x``'s dtype and
+        Tuple[Tensor, Tensor]: ``grad_x`` ``[..., K]`` in ``x``'s dtype and
         ``grad_weight`` ``[N, K]`` in ``weight``'s dtype.
     """
     logger.debug("TRAIN FUSED_PROJ_RMS_BACKWARD")
-    _check_tensor(x, "x", 2)
+    _check_tensor(x, "x", 1, exact=False)
     _check_tensor(weight, "weight", 2)
-    _check_tensor(grad_proj, "grad_proj", 2)
-    if x.shape[1] != weight.shape[1]:
+    _check_dtype_and_device(grad_proj, "grad_proj")
+    if x.shape[-1] != weight.shape[1]:
         raise ValueError(
             "x and weight must agree on the reduction dimension, got "
             f"{tuple(x.shape)} and {tuple(weight.shape)}"
         )
-    M, K = x.shape
-    N = weight.shape[0]
-    if tuple(grad_proj.shape) != (M, N):
+    if x.device != weight.device:
         raise ValueError(
-            f"grad_proj must have shape {(M, N)}, got {tuple(grad_proj.shape)}"
+            f"x and weight must be on the same device, got {x.device} and "
+            f"{weight.device}"
+        )
+
+    full_x_shape = x.shape
+    x_dtype = x.dtype
+    weight_dtype = weight.dtype
+    orig_shape = x.shape[:-1]
+    K = x.shape[-1]
+    N = weight.shape[0]
+    M = 1
+    for dim in orig_shape:
+        M *= dim
+    proj_shape = orig_shape + (N,)
+    if tuple(grad_proj.shape) != proj_shape:
+        raise ValueError(
+            f"grad_proj must have shape {proj_shape}, got {tuple(grad_proj.shape)}"
         )
     if grad_proj.device != x.device:
         raise ValueError(f"grad_proj must be on {x.device}, got {grad_proj.device}")
-    grad_r = _check_vector(grad_r, "grad_r", M, x.device)
-    r = _check_vector(r, "r", M, x.device)
+    grad_r = _check_vector(
+        grad_r, "grad_r", M, x.device, expected_shape=orig_shape + (1,)
+    )
+    r = _check_vector(r, "r", M, x.device, expected_shape=orig_shape + (1,))
 
-    grad_x = x.new_empty((M, K))
-    grad_weight = weight.new_empty((N, K))
+    orig_device = x.device
+    cpu_input = orig_device.type == "cpu"
+    fp32_output = _resolve_fp32_output(eps_inside_sqrt, fp32_output)
+    compute = (
+        torch.float32 if fp32_output else torch.promote_types(x.dtype, weight.dtype)
+    )
+    if compute == torch.float64 and not runtime_device.support_fp64:
+        raise RuntimeError(
+            "fused_proj_rms_backward: the legacy float64 contract requires a "
+            "device with fp64 support; use fp32_output=True to compute in fp32"
+        )
     if M == 0 or K == 0:
-        # Neither product contributes anything: with no rows there is nothing to
-        # reduce over, and with no reduction dimension every product is an empty
-        # sum. ``K == 0`` leaves two empty tensors, but ``M == 0`` still returns
-        # an ``[N, K]`` grad_weight -- and an empty allocation would hand back
-        # uninitialised memory, not the zeros autograd produces.
-        grad_x.zero_()
-        grad_weight.zero_()
+        # Neither product contributes anything, so grad_x and a zero-width
+        # grad_weight are empty. An M == 0 projection still has an [N, K]
+        # grad_weight of zeros, which the fill kernel writes rather than torch.
+        grad_x = x.new_empty(full_x_shape)
+        if N == 0 or K == 0:
+            return grad_x, weight.new_empty((N, K))
+        compute_device = (
+            _accelerator_device("fused_proj_rms_backward") if cpu_input else orig_device
+        )
+        grad_weight = torch.empty((N, K), dtype=weight_dtype, device=compute_device)
+        numel = grad_weight.numel()
+        block = 1024
+        _fill_zero_kernel[(triton.cdiv(numel, block),)](
+            grad_weight, numel, BLOCK=block, num_warps=4
+        )
+        if cpu_input:
+            grad_weight = grad_weight.to(orig_device)
         return grad_x, grad_weight
+
+    # Triton has no CPU backend, so a CPU input is staged through the active
+    # accelerator: torch only copies, the arithmetic stays in the kernels.
+    # Megatron-main fp64 inputs are cast to fp32 and use the same kernels.
+    if cpu_input:
+        compute_device = _accelerator_device("fused_proj_rms_backward")
+        x = x.to(compute_device)
+        weight = weight.to(compute_device)
+        grad_proj = grad_proj.to(compute_device)
+        r = r.to(compute_device)
+        grad_r = grad_r.to(compute_device)
 
     # One dtype for the whole computation, as the forward does. Each conversion
     # is guarded rather than requested outright: at the mHC shapes the caller
     # hands over the promoted dtype already, and the kernels take their strides
     # from M, N and K, so every operand has to be contiguous by the time one
     # runs.
-    compute = torch.promote_types(x.dtype, weight.dtype)
     if x.dtype != compute:
         x = x.to(compute)
     if not x.is_contiguous():
@@ -644,6 +815,12 @@ def fused_proj_rms_backward(
     if grad_r.dtype != compute:
         grad_r = grad_r.to(compute)
 
+    # The kernels are 2-D; leading axes are only shape.
+    x2 = x.reshape(M, K)
+    grad_proj2 = grad_proj.reshape(M, N)
+    grad_x2 = x2.new_empty((M, K), dtype=x_dtype)
+    grad_weight = weight.new_empty((N, K), dtype=weight_dtype)
+
     device_index = x.device.index
     if device_index is None:
         device_index = torch_device_fn.current_device()
@@ -653,10 +830,11 @@ def fused_proj_rms_backward(
         else torch_device_fn.device(x.device)
     )
 
-    ieee = compute == torch.float32
-    # The coefficient is fp32 regardless of the operand dtype: it multiplies
-    # x and is added to an fp32 accumulator.
-    coef = x.new_empty((M,), dtype=torch.float32)
+    ieee = compute in (torch.float32, torch.float64)
+    fp64 = compute == torch.float64
+    # The coefficient is fp32 for the fp16/bf16/fp32 paths and fp64 for legacy
+    # fp64: it multiplies x and is added to the matching accumulator dtype.
+    coef = x.new_empty((M,), dtype=torch.float64 if fp64 else torch.float32)
     coef_block_m, coef_block_k, coef_warps, coef_stages = _coef_config(K)
     grad_x_block_m, grad_x_block_n, grad_x_block_k, warps, stages = _grad_x_config(
         M, N, K, compute
@@ -678,8 +856,8 @@ def fused_proj_rms_backward(
             ) = _merged_config(M, N, K, compute)
             num_gw = triton.cdiv(N, weight_block_n) * triton.cdiv(K, weight_block_k)
             _coef_grad_weight_kernel[(num_gw + triton.cdiv(M, coef_block_m),)](
-                grad_proj,
-                x,
+                grad_proj2,
+                x2,
                 grad_weight,
                 r,
                 grad_r,
@@ -692,14 +870,16 @@ def fused_proj_rms_backward(
                 BLOCK_N=weight_block_n,
                 BLOCK_K=weight_block_k,
                 IEEE=ieee,
+                FP64=fp64,
                 COEF_BLOCK_M=coef_block_m,
                 COEF_BLOCK_K=coef_block_k,
+                EPS_INSIDE_SQRT=eps_inside_sqrt,
                 num_warps=weight_warps,
                 num_stages=weight_stages,
             )
         else:
             _coef_kernel[(triton.cdiv(M, coef_block_m),)](
-                x,
+                x2,
                 r,
                 grad_r,
                 coef,
@@ -707,6 +887,8 @@ def fused_proj_rms_backward(
                 K,
                 BLOCK_M=coef_block_m,
                 BLOCK_K=coef_block_k,
+                FP64=fp64,
+                EPS_INSIDE_SQRT=eps_inside_sqrt,
                 num_warps=coef_warps,
                 num_stages=coef_stages,
             )
@@ -716,24 +898,29 @@ def fused_proj_rms_backward(
                 (triton.cdiv(M, grad_x_block_m), triton.cdiv(K, grad_x_block_k))
             ](
                 coef,
-                x,
-                grad_x,
+                x2,
+                grad_x2,
                 M,
                 K,
                 BLOCK_M=grad_x_block_m,
                 BLOCK_K=grad_x_block_k,
+                FP64=fp64,
                 num_warps=4,
             )
+            grad_x = grad_x2.reshape(full_x_shape)
+            if cpu_input:
+                grad_x = grad_x.to(orig_device)
+                grad_weight = grad_weight.to(orig_device)
             return grad_x, grad_weight
 
         _grad_x_kernel[
             (triton.cdiv(M, grad_x_block_m), triton.cdiv(K, grad_x_block_k))
         ](
-            grad_proj,
+            grad_proj2,
             weight,
-            x,
+            x2,
             coef,
-            grad_x,
+            grad_x2,
             M,
             N,
             K,
@@ -741,6 +928,7 @@ def fused_proj_rms_backward(
             BLOCK_N=grad_x_block_n,
             BLOCK_K=grad_x_block_k,
             IEEE=ieee,
+            FP64=fp64,
             num_warps=warps,
             num_stages=stages,
         )
@@ -756,8 +944,8 @@ def fused_proj_rms_backward(
             _grad_weight_kernel[
                 (triton.cdiv(N, weight_block_n) * triton.cdiv(K, weight_block_k),)
             ](
-                grad_proj,
-                x,
+                grad_proj2,
+                x2,
                 grad_weight,
                 M,
                 N,
@@ -766,8 +954,13 @@ def fused_proj_rms_backward(
                 BLOCK_N=weight_block_n,
                 BLOCK_K=weight_block_k,
                 IEEE=ieee,
+                FP64=fp64,
                 num_warps=weight_warps,
                 num_stages=weight_stages,
             )
 
+    grad_x = grad_x2.reshape(full_x_shape)
+    if cpu_input:
+        grad_x = grad_x.to(orig_device)
+        grad_weight = grad_weight.to(orig_device)
     return grad_x, grad_weight
