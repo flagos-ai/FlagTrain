@@ -59,11 +59,33 @@ torch 组合。运行基线前需要安装：
    pip install -e .
    ```
 
-6. **Transformer Engine** — Router 的 Megatron GEMM 路径和 L2 normalization
-   backward 需要带 CUDA 扩展的 Transformer Engine。使用含
-   `l2normalization_fwd_fused` 和 `l2normalization_backward_fused` 的版本，
-   并为 L2 采集保留默认的 `NVTE_TORCH_COMPILE=1`。已验证的上游 L2 helper
-   源码版本为 [390cd03](https://github.com/NVIDIA/TransformerEngine/blob/390cd037f0a29dc39e9d9ab6f38c96cc06c59715/transformer_engine/pytorch/jit.py)。
+6. **Transformer Engine** — Router 和 L2 normalization backward 需要 TE 的
+   PyTorch CUDA 扩展。H800 采集环境需要 CUDA 13 版 PyTorch 和 cuDNN 9.12
+   或更新版本。`CUDA_HOME` 应指向带 `nvcc` 和头文件的 CUDA 13 Toolkit。
+   采集 L2 backward 时保留 `NVTE_TORCH_COMPILE=1`。
+
+   ```bash
+   python3 -m pip install setuptools wheel packaging ninja
+   python3 -m pip install --no-build-isolation \
+       'transformer-engine[pytorch,core_cu13]==2.21.0'
+   export NVTE_TORCH_COMPILE=1
+   ```
+
+   安装后检查 Megatron 的 Router GEMM 入口和 TE 的两个 L2 helper。
+
+   ```bash
+   python3 - <<'PY'
+   from megatron.core.transformer.moe.moe_utils import te_general_gemm
+   from transformer_engine.pytorch.jit import (
+       l2normalization_backward_fused,
+       l2normalization_fwd_fused,
+   )
+
+   assert callable(te_general_gemm)
+   assert callable(l2normalization_fwd_fused)
+   assert callable(l2normalization_backward_fused)
+   PY
+   ```
 
 第 2、3、4 条可以合并成一条命令：
 
