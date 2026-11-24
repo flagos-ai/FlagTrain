@@ -47,16 +47,8 @@ def _upstream():
     return l2normalization_fwd_fused, l2normalization_backward_fused
 
 
-def _backward(grad_output, x, inverse_norm, eps):
-    with dynamo_config.patch(
-        recompile_limit=len(_SHAPES) * len(DTYPES), fail_on_recompile_limit_hit=True
-    ):
-        return _upstream()[1](grad_output, x, inverse_norm, eps)
-
-
 def native():
-    _upstream()
-    return _backward
+    return _upstream()[1]
 
 
 def grid():
@@ -72,12 +64,15 @@ def build_inputs(binding, dtype, device):
     grad = torch.randn(shape, generator=rng, dtype=torch.float32).to(
         device=device, dtype=dtype
     )
-    forward, _ = _upstream()
+    forward, backward = _upstream()
+    # Prepare the saved norm and compile the backward before timing.
     with dynamo_config.patch(
         recompile_limit=len(_SHAPES) * len(DTYPES), fail_on_recompile_limit_hit=True
     ):
         _, inverse_norm = forward(x, _EPS)
-    return (grad, x, inverse_norm, _EPS), {}
+        args = (grad, x, inverse_norm, _EPS)
+        backward(*args)
+    return args, {}
 
 
 def key_shape(binding):

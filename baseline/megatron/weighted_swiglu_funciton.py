@@ -41,16 +41,8 @@ def _upstream():
     return weighted_swiglu
 
 
-def _forward(y, weights):
-    with dynamo_config.patch(
-        recompile_limit=len(_SHAPES) * len(DTYPES), fail_on_recompile_limit_hit=True
-    ):
-        return _upstream()(y, weights)
-
-
 def native():
-    _upstream()
-    return _forward
+    return _upstream()
 
 
 def grid():
@@ -62,6 +54,11 @@ def build_inputs(binding, dtype, device):
     rng = torch.Generator().manual_seed(6466)
     y = torch.randn(shape, generator=rng).to(device=device, dtype=dtype)
     weights = torch.rand((*shape[:-1], 1), generator=rng).to(device=device)
+    # Compile this input signature before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(_SHAPES) * len(DTYPES), fail_on_recompile_limit_hit=True
+    ):
+        _upstream()(y, weights)
     return (y, weights), {}
 
 

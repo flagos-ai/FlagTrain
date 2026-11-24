@@ -42,16 +42,8 @@ def _upstream():
     return native_sinkhorn
 
 
-def _forward(logits, num_iterations, eps):
-    with dynamo_config.patch(
-        recompile_limit=len(_CASES) * len(DTYPES), fail_on_recompile_limit_hit=True
-    ):
-        return _upstream()(logits, num_iterations, eps)
-
-
 def native():
-    _upstream()
-    return _forward
+    return _upstream()
 
 
 def grid():
@@ -64,7 +56,13 @@ def grid():
 def build_inputs(binding, dtype, device):
     rng = torch.Generator().manual_seed(6472)
     logits = torch.randn(binding["shape"], generator=rng).to(device=device, dtype=dtype)
-    return (logits, binding["num_iterations"], binding["eps"]), {}
+    args = (logits, binding["num_iterations"], binding["eps"])
+    # Compile this input signature before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(_CASES) * len(DTYPES), fail_on_recompile_limit_hit=True
+    ):
+        _upstream()(*args)
+    return args, {}
 
 
 def key_shape(binding):
