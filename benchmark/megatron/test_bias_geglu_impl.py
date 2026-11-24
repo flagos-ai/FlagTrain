@@ -13,20 +13,26 @@
 # limitations under the License.
 """Performance benchmark for bias_geglu_impl.
 
-The baseline is Megatron-LM's ``bias_geglu_impl`` when installed. Its forward
-helpers use ``jit_fuser``, which is ``torch.compile`` on supported PyTorch
-versions. Machines without Megatron-LM use the vendored forward implementation
-at the end of this file, also compiled with ``torch.compile``. Thus every row
-is compared against a compiled native implementation rather than eager
-PyTorch.
+The baseline is Megatron-LM's ``bias_geglu_impl`` when it can be imported. Its
+forward helpers use ``jit_fuser``, which is ``torch.compile`` on supported
+PyTorch versions. Without Megatron, ``torch_op`` is ``None`` and no on-machine
+baseline is timed -- ``--base-data`` is then the only comparison, rather than a
+vendored torch composition. The ``Baseline:`` line printed by the test records
+which one ran.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the shapes
 below. The operator is forward-only, so there are no backward cases.
 
+The measured path is the fused Triton fast path: contiguous active-device
+floating inputs with a same-dtype bias. CPU staging, non-contiguous or
+broadcast-expanded layouts and mixed/integer/bool promotion are covered by the
+functional suite and are not performance targets here.
+
 ``torch.compile`` recompiles per shape/dtype pattern. The default Dynamo
-recompile limit is smaller than this benchmark's case count, so the module
-raises it; otherwise the baseline could silently fall back to eager.
+recompile limit is smaller than this benchmark's case count, so the
+module-scoped fixture below raises it; otherwise the baseline could silently
+fall back to eager halfway through the table.
 """
 
 import pytest
@@ -49,7 +55,7 @@ _CORE_SHAPES = [
 
 
 def _dtypes():
-    """Use the same floating-point dtypes as the correctness suite."""
+    """The floating dtypes the fused fast path is benchmarked with."""
     dtypes = [dtype for dtype in consts.FLOAT_DTYPES if dtype != torch.bfloat16]
     if flag_train.runtime.device.support_bf16:
         dtypes.append(torch.bfloat16)
@@ -64,6 +70,7 @@ class BiasGegluImplBenchmark(base.GenericBenchmark):
 
 
 def bias_geglu_input_fn(shape, dtype, device):
+    # Same-dtype, contiguous operands with a [hidden] bias: the kernel fast path.
     x = torch.randn(shape, dtype=dtype, device=device)
     bias = torch.randn((shape[-1],), dtype=dtype, device=device)
     yield (x, bias)
@@ -75,6 +82,51 @@ def base_op():
     except Exception:
         return None
     return bias_geglu_impl
+
+
+# Enough variants for 7 shapes x 3 dtypes of forward cases without Dynamo
+# falling back to eager halfway through the table.
+_DYNAMO_RECOMPILE_LIMIT = 128
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure_torch_compile():
+    """Keep the compiled baseline working across this module's case count."""
+    import torch._dynamo
+    import torch._inductor.config as inductor_config
+
+    # One compile thread keeps Inductor's compilation in-process; vendor Triton
+    # builds may fail to pickle the compiled kernel back from a worker.
+    saved_threads = inductor_config.compile_threads
+    inductor_config.compile_threads = 1
+    saved_autotune = inductor_config.triton.autotune_pointwise
+    # torch_musa's Inductor autotune timer imports
+    # triton.backends.mtgpu.musa_testing, which the FlagTree Triton build does
+    # not ship. Disable the pointwise config search on MUSA; the compiled
+    # baseline itself still runs.
+    if flag_train.vendor_name == "mthreads":
+        inductor_config.triton.autotune_pointwise = False
+
+    dynamo = torch._dynamo.config
+    limit_name = next(
+        (
+            name
+            for name in ("recompile_limit", "cache_size_limit")
+            if hasattr(dynamo, name)
+        ),
+        None,
+    )
+    saved_limit = getattr(dynamo, limit_name) if limit_name else None
+    if limit_name is not None:
+        setattr(dynamo, limit_name, max(saved_limit, _DYNAMO_RECOMPILE_LIMIT))
+
+    try:
+        yield
+    finally:
+        inductor_config.compile_threads = saved_threads
+        inductor_config.triton.autotune_pointwise = saved_autotune
+        if limit_name is not None:
+            setattr(dynamo, limit_name, saved_limit)
 
 
 @pytest.mark.bias_geglu_impl
