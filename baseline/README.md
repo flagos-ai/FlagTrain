@@ -4,9 +4,10 @@
 [ops-baseline](https://github.com/zhaojs12345/ops-baseline) 仓库（上游路径
 `ops/flagtrain/`）。
 
-这些模块采集的是 FlagTrain benchmark 在 NVIDIA 上使用的基线实现，不是 FlagTrain
-自己的 Triton 实现。每个模块自包含，只依赖 torch / DeepSpeed / Megatron，**不
-import `flag_train` 或 `benchmark`**；shape、dtype 和输入构造复制在模块内。
+这些模块采集 NVIDIA 上的上游实现。每个模块自包含，只依赖 Torch、DeepSpeed、
+Megatron 或 Transformer Engine，**不 import `flag_train` 或 `benchmark`**。
+shape、dtype 和输入构造与对应 benchmark 保持一致。Optest 从本仓库的 `baseline/`
+直接读取采集模块。
 
 按基线实现所属的库分组：
 
@@ -58,9 +59,21 @@ torch 组合。运行基线前需要安装：
    pip install -e .
    ```
 
+6. **Transformer Engine** — Router 的 Megatron GEMM 路径和 L2 normalization
+   backward 需要带 CUDA 扩展的 Transformer Engine。使用含
+   `l2normalization_fwd_fused` 和 `l2normalization_backward_fused` 的版本，
+   并为 L2 采集保留默认的 `NVTE_TORCH_COMPILE=1`。已验证的上游 L2 helper
+   源码版本为 [390cd03](https://github.com/NVIDIA/TransformerEngine/blob/390cd037f0a29dc39e9d9ab6f38c96cc06c59715/transformer_engine/pytorch/jit.py)。
+
 第 2、3、4 条可以合并成一条命令：
 
 ```bash
 pip install deepspeed-kernels==0.0.1 nvidia-cutlass==3.8.0.0 \
     nvidia-resiliency-ext==0.6.0
 ```
+
+Sinkhorn 采集 Megatron 的编译前向，MTP loss scaler 采集 Megatron 的反向。
+mRoPE 使用 Megatron 非交错前向，weighted SwiGLU 使用 Megatron
+`WeightedSwiGLUFunction` 默认分支调用的 `weighted_swiglu`。
+Router 计入混合输入转为 router dtype 的开销，并使用 Megatron 的 TE GEMM。
+L2 采集 TE 的反向，所需的 forward inverse norm 在计时前生成。
