@@ -23,6 +23,7 @@ import pytest
 import torch
 
 import flag_train
+from flag_train.testing import RESOLUTION
 
 from .. import accuracy_utils as utils
 
@@ -69,6 +70,10 @@ def _check(x, b):
     z = utils.to_reference(z, upcast=True)
     result = utils.to_reference(y)
 
+    # Both sides are evaluated from the reference-precision bias sum ``z``;
+    # only the operator's output is dtype-rounded, so the default atol and
+    # rtol suffice here. The Megatron-output comparisons in
+    # ``_assert_matches_megatron`` use the dtype ULP budgets in ``_ATOL``.
     megatron_impl = _load_megatron()
     if megatron_impl is not None:
         # Bias is already included in z, so use a scalar zero.
@@ -156,6 +161,39 @@ if utils.int64_is_supported:
 if utils.fp64_is_supported:
     _EXTENDED_DTYPES.append(torch.float64)
 
+# Absolute tolerance for comparing FlagTrain with Megatron's dtype-rounded
+# output. ``train_assert_close`` adds this to ``rtol * |ref|``; near zero the
+# rtol term vanishes, while two implementations that round the bias sum and
+# the GELU intermediates at different points differ by a few ULPs of the
+# output dtype. The table is keyed by the *output* dtype (integer/bool sums
+# produce the default floating dtype). Values are two resolution units for
+# fp16/bf16, ten for fp64; the fp32 default is the tanh.approx error budget
+# described below.
+_ATOL = {
+    # fp16: 2 * RESOLUTION[fp16] = 2e-3. One fp16 ULP is ~1e-3 near |y|=1;
+    # the kernel rounds the bias sum and then evaluates GELU in FP32, while
+    # Megatron evaluates in fp16 op by op, and the fast tanh/sigmoid paths
+    # add their own rounding. Used by fp16 outputs from int32+fp16 promotion,
+    # fp16 scalar operands, and the 0-dim CPU scalar case.
+    torch.float16: 2 * RESOLUTION[torch.float16],
+    # bf16: 2 * RESOLUTION[bf16] = 3.2e-2. One bf16 ULP is ~3.9e-3 near
+    # |y|=1 (~3.1e-2 near |y|=8), so this budget is about eight ULPs at 1
+    # and one ULP at 8. No current case emits bf16, but bf16 promotions/
+    # future cases and backend bf16 legalization need this band.
+    torch.bfloat16: 2 * RESOLUTION[torch.bfloat16],
+    # fp64: 10 * RESOLUTION[fp64] = 1e-6. FP64 uses the accurate libdevice
+    # tanh, so the measured difference is ~0; this is a conservative band
+    # for a backend's libdevice/torch tanh implementations.
+    torch.float64: 10 * RESOLUTION[torch.float64],
+}
+# fp32 outputs (integer/bool sums and fp32 promotions): 1e-3 is the
+# worst-case GELU error of NVIDIA's tanh.approx.f32. The PTX instruction
+# bounds |error| by ~2^-11; through 0.5*z*(1+tanh(u)) that is about
+# 0.5*|z|*2^-11, i.e. ~1e-3 at |z|~4. Measured CUDA differences are ~5e-6;
+# the value also leaves room for Ascend's libdevice/sigmoid and bf16
+# legalization. It is not derived from fp32 resolution (1.3e-6 rtol).
+_ATOL_DEFAULT = 1e-3
+
 
 def _random_operand(dtype, shape):
     if dtype is torch.bool:
@@ -190,11 +228,11 @@ def _assert_matches_megatron(x, b):
     assert y.shape == expected.shape
     assert y.dtype == expected.dtype
     assert y.device == expected.device
-    atol = {
-        torch.float16: 2e-3,
-        torch.bfloat16: 3.2e-2,
-        torch.float64: 1e-6,
-    }.get(y.dtype, 1e-3)
+    # ``expected`` is Megatron's dtype-rounded output, not a reference-precision
+    # formula: near zero the rtol term vanishes and the remaining difference is
+    # a few output ULP (integer/bool sums output the default float dtype, hence
+    # the fallback entry).
+    atol = _ATOL.get(y.dtype, _ATOL_DEFAULT)
     utils.train_assert_close(
         utils.to_reference(y), utils.to_reference(expected), y.dtype, atol=atol
     )
@@ -321,14 +359,23 @@ def test_bias_gelu_cpu_scalar_tensor():
         y = flag_train.megatron.bias_gelu_impl(x, b)
         expected = megatron_impl(x, b)
         assert y.device == b.device
+        # fp16 output: one ULP is ~1e-3 near |y|=1 and the 0-dim CPU-scalar
+        # path can round differently from the accelerator path, so use the
+        # fp16 ULP budget instead of the default 1e-4.
         utils.train_assert_close(
-            utils.to_reference(y), utils.to_reference(expected), y.dtype, atol=2e-3
+            utils.to_reference(y),
+            utils.to_reference(expected),
+            y.dtype,
+            atol=_ATOL[torch.float16],
         )
         y = flag_train.megatron.bias_gelu_impl(b, x)
         expected = megatron_impl(b, x)
         assert y.device == b.device
         utils.train_assert_close(
-            utils.to_reference(y), utils.to_reference(expected), y.dtype, atol=2e-3
+            utils.to_reference(y),
+            utils.to_reference(expected),
+            y.dtype,
+            atol=_ATOL[torch.float16],
         )
 
 
