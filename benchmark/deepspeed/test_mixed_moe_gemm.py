@@ -267,11 +267,6 @@ def input_fn(shape, dtype, device, num_bits, activation):
 
 
 @pytest.mark.mixed_moe_gemm
-@pytest.mark.skipif(
-    flag_train.vendor_name
-    not in ("nvidia", "hygon", "metax", "thead", "iluvatar", "ascend", "mthreads"),
-    reason="Unsupported accelerator",
-)
 @pytest.mark.parametrize("num_bits", [4, 8])
 @pytest.mark.parametrize("activation", [6, 2], ids=["identity", "silu"])
 def test_mixed_moe_gemm_perf(num_bits, activation):

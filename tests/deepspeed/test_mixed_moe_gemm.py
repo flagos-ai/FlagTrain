@@ -24,15 +24,6 @@ from flag_train.runtime import torch_device_fn
 
 from .. import accuracy_utils as utils
 
-pytestmark = [
-    pytest.mark.mixed_moe_gemm,
-    pytest.mark.skipif(
-        flag_train.vendor_name
-        not in ("nvidia", "hygon", "metax", "thead", "iluvatar", "ascend", "mthreads"),
-        reason="Unsupported accelerator",
-    ),
-]
-
 _ACTIVATIONS = {0: F.gelu, 1: F.relu, 2: F.silu, 6: lambda x: x}
 _CASES = [
     ([37], 128, 64),
@@ -98,6 +89,7 @@ def _assert_close(output, expected):
     utils.train_assert_close(output, expected, output.dtype)
 
 
+@pytest.mark.mixed_moe_gemm
 @pytest.mark.parametrize("counts,k,n", _CASES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_bits", [4, 8])
@@ -118,6 +110,7 @@ def test_mixed_moe_gemm(counts, k, n, dtype, num_bits, activation, has_bias):
     _assert_close(output, expected)
 
 
+@pytest.mark.mixed_moe_gemm
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_bits", [4, 8])
 def test_mixed_moe_gemm_strides(dtype, num_bits):
@@ -139,6 +132,7 @@ def test_mixed_moe_gemm_strides(dtype, num_bits):
     assert torch.isnan(storage[::2, 1::2]).all()
 
 
+@pytest.mark.mixed_moe_gemm
 @pytest.mark.parametrize(
     "num_bits,weight_dtype", [(4, torch.int8), (4, torch.uint8), (8, torch.int8)]
 )
@@ -164,6 +158,7 @@ def test_mixed_moe_gemm_signed_extrema(num_bits, weight_dtype):
     utils.train_assert_equal(output, utils.to_reference(expected))
 
 
+@pytest.mark.mixed_moe_gemm
 @pytest.mark.parametrize("num_bits", [4, 8])
 @pytest.mark.parametrize(
     "counts,k,n", [([0, 0], 17, 7), ([3, 0, 2], 0, 7), ([3, 0, 2], 17, 0)]
@@ -181,6 +176,7 @@ def test_mixed_moe_gemm_empty_dimensions(num_bits, counts, k, n):
     _assert_close(output, expected)
 
 
+@pytest.mark.mixed_moe_gemm
 @pytest.mark.parametrize("num_bits", [4, 8])
 def test_mixed_moe_gemm_graph_capture(num_bits):
     """Catch hidden host synchronization; changed routing must work on replay."""
@@ -213,6 +209,7 @@ def test_mixed_moe_gemm_graph_capture(num_bits):
     _assert_close(output, expected)
 
 
+@pytest.mark.mixed_moe_gemm
 @pytest.mark.parametrize("num_bits", [4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_mixed_moe_gemm_large_k(num_bits, dtype):
@@ -228,6 +225,7 @@ def test_mixed_moe_gemm_large_k(num_bits, dtype):
     _assert_close(output, expected)
 
 
+@pytest.mark.mixed_moe_gemm
 @pytest.mark.parametrize("num_bits", [4, 8])
 def test_mixed_moe_gemm_two_layers(num_bits):
     """Catch incompatible output reuse across two expert linear layers."""
@@ -249,6 +247,7 @@ def test_mixed_moe_gemm_two_layers(num_bits):
     _assert_close(output, expected)
 
 
+@pytest.mark.mixed_moe_gemm
 @pytest.mark.parametrize(
     "invalid",
     [
