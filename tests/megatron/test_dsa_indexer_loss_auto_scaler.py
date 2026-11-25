@@ -21,7 +21,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.testing import assert_close, assert_equal
 
 
@@ -191,16 +190,15 @@ def _compare(actual, expected):
         assert_equal(got, wanted)
 
 
-def _candidate():
-    return get_candidate(f"megatron.{OP_NAME}", reference=reference)
-
-
 @pytest.mark.dsa_indexer_loss_auto_scaler
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_dsa_indexer_loss_auto_scaler(case, dtype):
     _compare(
-        _observe(_candidate(), make_inputs(case, dtype, flag_train.device)),
+        _observe(
+            flag_train.megatron.dsa_indexer_loss_auto_scaler,
+            make_inputs(case, dtype, flag_train.device),
+        ),
         _observe(reference, make_inputs(case, dtype, flag_train.device)),
     )
 
@@ -209,14 +207,17 @@ def test_dsa_indexer_loss_auto_scaler(case, dtype):
 @pytest.mark.parametrize("case", ("multi-block", "column-scale", "cpu-scale"))
 def test_dsa_indexer_loss_auto_scaler_review_regressions(case):
     _compare(
-        _observe(_candidate(), _review_inputs(case, flag_train.device)),
+        _observe(
+            flag_train.megatron.dsa_indexer_loss_auto_scaler,
+            _review_inputs(case, flag_train.device),
+        ),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
 
 
 @pytest.mark.dsa_indexer_loss_auto_scaler
 def test_dsa_retained_gradients():
-    for fn in (reference, _candidate()):
+    for fn in (reference, flag_train.megatron.dsa_indexer_loss_auto_scaler):
         x = torch.ones(2, device=flag_train.device, requires_grad=True)
         loss = torch.ones((), device=x.device, requires_grad=True)
         scale = torch.tensor(2.0, device=x.device)
@@ -230,7 +231,7 @@ def test_dsa_retained_gradients():
 
 
 def check_live_scales(order):
-    for fn in (_candidate(), reference):
+    for fn in (flag_train.megatron.dsa_indexer_loss_auto_scaler, reference):
         scale = torch.tensor(2.0, device=flag_train.device, requires_grad=True)
         graphs = []
         for i in (1, 2):
