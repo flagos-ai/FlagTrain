@@ -24,6 +24,7 @@ import torch.nn.functional as F
 import flag_train
 from flag_train.reference_candidate import get_candidate
 from flag_train.runtime import torch_device_fn
+from flag_train.testing import assert_close, assert_equal
 
 
 def _is_ppu(tensor):
@@ -178,7 +179,7 @@ def _observe(fn, args):
             assert arg == snapshot
             continue
         assert _layout(arg) == layouts[i], "Input was rebound or resized"
-        torch.testing.assert_close(arg, snapshot, rtol=0, atol=0)
+        assert_equal(arg, snapshot)
     return outputs
 
 
@@ -190,10 +191,7 @@ def _compare(actual, expected):
             wanted.dtype,
             wanted.device,
         )
-        if got.dtype == torch.float32:
-            torch.testing.assert_close(got, wanted, rtol=2e-06, atol=0.0001)
-        else:
-            torch.testing.assert_close(got, wanted)
+        assert_close(got, wanted, wanted.dtype)
 
 
 def _candidate():
@@ -235,7 +233,7 @@ def test_grouped_linear_large_row_offset():
     actual = candidate(inputs, [len(inputs)], weights)
     expected = inputs.new_zeros((len(inputs), 1))
     expected[-1, 0] = 1
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert_equal(actual, expected)
 
 
 @pytest.mark.grouped_linear
