@@ -21,7 +21,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.testing import assert_equal
 
 
@@ -157,16 +156,15 @@ def _compare(actual, expected):
         assert_equal(got, wanted)
 
 
-def _candidate():
-    return get_candidate(f"megatron.{OP_NAME}", reference=reference)
-
-
 @pytest.mark.moe_aux_loss_auto_scaler_backward
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_moe_aux_loss_auto_scaler_backward(case, dtype):
     _compare(
-        _observe(_candidate(), make_inputs(case, dtype, flag_train.device)),
+        _observe(
+            flag_train.megatron.moe_aux_loss_auto_scaler_backward,
+            make_inputs(case, dtype, flag_train.device),
+        ),
         _observe(reference, make_inputs(case, dtype, flag_train.device)),
     )
 
@@ -175,14 +173,17 @@ def test_moe_aux_loss_auto_scaler_backward(case, dtype):
 @pytest.mark.parametrize("case", ("scale-rank", "vector-promotion"))
 def test_moe_aux_loss_auto_scaler_backward_review_regressions(case):
     _compare(
-        _observe(_candidate(), _review_inputs(case, flag_train.device)),
+        _observe(
+            flag_train.megatron.moe_aux_loss_auto_scaler_backward,
+            _review_inputs(case, flag_train.device),
+        ),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
 
 
 @pytest.mark.moe_aux_loss_auto_scaler_backward
 def test_aux_scale_changes_between_calls():
-    fn = _candidate()
+    fn = flag_train.megatron.moe_aux_loss_auto_scaler_backward
     grad, aux, _ = _review_inputs("vector-promotion", flag_train.device)
     for scale in (2.5, 1.0, 3.0, 1.0):
         _compare(fn(grad, aux, scale), reference(grad, aux, scale))
@@ -193,4 +194,7 @@ def test_aux_scale_changes_between_calls():
 def test_moe_aux_loss_unset_scale(dtype):
     grad = torch.ones(2, device=flag_train.device, dtype=dtype)
     aux = torch.zeros((), device=grad.device, dtype=dtype)
-    _compare(_candidate()(grad, aux), reference(grad, aux))
+    _compare(
+        flag_train.megatron.moe_aux_loss_auto_scaler_backward(grad, aux),
+        reference(grad, aux),
+    )
