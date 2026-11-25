@@ -130,8 +130,8 @@ def test_fused_sinkhorn(shape, num_iterations, eps, dtype):
     grad_output = (
         torch.linspace(-0.8, 0.9, expected.numel()).reshape(expected.shape).to(expected)
     )
-    (actual_grad,) = torch.autograd.grad(actual, candidate_input, grad_output.clone())
-    (expected_grad,) = torch.autograd.grad(expected, reference_input, grad_output)
+    actual_grad = torch.autograd.grad(actual, candidate_input, grad_output.clone())[0]
+    expected_grad = torch.autograd.grad(expected, reference_input, grad_output)[0]
     assert_close(actual_grad, expected_grad, expected_grad.dtype)
     assert_equal(candidate_input, input_logits)
 
