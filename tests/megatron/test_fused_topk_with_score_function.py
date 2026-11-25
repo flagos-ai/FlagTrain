@@ -22,7 +22,6 @@ import torch
 import torch.nn.functional as F
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.testing import assert_close, assert_equal
 
 
@@ -268,16 +267,15 @@ def _compare(actual, expected):
             assert_equal(got, wanted)
 
 
-def _candidate():
-    return get_candidate(f"megatron.{OP_NAME}", reference=reference)
-
-
 @pytest.mark.fused_topk_with_score_function
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_fused_topk_with_score_function(case, dtype):
     _compare(
-        _observe(_candidate(), make_inputs(case, dtype, flag_train.device)),
+        _observe(
+            flag_train.megatron.fused_topk_with_score_function,
+            make_inputs(case, dtype, flag_train.device),
+        ),
         _observe(reference, make_inputs(case, dtype, flag_train.device)),
     )
 
@@ -296,7 +294,10 @@ def test_fused_topk_with_score_function(case, dtype):
 )
 def test_fused_topk_with_score_function_review_regressions(case):
     _compare(
-        _observe(_candidate(), _review_inputs(case, flag_train.device)),
+        _observe(
+            flag_train.megatron.fused_topk_with_score_function,
+            _review_inputs(case, flag_train.device),
+        ),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
 
@@ -306,7 +307,9 @@ def test_fused_topk_with_score_function_review_regressions(case):
 def test_fused_topk_numeric_routing_format(format):
     args = _review_inputs("warp-ties-k9", flag_train.device)
     _compare(
-        _observe(_candidate(), (*args[:-1], format)),
+        _observe(
+            flag_train.megatron.fused_topk_with_score_function, (*args[:-1], format)
+        ),
         _observe(reference, (*args[:-1], format)),
     )
 
@@ -316,4 +319,6 @@ def test_fused_topk_without_group_topk_ignores_num_groups():
     args = list(_review_inputs("warp-ties-k9", flag_train.device))
     expected = _observe(reference, args)
     args[3] = 4
-    _compare(_observe(_candidate(), args), expected)
+    _compare(
+        _observe(flag_train.megatron.fused_topk_with_score_function, args), expected
+    )
