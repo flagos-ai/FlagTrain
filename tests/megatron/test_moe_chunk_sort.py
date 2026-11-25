@@ -22,7 +22,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.testing import assert_equal
 
 
@@ -186,16 +185,15 @@ def _compare(actual, expected):
         assert_equal(got, wanted)
 
 
-def _candidate():
-    return get_candidate(f"megatron.{OP_NAME}", reference=reference)
-
-
 @pytest.mark.moe_chunk_sort
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_moe_chunk_sort(case, dtype):
     _compare(
-        _observe(_candidate(), make_inputs(case, dtype, flag_train.device)),
+        _observe(
+            flag_train.megatron.moe_chunk_sort,
+            make_inputs(case, dtype, flag_train.device),
+        ),
         _observe(reference, make_inputs(case, dtype, flag_train.device)),
     )
 
@@ -204,7 +202,9 @@ def test_moe_chunk_sort(case, dtype):
 @pytest.mark.parametrize("case", ("strided-probabilities",))
 def test_moe_chunk_sort_review_regressions(case):
     _compare(
-        _observe(_candidate(), _review_inputs(case, flag_train.device)),
+        _observe(
+            flag_train.megatron.moe_chunk_sort, _review_inputs(case, flag_train.device)
+        ),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
 
@@ -212,7 +212,7 @@ def test_moe_chunk_sort_review_regressions(case):
 @pytest.mark.moe_chunk_sort
 def test_moe_chunk_sort_offset_and_fresh_empty():
     device = flag_train.device
-    fn = _candidate()
+    fn = flag_train.megatron.moe_chunk_sort
     splits = torch.tensor([1, 2], device=device, dtype=torch.int32)
     order = torch.tensor([1, 0], device=device, dtype=torch.int32)
     base = torch.arange(3 * 128 + 1, device=device, dtype=torch.float32)
@@ -231,4 +231,6 @@ def test_moe_chunk_sort_zero_hidden_width():
         torch.tensor([1, 0], dtype=torch.int32, device=device),
         torch.tensor([3.0, 4.0], device=device),
     )
-    _compare(_observe(_candidate(), args), _observe(reference, args))
+    _compare(
+        _observe(flag_train.megatron.moe_chunk_sort, args), _observe(reference, args)
+    )
