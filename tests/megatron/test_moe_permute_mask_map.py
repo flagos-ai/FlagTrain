@@ -21,7 +21,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.testing import assert_equal
 
 
@@ -207,16 +206,15 @@ def _compare(actual, expected):
             assert_equal(got, wanted)
 
 
-def _candidate():
-    return get_candidate(f"megatron.{OP_NAME}", reference=reference)
-
-
 @pytest.mark.moe_permute_mask_map
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_moe_permute_mask_map(case, dtype):
     _compare(
-        _observe(_candidate(), make_inputs(case, dtype, flag_train.device)),
+        _observe(
+            flag_train.megatron.moe_permute_mask_map,
+            make_inputs(case, dtype, flag_train.device),
+        ),
         _observe(reference, make_inputs(case, dtype, flag_train.device)),
     )
 
@@ -225,7 +223,10 @@ def test_moe_permute_mask_map(case, dtype):
 @pytest.mark.parametrize("case", ("strided-activation-and-routing",))
 def test_moe_permute_mask_map_review_regressions(case):
     _compare(
-        _observe(_candidate(), _review_inputs(case, flag_train.device)),
+        _observe(
+            flag_train.megatron.moe_permute_mask_map,
+            _review_inputs(case, flag_train.device),
+        ),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
 
@@ -240,4 +241,7 @@ def test_moe_permute_zero_hidden_width():
         None,
         None,
     )
-    _compare(_observe(_candidate(), args), _observe(reference, args))
+    _compare(
+        _observe(flag_train.megatron.moe_permute_mask_map, args),
+        _observe(reference, args),
+    )
