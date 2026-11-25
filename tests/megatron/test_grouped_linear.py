@@ -22,7 +22,6 @@ import torch
 import torch.nn.functional as F
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.runtime import torch_device_fn
 from flag_train.testing import assert_close, assert_equal
 
@@ -194,16 +193,15 @@ def _compare(actual, expected):
         assert_close(got, wanted, wanted.dtype)
 
 
-def _candidate():
-    return get_candidate(f"megatron.{OP_NAME}", reference=reference)
-
-
 @pytest.mark.grouped_linear
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_grouped_linear(case, dtype):
     _compare(
-        _observe(_candidate(), make_inputs(case, dtype, flag_train.device)),
+        _observe(
+            flag_train.megatron.grouped_linear,
+            make_inputs(case, dtype, flag_train.device),
+        ),
         _observe(reference, make_inputs(case, dtype, flag_train.device)),
     )
 
@@ -212,14 +210,16 @@ def test_grouped_linear(case, dtype):
 @pytest.mark.parametrize("case", ("strided-splits-and-activation",))
 def test_grouped_linear_review_regressions(case):
     _compare(
-        _observe(_candidate(), _review_inputs(case, flag_train.device)),
+        _observe(
+            flag_train.megatron.grouped_linear, _review_inputs(case, flag_train.device)
+        ),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
 
 
 @pytest.mark.grouped_linear
 def test_grouped_linear_large_row_offset():
-    candidate = _candidate()
+    candidate = flag_train.megatron.grouped_linear
     device = torch.device(flag_train.device)
     try:
         free_memory, _ = torch_device_fn.mem_get_info(device)
@@ -245,7 +245,7 @@ def test_grouped_linear_switch_split_dtype(first_dtype, second_dtype, host_split
     device = flag_train.device
     inp = torch.arange(128, dtype=torch.float32, device=device).reshape(8, 16)
     weights = torch.ones((2, 4, 16), device=device)
-    fn = _candidate()
+    fn = flag_train.megatron.grouped_linear
     splits_device = "cpu" if host_splits else device
     for dtype in (first_dtype, second_dtype):
         args = (inp, torch.tensor([3, 5], dtype=dtype, device=splits_device), weights)
