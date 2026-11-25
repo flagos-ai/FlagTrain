@@ -23,6 +23,7 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_close, assert_equal
 
 
 def _is_ppu(tensor):
@@ -326,7 +327,7 @@ def _observe(fn, args):
             assert arg == snapshot
             continue
         assert _layout(arg) == layouts[i], "Input was rebound or resized"
-        torch.testing.assert_close(arg, snapshot, rtol=0, atol=0)
+        assert_equal(arg, snapshot)
     return outputs
 
 
@@ -338,7 +339,10 @@ def _compare(actual, expected):
             wanted.dtype,
             wanted.device,
         )
-        torch.testing.assert_close(got, wanted)
+        if wanted.is_floating_point():
+            assert_close(got, wanted, wanted.dtype)
+        else:
+            assert_equal(got, wanted)
 
 
 def _candidate():
@@ -386,8 +390,8 @@ def test_fused_dsa_indexer_loss_wide_context():
         )
     finally:
         torch.set_default_dtype(previous_dtype)
-    torch.testing.assert_close(indices, torch.tensor([[[65536]]], device=device))
-    torch.testing.assert_close(loss, torch.zeros((), device=device), rtol=0, atol=0)
+    assert_equal(indices, torch.tensor([[[65536]]], device=device))
+    assert_equal(loss, torch.zeros((), device=device))
 
 
 @pytest.mark.fused_dsa_indexer_loss
