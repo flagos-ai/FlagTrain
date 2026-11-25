@@ -22,6 +22,7 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_close, assert_equal
 
 
 def reference(
@@ -224,12 +225,10 @@ def _observe(fn, args):
         assert _layout(arg) == layouts[i], "Input was rebound or resized"
         if i == 0:
             cutoff = args[3]
-            torch.testing.assert_close(
-                arg[..., :cutoff], snapshot[..., :cutoff], rtol=0, atol=0
-            )
+            assert_equal(arg[..., :cutoff], snapshot[..., :cutoff])
             assert not torch.equal(arg[..., cutoff:], snapshot[..., cutoff:])
         else:
-            torch.testing.assert_close(arg, snapshot, rtol=0, atol=0)
+            assert_equal(arg, snapshot)
     return outputs
 
 
@@ -241,7 +240,7 @@ def _compare(actual, expected):
             wanted.dtype,
             wanted.device,
         )
-        torch.testing.assert_close(got, wanted)
+        assert_close(got, wanted, wanted.dtype)
 
 
 def _candidate():
@@ -278,4 +277,4 @@ def test_mla_backward(remove_interleaving):
     (grad,) = torch.autograd.grad(out[..., 0].sum(), x)
     expected = torch.zeros_like(x)
     expected[..., 1] = -1
-    torch.testing.assert_close(grad, expected, rtol=0, atol=0)
+    assert_equal(grad, expected)
