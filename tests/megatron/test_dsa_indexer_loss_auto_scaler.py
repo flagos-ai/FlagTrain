@@ -22,6 +22,7 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_close, assert_equal
 
 
 class _DSAScaler(torch.autograd.Function):
@@ -161,7 +162,7 @@ def _observe(fn, args):
             assert arg == snapshot
             continue
         assert _layout(arg) == layouts[i], "Input was rebound or resized"
-        torch.testing.assert_close(arg, snapshot, rtol=0, atol=0)
+        assert_equal(arg, snapshot)
     grad = (
         torch.linspace(-1, 2, args[0].numel(), device=args[0].device)
         .reshape_as(args[0])
@@ -171,10 +172,10 @@ def _observe(fn, args):
         outputs[0], args, grad, allow_unused=True
     )
     assert grad_scale is None
-    torch.testing.assert_close(grad_output, grad, rtol=0, atol=0)
+    assert_equal(grad_output, grad)
     for arg, snapshot, layout in zip(args, originals, layouts):
         assert _layout(arg) == layout
-        torch.testing.assert_close(arg, snapshot, rtol=0, atol=0)
+        assert_equal(arg, snapshot)
     outputs += (grad_output, grad_loss)
     return outputs
 
@@ -187,7 +188,7 @@ def _compare(actual, expected):
             wanted.dtype,
             wanted.device,
         )
-        torch.testing.assert_close(got, wanted, rtol=0, atol=0)
+        assert_equal(got, wanted)
 
 
 def _candidate():
@@ -223,8 +224,8 @@ def test_dsa_retained_gradients():
         (first,) = torch.autograd.grad(out.sum(), loss, retain_graph=True)
         scale.fill_(3.0)
         (second,) = torch.autograd.grad(out.sum(), loss)
-        torch.testing.assert_close(first, loss.new_tensor(2))
-        torch.testing.assert_close(second, loss.new_tensor(3))
+        assert_close(first, loss.new_tensor(2), loss.dtype)
+        assert_close(second, loss.new_tensor(3), loss.dtype)
         assert first.data_ptr() != second.data_ptr()
 
 
@@ -237,7 +238,7 @@ def check_live_scales(order):
             loss = torch.full((), float(i), device=scale.device, requires_grad=True)
             result = fn(out, loss, scale)
             _assert_alias(result, out, True)
-            torch.testing.assert_close(result, out, rtol=0, atol=0)
+            assert_equal(result, out)
             graphs.append((out, loss, result))
         for index, current_scale in zip(order, (3.25, 7.5)):
             with torch.no_grad():
@@ -247,14 +248,12 @@ def check_live_scales(order):
             dx, dl, ds = torch.autograd.grad(
                 result, (out, loss, scale), grad, allow_unused=True
             )
-            torch.testing.assert_close(dx, grad, rtol=0, atol=0)
-            torch.testing.assert_close(
-                dl, loss.new_tensor(current_scale), rtol=0, atol=0
-            )
+            assert_equal(dx, grad)
+            assert_equal(dl, loss.new_tensor(current_scale))
             assert ds is None
-            torch.testing.assert_close(out, torch.full_like(out, float(index + 1)))
-            torch.testing.assert_close(loss, loss.new_tensor(float(index + 1)))
-            torch.testing.assert_close(scale, scale.new_tensor(current_scale))
+            assert_close(out, torch.full_like(out, float(index + 1)), out.dtype)
+            assert_close(loss, loss.new_tensor(float(index + 1)), loss.dtype)
+            assert_close(scale, scale.new_tensor(current_scale), scale.dtype)
 
 
 @pytest.mark.dsa_indexer_loss_auto_scaler
