@@ -21,7 +21,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.testing import assert_close, assert_equal
 
 
@@ -219,16 +218,15 @@ def _compare(actual, expected):
         assert_close(got, wanted, wanted.dtype)
 
 
-def _candidate():
-    return get_candidate(f"megatron.{OP_NAME}", reference=reference)
-
-
 @pytest.mark.moe_unpermute_mask_map
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_moe_unpermute_mask_map(case, dtype):
     _compare(
-        _observe(_candidate(), make_inputs(case, dtype, flag_train.device)),
+        _observe(
+            flag_train.megatron.moe_unpermute_mask_map,
+            make_inputs(case, dtype, flag_train.device),
+        ),
         _observe(reference, make_inputs(case, dtype, flag_train.device)),
     )
 
@@ -237,14 +235,17 @@ def test_moe_unpermute_mask_map(case, dtype):
 @pytest.mark.parametrize("case", ("strided-activation",))
 def test_moe_unpermute_mask_map_review_regressions(case):
     _compare(
-        _observe(_candidate(), _review_inputs(case, flag_train.device)),
+        _observe(
+            flag_train.megatron.moe_unpermute_mask_map,
+            _review_inputs(case, flag_train.device),
+        ),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
 
 
 @pytest.mark.moe_unpermute_mask_map
 def test_unpermute_rechecks_layout_after_transpose():
-    fn = _candidate()
+    fn = flag_train.megatron.moe_unpermute_mask_map
     args = _review_inputs("strided-activation", flag_train.device)
     fn(*args)
     args[0].transpose_(0, 1)
@@ -265,4 +266,7 @@ def test_moe_unpermute_no_routed_input():
         5,
         None,
     )
-    _compare(_observe(_candidate(), args), _observe(reference, args))
+    _compare(
+        _observe(flag_train.megatron.moe_unpermute_mask_map, args),
+        _observe(reference, args),
+    )
