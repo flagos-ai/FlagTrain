@@ -22,6 +22,7 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_equal
 
 
 def reference(inp, routing_map, num_out_tokens, probs, pad_offsets):
@@ -184,7 +185,7 @@ def _observe(fn, args):
             assert arg == snapshot
             continue
         assert _layout(arg) == layouts[i], "Input was rebound or resized"
-        torch.testing.assert_close(arg, snapshot, rtol=0, atol=0)
+        assert_equal(arg, snapshot)
     return outputs
 
 
@@ -199,15 +200,11 @@ def _compare(actual, expected):
         if i == 1:
             experts = (got.shape[1] - 1) // 2
             active = torch.arange(experts, device=got.device)[None] < wanted[:, -1:]
-            torch.testing.assert_close(got[:, -1], wanted[:, -1])
-            torch.testing.assert_close(
-                got[:, :experts][active], wanted[:, :experts][active]
-            )
-            torch.testing.assert_close(
-                got[:, experts:-1][active], wanted[:, experts:-1][active]
-            )
+            assert_equal(got[:, -1], wanted[:, -1])
+            assert_equal(got[:, :experts][active], wanted[:, :experts][active])
+            assert_equal(got[:, experts:-1][active], wanted[:, experts:-1][active])
         else:
-            torch.testing.assert_close(got, wanted, rtol=0, atol=0)
+            assert_equal(got, wanted)
 
 
 def _candidate():
