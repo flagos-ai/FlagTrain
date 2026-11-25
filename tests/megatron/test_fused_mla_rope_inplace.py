@@ -21,7 +21,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.testing import assert_close, assert_equal
 
 
@@ -243,16 +242,15 @@ def _compare(actual, expected):
         assert_close(got, wanted, wanted.dtype)
 
 
-def _candidate():
-    return get_candidate(f"megatron.{OP_NAME}", reference=reference)
-
-
 @pytest.mark.fused_mla_rope_inplace
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_fused_mla_rope_inplace(case, dtype):
     _compare(
-        _observe(_candidate(), make_inputs(case, dtype, flag_train.device)),
+        _observe(
+            flag_train.megatron.fused_mla_rope_inplace,
+            make_inputs(case, dtype, flag_train.device),
+        ),
         _observe(reference, make_inputs(case, dtype, flag_train.device)),
     )
 
@@ -261,7 +259,10 @@ def test_fused_mla_rope_inplace(case, dtype):
 @pytest.mark.parametrize("case", ("dense-rotation",))
 def test_fused_mla_rope_inplace_review_regressions(case):
     _compare(
-        _observe(_candidate(), _review_inputs(case, flag_train.device)),
+        _observe(
+            flag_train.megatron.fused_mla_rope_inplace,
+            _review_inputs(case, flag_train.device),
+        ),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
 
@@ -273,7 +274,7 @@ def test_mla_backward(remove_interleaving):
     args[10] = remove_interleaving
     x = args[0].requires_grad_()
     args[0] = x * 1
-    out = _candidate()(*args)
+    out = flag_train.megatron.fused_mla_rope_inplace(*args)
     (grad,) = torch.autograd.grad(out[..., 0].sum(), x)
     expected = torch.zeros_like(x)
     expected[..., 1] = -1
