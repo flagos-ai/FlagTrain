@@ -22,7 +22,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.testing import assert_close, assert_equal
 
 
@@ -345,16 +344,15 @@ def _compare(actual, expected):
             assert_equal(got, wanted)
 
 
-def _candidate():
-    return get_candidate(f"megatron.{OP_NAME}", reference=reference)
-
-
 @pytest.mark.fused_dsa_indexer_loss
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_fused_dsa_indexer_loss(case, dtype):
     _compare(
-        _observe(_candidate(), make_inputs(case, dtype, flag_train.device)),
+        _observe(
+            flag_train.megatron.fused_dsa_indexer_loss,
+            make_inputs(case, dtype, flag_train.device),
+        ),
         _observe(reference, make_inputs(case, dtype, flag_train.device)),
     )
 
@@ -363,7 +361,10 @@ def test_fused_dsa_indexer_loss(case, dtype):
 @pytest.mark.parametrize("case", ("implicit-causal", "underflow-lse"))
 def test_fused_dsa_indexer_loss_review_regressions(case):
     _compare(
-        _observe(_candidate(), _review_inputs(case, flag_train.device)),
+        _observe(
+            flag_train.megatron.fused_dsa_indexer_loss,
+            _review_inputs(case, flag_train.device),
+        ),
         _observe(reference, _review_inputs(case, flag_train.device)),
     )
 
@@ -373,7 +374,10 @@ def test_fused_dsa_indexer_loss_packed_cpu_metadata():
     args = list(make_inputs(Case(17, 16, "packed"), torch.float32, flag_train.device))
     for index in (10, 11, 12):
         args[index] = args[index].cpu()
-    _compare(_observe(_candidate(), args), _observe(reference, args))
+    _compare(
+        _observe(flag_train.megatron.fused_dsa_indexer_loss, args),
+        _observe(reference, args),
+    )
 
 
 @pytest.mark.fused_dsa_indexer_loss
@@ -385,7 +389,7 @@ def test_fused_dsa_indexer_loss_wide_context():
     previous_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.float64)
-        indices, loss = _candidate()(
+        indices, loss = flag_train.megatron.fused_dsa_indexer_loss(
             q, q[..., 0], k, q.clone(), k.unsqueeze(2).clone(), 1.0, 1, 1.0
         )
     finally:
@@ -401,7 +405,10 @@ def test_fused_dsa_indexer_loss_boolean_cpu_valid_rows():
     )
     args[13] = torch.ones(17, dtype=torch.int32)
     args[13][:2] = torch.tensor([0, 2], dtype=torch.int32)
-    _compare(_observe(_candidate(), args), _observe(reference, args))
+    _compare(
+        _observe(flag_train.megatron.fused_dsa_indexer_loss, args),
+        _observe(reference, args),
+    )
 
 
 @pytest.mark.fused_dsa_indexer_loss
@@ -409,7 +416,7 @@ def test_fused_dsa_indexer_loss_boolean_cpu_valid_rows():
 def test_fused_dsa_indexer_loss_normalizes_external_lse(dtype):
     args = list(_review_inputs("underflow-lse", flag_train.device))
     args[-1] = args[-1].to(dtype)
-    actual = _candidate()(*args)
+    actual = flag_train.megatron.fused_dsa_indexer_loss(*args)
     expected = reference(*args)
     _compare(actual, expected)
     assert actual[1].dtype == torch.float32
