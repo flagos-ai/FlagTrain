@@ -855,21 +855,26 @@ class Benchmark:
                 # Both operands are required. With no on-machine baseline
                 # (torch_op None or skip_native) latency_base stays None, and
                 # the report shows N/A rather than dividing a nonexistent value.
-                if metric.latency_base is not None and metric.latency is not None:
+                # A zero reading is the same case: the timer measured nothing.
+                if metric.latency_base and metric.latency:
                     metric.speedup = (metric.latency_base + self.EPS) / (
                         metric.latency + self.EPS
                     )
 
             if "gbps" in self.to_bench_metrics:
-                if metric.latency_base is not None:
+                # A zero latency is a measurement the timer could not make: on
+                # a profiler-backed run the events can come back empty and the
+                # reading is 0.0. Treated like a missing baseline -- N/A in the
+                # report, never a division by zero here.
+                if metric.latency_base:
                     metric.gbps_base = self.get_gbps(args, latency=metric.latency_base)
-                if metric.latency is not None:
+                if metric.latency:
                     metric.gbps = self.get_gbps(args, latency=metric.latency)
 
             if (
                 "tflops" in self.to_bench_metrics
                 and self.torch_op is not None
-                and metric.latency is not None
+                and metric.latency
             ):
                 metric.tflops = (
                     self.get_tflops(self.torch_op, *args, **kwargs)

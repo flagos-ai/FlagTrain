@@ -18,8 +18,11 @@ megatron-core provides a Triton kernel that can run here -- the kernel this port
 is a port *of*. When that kernel cannot run, the baseline is Megatron's own
 ``native_h_aggregate``, the ``@torch.compile``d torch composition the vendor
 defines this stage as; with an older megatron-core that predates it, the
-transcription below is compiled the way Megatron compiles it. ``_BASELINE``
-records which case was measured.
+transcription below is compiled the way Megatron compiles it. On Ascend the
+baseline is the eager composition -- Megatron's kernel exceeds that device's
+core-dim limit at the larger shapes -- and it is timed with a wall-clock loop
+(see ``FusedHAggregateForwardBenchmark.get_latency``). ``_BASELINE`` records
+which case was measured.
 
 Both sides take the same ``(x, h_pre)`` tuple and return the aggregated
 ``[s, b, C]``, so there is nothing to pre-compute outside the timed region. The
@@ -30,6 +33,7 @@ multiply-adds), and the two together say whether a latency that moved was the
 memory or the arithmetic.
 """
 
+import time
 import warnings
 
 import pytest
@@ -73,18 +77,29 @@ if flag_train.runtime.device.support_bf16:
     _DTYPES.append(torch.bfloat16)
 
 
+# The baseline is timed with the harness timer except on Ascend, whose
+# profiler-backed kernel-mode timer cannot read the events it creates there.
+_IS_ASCEND = base.vendor_name == "ascend"
+_ASCEND_WARMUP = 10
+_ASCEND_REPEAT = 50
+
+
 def native_h_aggregate_ref(x, h_pre):
     """Megatron-LM's ``native_h_aggregate`` body, transcribed."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
-def _load_native_h_aggregate():
+def _load_native_h_aggregate(compile_it=True):
     """Megatron's ``native_h_aggregate``, or its transcribed body compiled."""
     try:
         from megatron.core.transformer.hyper_connection import native_h_aggregate
     except Exception:
-        return torch.compile(native_h_aggregate_ref), "transcribed"
-    return native_h_aggregate, "megatron-core"
+        op, source = native_h_aggregate_ref, "transcribed"
+    else:
+        op, source = native_h_aggregate, "megatron-core"
+    if not compile_it:
+        return op, source
+    return torch.compile(op), source
 
 
 # The compiled baseline needs one graph per (shape, dtype); with dynamo's
@@ -113,6 +128,20 @@ def _full_compile_budget():
 
 def _load_baseline():
     """Megatron's Triton forward kernel, else its ``native_h_aggregate``."""
+    if _IS_ASCEND:
+        # Megatron's kernel launches one program per output tile. On Ascend that
+        # count passes the 65535 core-dim limit once the sweep reaches
+        # (256, 32, ..., 7168): EE1003, "value 524288 for parameter coreDim is
+        # invalid", raised from its own autotuner. A smoke test at (1, 1, 2, 8)
+        # does not show it, so the kernel is not used here at all.
+        warnings.warn(
+            "Megatron-LM's Triton fused_h_aggregate_forward kernel exceeds the "
+            "Ascend core-dim limit at the larger shapes of this sweep; timing "
+            "its eager native_h_aggregate composition instead.",
+            stacklevel=2,
+        )
+        op, source = _load_native_h_aggregate(compile_it=False)
+        return op, f"megatron native_h_aggregate ({source}, eager)"
     try:
         from megatron.core.fusions.fused_mhc_kernels import _triton_h_aggregate_fwd
 
@@ -130,7 +159,7 @@ def _load_baseline():
             stacklevel=2,
         )
 
-    op, source = _load_native_h_aggregate()
+    op, source = _load_native_h_aggregate(compile_it=True)
     return op, f"megatron native_h_aggregate ({source}, @torch.compile)"
 
 
@@ -154,8 +183,37 @@ class FusedHAggregateForwardBenchmark(base.GenericBenchmark):
     def set_more_shapes(self):
         return []
 
+    def get_latency(self, op, *args, **kwargs):
+        """Milliseconds per call.
+
+        Ascend's kernel-mode timer is profiler-backed. On the CI runtime the
+        profiler comes back with no events ("Failed to get acl to npu flow
+        events") and the torch.npu events it reads either read as 0.0 ms or
+        raise ``aclrtEventElapsedTime`` 507000. A synchronized wall-clock loop
+        needs neither, and every shape in the sweep runs long enough that the
+        launch is not what is being measured.
+        """
+        if not _IS_ASCEND:
+            return super().get_latency(op, *args, **kwargs)
+
+        def call():
+            return op(*args, **kwargs)
+
+        for _ in range(_ASCEND_WARMUP):
+            call()
+        base.torch_device_fn.synchronize()
+        start = time.perf_counter()
+        for _ in range(_ASCEND_REPEAT):
+            call()
+        base.torch_device_fn.synchronize()
+        return (time.perf_counter() - start) / _ASCEND_REPEAT * 1e3
+
     def get_gbps(self, args, latency):
         """Boundary traffic of one call: read ``x`` and ``h_pre``, write ``out``."""
+        if not latency:
+            # The profiler can come back with no events on some runtimes; there
+            # is no bandwidth to report rather than an infinite one.
+            return 0.0
         x, h_pre = args[0], args[1]
         s, b, n, C = x.shape
         # The aggregate is cast back to x.dtype, matching Megatron main.

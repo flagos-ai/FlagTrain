@@ -23,6 +23,7 @@ from .bias_gelu_impl import bias_gelu_impl
 from .bias_swiglu_impl import bias_swiglu_impl
 from .fast_gelu import fast_gelu
 from .fused_gated_norm import fused_gated_norm
+from .fused_h_aggregate_forward import fused_h_aggregate_forward
 from .fused_h_post_bda_backward import fused_h_post_bda_backward
 from .fused_h_post_bda_forward import fused_h_post_bda_forward
 from .fused_indices_to_multihot import fused_indices_to_multihot
@@ -48,6 +49,7 @@ __all__ = [
     "bias_swiglu_impl",
     "fast_gelu",
     "fused_gated_norm",
+    "fused_h_aggregate_forward",
     "fused_h_post_bda_backward",
     "fused_h_post_bda_forward",
     "fused_indices_to_multihot",
