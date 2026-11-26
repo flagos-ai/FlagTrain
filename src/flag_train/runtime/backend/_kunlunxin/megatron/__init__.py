@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .fused_sinkhorn import fused_sinkhorn
 from .router_gating_linear_function import router_gating_linear_function
 
-__all__ = ["router_gating_linear_function"]
+__all__ = ["fused_sinkhorn", "router_gating_linear_function"]
