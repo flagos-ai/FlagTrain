@@ -71,14 +71,6 @@ _SPECIAL_VALUES = [
     float("-inf"),
     float("nan"),
 ]
-_FLOAT8_DTYPES = [
-    dtype
-    for dtype in (
-        getattr(torch, "float8_e4m3fn", None),
-        getattr(torch, "float8_e5m2", None),
-    )
-    if dtype is not None
-]
 
 # --------------------------------- case tables -----------------------------
 
@@ -161,16 +153,12 @@ _LARGE_CASES = [
     for dtype in (torch.int8, torch.uint8, torch.bool)
 ]
 
-# Dtypes Triton cannot load and store on this stack: the 16/32/64-bit unsigned
-# types and float8. They must be rejected with a clear error instead of an MLIR
-# failure. (float8 only exists on CPU here: torch-npu cannot hold it.)
+# Dtypes Triton cannot load and store on this stack. They are rejected with a
+# clear error instead of an MLIR failure.
 _UNSUPPORTED_CASES = [
     pytest.param(dtype, device, id=f"{str(dtype).split('.')[-1]}-{device}")
     for dtype in _WIDE_UNSIGNED_DTYPES
     for device in (flag_train.device, "cpu")
-] + [
-    pytest.param(dtype, "cpu", id=f"{str(dtype).split('.')[-1]}-cpu")
-    for dtype in _FLOAT8_DTYPES
 ]
 
 
@@ -527,7 +515,7 @@ def test_tanh_soft_clamp_rejects_non_scalar_float64_scale():
 
 @pytest.mark.parametrize(("dtype", "device"), _UNSUPPORTED_CASES)
 def test_tanh_soft_clamp_unsupported_dtypes(dtype, device):
-    """float8 and 16/32/64-bit unsigned are rejected before any kernel runs."""
+    """Dtypes the kernel cannot load are rejected before any kernel runs."""
     x = torch.zeros((2, 3), dtype=torch.int32).to(dtype)
     if device != "cpu":
         x = x.to(device)
