@@ -23,6 +23,7 @@ To specialise an operator, define it under this package, re-export it here
 which is what ``SpecOpRegistrar`` registers.
 """
 
+from .cuda_wf6af16_linear import cuda_wf6af16_linear
 from .mixed_moe_gemm import mixed_moe_gemm
 
-__all__ = ["mixed_moe_gemm"]
+__all__ = ["cuda_wf6af16_linear", "mixed_moe_gemm"]
