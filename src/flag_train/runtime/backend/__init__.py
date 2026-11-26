@@ -55,27 +55,27 @@ def operator_functions(module):
 
 
 def iter_package_functions(module):
-    """Yield ``(name, function)`` for ``module`` and every subpackage below it.
+    """Yield operators from a package, its public modules and its subpackages.
 
-    A backend operator package mirrors a generic ``flag_train`` package -- an
-    operator lives in ``<pkg>/<name>.py`` and is re-exported by that package's
-    ``__init__.py`` -- so reading the top-level module alone misses operators
-    hidden in a subpackage: importing the parent does not import its subpackages,
-    and only the parent was being read.
-
-    A subpackage yields after its parent, and subpackages are visited in name
-    order, so a name re-exported at two levels resolves to the deeper one, and
-    which of the two wins does not depend on the filesystem.
+    Package exports still work. An individual operator module must declare
+    ``__all__``. Private modules are left to explicit imports. Visit modules
+    before subpackages so that a deeper package can still override its parent.
     """
     if module is None:
         return
     yield from operator_functions(module)
-    for _, sub_name, is_pkg in sorted(pkgutil.iter_modules(module.__path__)):
-        if not is_pkg:
+    children = sorted(
+        pkgutil.iter_modules(module.__path__),
+        key=lambda entry: (entry.ispkg, entry.name),
+    )
+    for _, name, is_package in children:
+        if not is_package and name.startswith("_"):
             continue
-        yield from iter_package_functions(
-            importlib.import_module(f"{module.__name__}.{sub_name}")
-        )
+        child = importlib.import_module(f"{module.__name__}.{name}")
+        if is_package:
+            yield from iter_package_functions(child)
+        elif getattr(child, "__all__", None) is not None:
+            yield from operator_functions(child)
 
 
 class BackendState:
@@ -454,8 +454,12 @@ def get_customized_ops(vendor_name=None):
     # and caching a partial answer over this one. Registration itself runs once,
     # from flag_train/__init__.py, after every generic operator is imported.
     _state.customized_ops = []
-    for module in _state.operator_modules.values():
-        _state.customized_ops += iter_package_functions(module)
+    try:
+        for module in _state.operator_modules.values():
+            _state.customized_ops.extend(iter_package_functions(module))
+    except Exception:
+        _state.customized_ops = None
+        raise
     return _state.customized_ops
 
 
