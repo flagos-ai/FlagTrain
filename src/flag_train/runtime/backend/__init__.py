@@ -94,6 +94,14 @@ def iter_package_functions(
             yield from operator_functions(child)
 
 
+def export_operator_functions(namespace):
+    """Bind a public operator package to its declared implementation functions."""
+    module = sys.modules[namespace["__name__"]]
+    exports = dict(iter_package_functions(module, include_package_exports=False))
+    namespace.update(exports)
+    return sorted(exports, key=str.casefold)
+
+
 class BackendState:
     """Singleton class to manage backend state variables."""
 

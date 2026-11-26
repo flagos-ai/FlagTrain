@@ -21,6 +21,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["l2_normalization_backward"]
+
 
 @triton.jit
 def _l2_bwd_small(G, X, RN, DX, M: tl.constexpr, BLOCK_N: tl.constexpr):

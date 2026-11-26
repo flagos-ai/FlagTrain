@@ -1,12 +1,5 @@
-"""Megatron operators exported by their implementation modules."""
+"""Megatron operators."""
 
-import sys as _sys
+from flag_train.runtime.backend import export_operator_functions as _export_operators
 
-from flag_train.runtime.backend import iter_package_functions as _iter_package_functions
-
-_exports = dict(
-    _iter_package_functions(_sys.modules[__name__], include_package_exports=False)
-)
-__all__ = sorted(_exports, key=str.casefold)
-globals().update(_exports)
-del _exports
+__all__ = _export_operators(globals())

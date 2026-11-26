@@ -67,7 +67,7 @@ discovery. If a module has a missing dependency, FlagTrain skips that module
 and continues registering the remaining vendor overrides. Operators without a
 registered override keep their generic implementation.
 
-The public Megatron package uses the same declarations for generic operators.
-To add a Megatron operator, declare its public function in the implementation
-module's `__all__`. The package collects those names before applying the
-selected backend's overrides.
+The public DeepSpeed, Megatron, and Transformer Engine packages use the same
+declarations for generic operators. Declare the public function in its
+implementation module's `__all__`. FlagTrain collects these names before
+applying the selected backend's overrides.
