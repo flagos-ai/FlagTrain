@@ -54,16 +54,17 @@ def operator_functions(module):
     return [(name, bound[name]) for name in declared if name in bound]
 
 
-def iter_package_functions(module):
+def iter_package_functions(module, *, include_package_exports=True):
     """Yield operators from a package, its public modules and its subpackages.
 
-    Package exports still work. An individual operator module must declare
+    Package exports are optional. An individual operator module must declare
     ``__all__``. Private modules are left to explicit imports. Visit modules
     before subpackages so that a deeper package can still override its parent.
     """
     if module is None:
         return
-    yield from operator_functions(module)
+    if include_package_exports:
+        yield from operator_functions(module)
     children = sorted(
         pkgutil.iter_modules(module.__path__),
         key=lambda entry: (entry.ispkg, entry.name),
@@ -73,7 +74,9 @@ def iter_package_functions(module):
             continue
         child = importlib.import_module(f"{module.__name__}.{name}")
         if is_package:
-            yield from iter_package_functions(child)
+            yield from iter_package_functions(
+                child, include_package_exports=include_package_exports
+            )
         elif getattr(child, "__all__", None) is not None:
             yield from operator_functions(child)
 
@@ -455,8 +458,16 @@ def get_customized_ops(vendor_name=None):
     # from flag_train/__init__.py, after every generic operator is imported.
     _state.customized_ops = []
     try:
-        for module in _state.operator_modules.values():
-            _state.customized_ops.extend(iter_package_functions(module))
+        for package, module in _state.operator_modules.items():
+            try:
+                operators = list(iter_package_functions(module))
+            except ModuleNotFoundError as exc:
+                print(
+                    f"[Note] Skipping {vendor_name} {package} specializations: "
+                    f"{exc}. Generic operators will be used by default."
+                )
+                continue
+            _state.customized_ops.extend(operators)
     except Exception:
         _state.customized_ops = None
         raise

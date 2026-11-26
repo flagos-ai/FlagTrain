@@ -15,6 +15,8 @@
 
 from flag_train.megatron.weighted_swiglu_funciton import _weighted_swiglu
 
+__all__ = ["weighted_swiglu_funciton"]
+
 
 def weighted_swiglu_funciton(y, weights):
     return _weighted_swiglu(y, weights, use_libdevice=False)

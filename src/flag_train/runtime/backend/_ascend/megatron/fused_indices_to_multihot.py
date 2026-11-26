@@ -23,6 +23,8 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 
+__all__ = ["fused_indices_to_multihot"]
+
 logger = logging.getLogger(__name__)
 
 _NUM_WARPS = 1

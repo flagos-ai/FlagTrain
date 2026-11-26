@@ -27,6 +27,8 @@ from flag_train.megatron.tanh_soft_clamp import (
 )
 from flag_train.runtime.backend._ascend.utils import CORE_NUM
 
+__all__ = ["tanh_soft_clamp"]
+
 logger = logging.getLogger(__name__)
 
 

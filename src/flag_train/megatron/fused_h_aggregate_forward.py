@@ -61,6 +61,8 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["fused_h_aggregate_forward"]
+
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
