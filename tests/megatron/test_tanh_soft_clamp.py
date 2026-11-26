@@ -22,8 +22,6 @@ import flag_train
 
 from .. import accuracy_utils as utils
 
-pytestmark = pytest.mark.tanh_soft_clamp
-
 _FULL_SHAPES = [
     (),
     (0,),
@@ -387,6 +385,7 @@ def test_tanh_soft_clamp(shape, dtype, scale):
     check(x, scale)
 
 
+@pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize(("values", "scales", "equal_nan", "dtype"), _VALUE_CASES)
 def test_tanh_soft_clamp_boundary_values(values, scales, equal_nan, dtype):
     """Curve landmarks and non-finite/zero-scale inputs the grid cannot draw."""
@@ -395,6 +394,7 @@ def test_tanh_soft_clamp_boundary_values(values, scales, equal_nan, dtype):
         check(x, scale, equal_nan=equal_nan)
 
 
+@pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize(("dtype", "device", "scale"), _INTEGRAL_CASES)
 def test_tanh_soft_clamp_integral_dtypes(dtype, device, scale):
     """Integer and bool tensors cast back to their input dtype."""
@@ -425,6 +425,7 @@ def test_tanh_soft_clamp_integral_dtypes(dtype, device, scale):
         ), "more than half of the integer casts differ"
 
 
+@pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize(("device", "dtype", "layout", "scale"), _LAYOUT_CASES)
 def test_tanh_soft_clamp_layout_and_device(device, dtype, layout, scale):
     """Strided views keep their strides; empty and CPU tensors stay on the CPU."""
@@ -442,6 +443,7 @@ def test_tanh_soft_clamp_layout_and_device(device, dtype, layout, scale):
     assert out.device == x.device
 
 
+@pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize("device", [flag_train.device, "cpu"])
 @pytest.mark.parametrize(("x_shape", "scale_value", "dtype"), _SCALE_FORM_CASES)
 def test_tanh_soft_clamp_tensor_scale(x_shape, scale_value, dtype, device):
@@ -457,6 +459,7 @@ def test_tanh_soft_clamp_tensor_scale(x_shape, scale_value, dtype, device):
     assert out.shape == torch.broadcast_shapes(x_shape, scale.shape)
 
 
+@pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize(("shape", "dtype"), _LARGE_CASES)
 def test_tanh_soft_clamp_large_shapes(shape, dtype):
     """The walk kernel and the width-dependent tile (an int8 ub-overflow pin)."""
@@ -468,6 +471,7 @@ def test_tanh_soft_clamp_large_shapes(shape, dtype):
     check(x, 0.5)
 
 
+@pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_tanh_soft_clamp_tensor_scale_noncontiguous(dtype):
     """A same-shape scale pairs with a transposed input in logical order."""
@@ -479,6 +483,7 @@ def test_tanh_soft_clamp_tensor_scale_noncontiguous(dtype):
     assert out.shape == x.shape
 
 
+@pytest.mark.tanh_soft_clamp
 def test_tanh_soft_clamp_rank_raising_scale():
     """A one-element scale can raise the output's rank over a strided input."""
     utils.init_seed(5)
@@ -489,12 +494,14 @@ def test_tanh_soft_clamp_rank_raising_scale():
     assert out.shape == (1, 3, 4)
 
 
+@pytest.mark.tanh_soft_clamp
 @pytest.mark.skipif(not utils.fp64_is_supported, reason="device has no fp64")
 def test_tanh_soft_clamp_float64():
     x = torch.randn((2, 3, 7), dtype=torch.float64, device=flag_train.device)
     check(x, 0.5)
 
 
+@pytest.mark.tanh_soft_clamp
 @pytest.mark.skipif(not utils.fp64_is_supported, reason="device has no fp64")
 def test_tanh_soft_clamp_accepts_0dim_float64_scale():
     """A 0-dim float64 scale follows torch's wrapped-number rule and stays fp32."""
@@ -505,6 +512,7 @@ def test_tanh_soft_clamp_accepts_0dim_float64_scale():
     assert out.device == x.device
 
 
+@pytest.mark.tanh_soft_clamp
 def test_tanh_soft_clamp_rejects_non_scalar_float64_scale():
     """A shaped float64 scale would promote the expression to float64."""
     x = torch.zeros((2, 3), dtype=torch.float32, device=flag_train.device)
@@ -513,6 +521,7 @@ def test_tanh_soft_clamp_rejects_non_scalar_float64_scale():
         flag_train.megatron.tanh_soft_clamp(x, scale)
 
 
+@pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize(("dtype", "device"), _UNSUPPORTED_CASES)
 def test_tanh_soft_clamp_unsupported_dtypes(dtype, device):
     """Dtypes the kernel cannot load are rejected before any kernel runs."""
@@ -523,6 +532,7 @@ def test_tanh_soft_clamp_unsupported_dtypes(dtype, device):
         flag_train.megatron.tanh_soft_clamp(x, 0.5)
 
 
+@pytest.mark.tanh_soft_clamp
 def test_tanh_soft_clamp_api_contract():
     """The forward has no gradient, and invalid operands are rejected."""
     x = torch.randn((2, 3), device=flag_train.device, requires_grad=True)
