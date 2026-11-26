@@ -54,12 +54,16 @@ def operator_functions(module):
     return [(name, bound[name]) for name in declared if name in bound]
 
 
-def iter_package_functions(module, *, include_package_exports=True):
+def iter_package_functions(
+    module, *, include_package_exports=True, skip_missing_dependencies=False
+):
     """Yield operators from a package, its public modules and its subpackages.
 
     Package exports are optional. An individual operator module must declare
     ``__all__``. Private modules are left to explicit imports. Visit modules
     before subpackages so that a deeper package can still override its parent.
+
+    Vendor discovery can skip individual modules with missing dependencies.
     """
     if module is None:
         return
@@ -72,10 +76,19 @@ def iter_package_functions(module, *, include_package_exports=True):
     for _, name, is_package in children:
         if not is_package and name.startswith("_"):
             continue
-        child = importlib.import_module(f"{module.__name__}.{name}")
+        module_name = f"{module.__name__}.{name}"
+        try:
+            child = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if not skip_missing_dependencies:
+                raise
+            print(f"[Note] Skipping backend module {module_name}: {exc}")
+            continue
         if is_package:
             yield from iter_package_functions(
-                child, include_package_exports=include_package_exports
+                child,
+                include_package_exports=include_package_exports,
+                skip_missing_dependencies=skip_missing_dependencies,
             )
         elif getattr(child, "__all__", None) is not None:
             yield from operator_functions(child)
@@ -458,15 +471,10 @@ def get_customized_ops(vendor_name=None):
     # from flag_train/__init__.py, after every generic operator is imported.
     _state.customized_ops = []
     try:
-        for package, module in _state.operator_modules.items():
-            try:
-                operators = list(iter_package_functions(module))
-            except ModuleNotFoundError as exc:
-                print(
-                    f"[Note] Skipping {vendor_name} {package} specializations: "
-                    f"{exc}. Generic operators will be used by default."
-                )
-                continue
+        for module in _state.operator_modules.values():
+            operators = list(
+                iter_package_functions(module, skip_missing_dependencies=True)
+            )
             _state.customized_ops.extend(operators)
     except Exception:
         _state.customized_ops = None

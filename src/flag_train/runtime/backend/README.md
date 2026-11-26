@@ -63,8 +63,9 @@ __all__ = ["lamb"]
 
 During registration, FlagTrain imports public modules in the selected backend's
 operator packages. Prefix internal helper modules with `_` to keep them out of
-discovery. Operators without a registered override keep their generic
-implementation.
+discovery. If a module has a missing dependency, FlagTrain skips that module
+and continues registering the remaining vendor overrides. Operators without a
+registered override keep their generic implementation.
 
 The public Megatron package uses the same declarations for generic operators.
 To add a Megatron operator, declare its public function in the implementation
