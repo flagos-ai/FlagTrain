@@ -14,8 +14,10 @@
 
 ops:
 - id: bias_geglu_impl
-  description: 'Bias plus GeGLU fusion: bias add, gate/linear split, and GELU
-    gating in one kernel. Forward only.'
+  description: 'Bias plus GeGLU forward: bias add, gate/linear split, and GELU
+    gating, following Megatron''s broadcasting and dtype-promotion rules; the
+    activation is computed by a Triton kernel, with CPU operands staged through
+    the accelerator. Forward only.'
   for:
   - bias_geglu_impl
   labels:
