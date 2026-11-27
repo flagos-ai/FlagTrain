@@ -20,7 +20,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 
 __all__ = ["router_gating_linear_function"]
@@ -820,13 +819,11 @@ class _RouterGatingLinear(torch.autograd.Function):
 
 
 def router_gating_linear_function(inp, weight, bias, router_dtype):
-    """Project router logits and support first-order gradients on NVIDIA CUDA.
+    """Project router logits and support first-order gradients.
 
     Weight has shape (experts, hidden). Bias may be None or a vector of length
     experts. The output replaces the input's last dimension with experts.
     """
-    if runtime_device.vendor_name != "nvidia" or inp.device.type != "cuda":
-        raise NotImplementedError("Router gating linear requires an NVIDIA CUDA tensor")
     if inp.ndim < 2 or weight.ndim != 2 or inp.size(-1) != weight.size(1):
         raise ValueError("Expected input [..., hidden] and weight [experts, hidden]")
     if bias is not None and bias.shape != (weight.size(0),):
