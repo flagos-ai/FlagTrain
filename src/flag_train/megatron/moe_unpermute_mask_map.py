@@ -20,6 +20,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["moe_unpermute_mask_map"]
+
 
 @triton.jit
 def _unpermute_kernel(
