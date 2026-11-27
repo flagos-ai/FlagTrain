@@ -17,6 +17,8 @@
 
 import torch
 
+__all__ = ["moe_aux_loss_auto_scaler_backward"]
+
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 

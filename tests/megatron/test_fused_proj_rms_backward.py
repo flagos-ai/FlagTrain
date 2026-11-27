@@ -106,7 +106,11 @@ _BENCHMARK_SHAPES = [
 _DTYPES = [torch.float16, torch.float32]
 if utils.bf16_is_supported:
     _DTYPES.append(torch.bfloat16)
+# FP32 correctness is already covered by ``_SHAPES``; add FP64 here so the
+# benchmark shapes also exercise the fp64 kernel path.
 _BENCHMARK_DTYPES = [dtype for dtype in _DTYPES if dtype is not torch.float32]
+if utils.fp64_is_supported:
+    _BENCHMARK_DTYPES.append(torch.float64)
 
 _MIXED_DTYPES = [(torch.float16, torch.float32), (torch.float32, torch.float16)]
 if utils.bf16_is_supported:
@@ -161,6 +165,18 @@ def native_proj_rms_ref(x, weight, eps=1e-6):
     K = x.shape[-1]
     v = norm / math.sqrt(K) + eps
     r = 1.0 / v
+    return proj, r
+
+
+def native_proj_rms_main_ref(x, weight, eps=1e-6, eps_inside_sqrt=False):
+    """Megatron main's ``native_proj_rms``: fp32 projection and norm."""
+    xf = x.to(torch.float32)
+    wf = weight.to(torch.float32)
+    proj = torch.matmul(xf, wf.t())
+    if eps_inside_sqrt:
+        r = torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + eps)
+    else:
+        r = 1.0 / (xf.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1]) + eps)
     return proj, r
 
 
@@ -233,10 +249,21 @@ def _reference_arithmetic():
 # kernel accumulates in fp32 and rounds once. 5e-2 for bf16 is also the band
 # Megatron-LM's own mHC kernel tests allow for a backward.
 _TOL = {
+    torch.float64: 1e-6,
     torch.float32: 1e-4,
     torch.float16: 2e-2,
     torch.bfloat16: 5e-2,
 }
+
+# CPU fp64 inputs are staged to the accelerator, so they need a Triton backend
+# that can execute fp64; fp32 CPU coverage still runs on every device.
+_FP64_CPU = pytest.param(
+    torch.float64,
+    marks=pytest.mark.skipif(
+        not utils.fp64_is_supported, reason="device does not support fp64"
+    ),
+)
+_CPU_DTYPES = [torch.float32, _FP64_CPU]
 
 
 def _assert_close(res, ref, dtype, tol):
@@ -279,8 +306,45 @@ def _oracle_backward(x, weight, grad_proj, grad_r, eps):
 
     with _reference_arithmetic():
         proj, r = _native_proj_rms(x, weight, eps)
+        # Megatron main's proj/r are fp32 while the harness hands the operator
+        # narrow gradients; narrow -> wide is exact, so this is the same
+        # incoming gradient the installed contract expects.
+        grad_proj = grad_proj.to(proj.dtype)
+        grad_r = grad_r.to(r.dtype)
         grad_x, grad_weight = torch.autograd.grad(
             (proj, r), (x, weight), (grad_proj, grad_r)
+        )
+    return grad_x.detach(), grad_weight.detach()
+
+
+def _oracle_backward_legacy(x, weight, grad_proj, grad_r, eps):
+    """Autograd through the 0.17.x/legacy torch reference."""
+    x = utils.to_reference(x).detach().clone().requires_grad_(True)
+    weight = utils.to_reference(weight).detach().clone().requires_grad_(True)
+    grad_proj = utils.to_reference(grad_proj)
+    grad_r = utils.to_reference(grad_r)
+    with _reference_arithmetic():
+        proj, r = native_proj_rms_ref(x, weight, eps)
+        grad_x, grad_weight = torch.autograd.grad(
+            (proj, r),
+            (x, weight),
+            (grad_proj.to(proj.dtype), grad_r.to(r.dtype)),
+        )
+    return grad_x.detach(), grad_weight.detach()
+
+
+def _oracle_backward_main(x, weight, grad_proj, grad_r, eps, eps_inside_sqrt):
+    """Autograd through Megatron main's fp32 ``native_proj_rms``."""
+    x = utils.to_reference(x).detach().clone().requires_grad_(True)
+    weight = utils.to_reference(weight).detach().clone().requires_grad_(True)
+    grad_proj = utils.to_reference(grad_proj)
+    grad_r = utils.to_reference(grad_r)
+    with _reference_arithmetic():
+        proj, r = native_proj_rms_main_ref(x, weight, eps, eps_inside_sqrt)
+        grad_x, grad_weight = torch.autograd.grad(
+            (proj, r),
+            (x, weight),
+            (grad_proj.to(proj.dtype), grad_r.to(r.dtype)),
         )
     return grad_x.detach(), grad_weight.detach()
 
@@ -290,18 +354,18 @@ def _operands(shape, dtype):
 
     With a short reduction, a row whose norm is near zero is lifted to
     ``_MIN_ROW_NORM``. The gradient's coefficient term goes as
-    ``grad_r * x / |x|^3``, i.e. ``grad_x`` grows as ``1 / |x|^2``; below
-    ``|x| ~ 0.01`` that leaves fp16's range, and the two sides then differ by an
-    inf only because their rounding of ``|x|`` landed on either side of the
-    overflow. Rows at the floor are what that test is about, and they are covered
-    deliberately by ``test_fused_proj_rms_backward_zero_rows``.
+    ``grad_r * x / |x|^3``, i.e. ``grad_x`` grows as ``1 / |x|^2``; near zero
+    the reference's own input rounding is amplified by the same factor, which
+    exhausts fp16's range and bf16's 8-bit mantissa before the floor. Rows at
+    the floor are what that test is about, and they are covered deliberately by
+    ``test_fused_proj_rms_backward_zero_rows``.
     """
     M, N, K = shape
     device = flag_train.device
     x = torch.randn((M, K), dtype=dtype, device=device)
-    if dtype == torch.float16 and K < 16:
-        # fp16 -> fp32 -> fp16 is exact, so rows above the floor come back
-        # bit-identical and only the degenerate ones move.
+    if dtype in (torch.float16, torch.bfloat16) and K < 16:
+        # narrow dtype -> fp32 -> narrow is exact, so rows above the floor come
+        # back bit-identical and only the degenerate ones move.
         norm = x.float().norm(dim=1, keepdim=True)
         x = (x.float() * (_MIN_ROW_NORM / norm.clamp_min(1e-30)).clamp(min=1.0)).to(
             dtype
@@ -315,15 +379,17 @@ def _operands(shape, dtype):
 
 def _check(x, weight, grad_proj, grad_r, eps=_EPS):
     """Run the operator against the oracle and return its gradients."""
-    promoted = torch.promote_types(x.dtype, weight.dtype)
     _, r = flag_train.megatron.fused_proj_rms_forward(x, weight, eps)
     grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
         x, weight, grad_proj, grad_r, r
     )
     grad_x_ref, grad_weight_ref = _oracle_backward(x, weight, grad_proj, grad_r, eps)
 
-    _assert_close(grad_x, grad_x_ref, x.dtype, _TOL[promoted])
-    _assert_close(grad_weight, grad_weight_ref, weight.dtype, _TOL[promoted])
+    # The gradients are returned in each operand's dtype; on Megatron main the
+    # fp32 arithmetic is rounded into that dtype at the end, so the output
+    # dtype's resolution is the right tolerance in both compatibility modes.
+    _assert_close(grad_x, grad_x_ref, x.dtype, _TOL[x.dtype])
+    _assert_close(grad_weight, grad_weight_ref, weight.dtype, _TOL[weight.dtype])
     return grad_x, grad_weight
 
 
@@ -505,6 +571,60 @@ def test_fused_proj_rms_backward_mixed_dtype(dtype, weight_dtype):
 
 
 @pytest.mark.fused_proj_rms_backward
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_fused_proj_rms_backward_megatron_main_contract(dtype, eps_inside_sqrt):
+    """The fp32-output/inside-sqrt backward contract used by Megatron main."""
+    shape = (7, 24, 512) if utils.QUICK_MODE else (257, 24, 1024)
+    M, N, K = shape
+    x, weight, _, _ = _operands(shape, dtype)
+    device = flag_train.device
+    grad_proj = torch.randn((M, N), dtype=torch.float32, device=device)
+    grad_r = torch.randn((M, 1), dtype=torch.float32, device=device)
+
+    _, r = flag_train.megatron.fused_proj_rms_forward(
+        x,
+        weight,
+        _EPS,
+        eps_inside_sqrt=eps_inside_sqrt,
+        fp32_output=True,
+    )
+    grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
+        x,
+        weight,
+        grad_proj,
+        grad_r,
+        r,
+        eps_inside_sqrt=eps_inside_sqrt,
+        fp32_output=True,
+    )
+    grad_x_ref, grad_weight_ref = _oracle_backward_main(
+        x, weight, grad_proj, grad_r, _EPS, eps_inside_sqrt
+    )
+
+    assert grad_x.dtype == x.dtype and grad_weight.dtype == weight.dtype
+    _assert_close(grad_x, grad_x_ref, x.dtype, _TOL[x.dtype])
+    _assert_close(grad_weight, grad_weight_ref, weight.dtype, _TOL[weight.dtype])
+
+
+@pytest.mark.fused_proj_rms_backward
+def test_fused_proj_rms_backward_rejects_legacy_inside_sqrt():
+    """The inside-sqrt gradient only exists in the fp32-output Megatron."""
+    x, weight, grad_proj, grad_r = _operands((7, 24, 512), torch.float32)
+    _, r = flag_train.megatron.fused_proj_rms_forward(x, weight, _EPS)
+    with pytest.raises(ValueError, match="fp32-output"):
+        flag_train.megatron.fused_proj_rms_backward(
+            x,
+            weight,
+            grad_proj,
+            grad_r,
+            r,
+            eps_inside_sqrt=True,
+            fp32_output=False,
+        )
+
+
+@pytest.mark.fused_proj_rms_backward
 @pytest.mark.parametrize("shape", [(0, 24, 4096), (16, 0, 4096), (16, 24, 0)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_fused_proj_rms_backward_empty(shape, dtype):
@@ -536,6 +656,222 @@ def test_fused_proj_rms_backward_contract(dtype):
         assert torch.equal(tensor, copy)
 
 
+def _operands_nd(shape, dtype, device=None):
+    """``(x, weight, grad_proj, grad_r)`` for an arbitrary leading shape."""
+    device = device or flag_train.device
+    K = shape[-1]
+    N = 24
+    x = torch.randn(shape, dtype=dtype, device=device)
+    weight = torch.randn((N, K), dtype=torch.float32, device=device)
+    weight = (weight / math.sqrt(max(K, 1))).to(dtype)
+    grad_proj = torch.randn(shape[:-1] + (N,), dtype=dtype, device=device)
+    grad_r = torch.randn(shape[:-1] + (1,), dtype=dtype, device=device)
+    return x, weight, grad_proj, grad_r
+
+
+@pytest.mark.fused_proj_rms_backward
+@pytest.mark.parametrize("shape", [(128,), (3, 5, 128), (2, 3, 4, 128)])
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_fused_proj_rms_backward_nd(shape, dtype):
+    """Leading axes are shape only; grad shapes follow the forward."""
+    x, weight, grad_proj, grad_r = _operands_nd(shape, dtype)
+    _, r = flag_train.megatron.fused_proj_rms_forward(x, weight, _EPS)
+    grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
+        x, weight, grad_proj, grad_r, r
+    )
+    grad_x_ref, grad_weight_ref = _oracle_backward(x, weight, grad_proj, grad_r, _EPS)
+
+    assert grad_x.shape == x.shape and grad_weight.shape == weight.shape
+    _assert_close(grad_x, grad_x_ref, x.dtype, _TOL[x.dtype])
+    _assert_close(grad_weight, grad_weight_ref, weight.dtype, _TOL[weight.dtype])
+
+
+@pytest.mark.fused_proj_rms_backward
+@pytest.mark.parametrize("dtype", _CPU_DTYPES)
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_fused_proj_rms_backward_cpu(dtype, eps_inside_sqrt):
+    """CPU stages through the accelerator and uses the Triton kernels."""
+    shape = (2, 3, 4, 128)
+    x, weight, grad_proj, grad_r = _operands_nd(shape, dtype, device="cpu")
+    _, r = flag_train.megatron.fused_proj_rms_forward(
+        x, weight, _EPS, eps_inside_sqrt=eps_inside_sqrt, fp32_output=True
+    )
+    grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
+        x,
+        weight,
+        grad_proj.to(torch.float32),
+        grad_r.to(torch.float32),
+        r,
+        eps_inside_sqrt=eps_inside_sqrt,
+        fp32_output=True,
+    )
+    grad_x_ref, grad_weight_ref = _oracle_backward_main(
+        x,
+        weight,
+        grad_proj.to(torch.float32),
+        grad_r.to(torch.float32),
+        _EPS,
+        eps_inside_sqrt,
+    )
+
+    assert grad_x.device.type == "cpu" and grad_weight.device.type == "cpu"
+    assert grad_x.shape == x.shape and grad_weight.shape == weight.shape
+    # The recipe is fp32 here, so the fp64 band does not apply even when the
+    # gradients are widened back to the input dtype.
+    _assert_close(grad_x, grad_x_ref, x.dtype, _TOL[torch.float32])
+    _assert_close(grad_weight, grad_weight_ref, weight.dtype, _TOL[torch.float32])
+
+
+@pytest.mark.fused_proj_rms_backward
+@pytest.mark.parametrize("dtype", _CPU_DTYPES)
+def test_fused_proj_rms_backward_cpu_legacy(dtype):
+    """The 0.17.x contract on CPU keeps the input dtype."""
+    shape = (2, 3, 128)
+    x, weight, grad_proj, grad_r = _operands_nd(shape, dtype, device="cpu")
+    _, r = flag_train.megatron.fused_proj_rms_forward(
+        x, weight, _EPS, fp32_output=False
+    )
+    grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
+        x, weight, grad_proj, grad_r, r, fp32_output=False
+    )
+    grad_x_ref, grad_weight_ref = _oracle_backward_legacy(
+        x, weight, grad_proj, grad_r, _EPS
+    )
+
+    assert grad_x.dtype is dtype and grad_weight.dtype is dtype
+    _assert_close(grad_x, grad_x_ref, dtype, _TOL[dtype])
+    _assert_close(grad_weight, grad_weight_ref, dtype, _TOL[dtype])
+
+
+@pytest.mark.fused_proj_rms_backward
+@pytest.mark.parametrize("fp32_output", [False, True])
+@pytest.mark.parametrize("dtype", _CPU_DTYPES)
+def test_fused_proj_rms_backward_empty_n_cpu(dtype, fp32_output):
+    """N == 0 leaves an empty grad_weight, not an ambiguous reshape.
+
+    The kernel path has a dedicated RMS-only launch for this; the CPU staging
+    and fp64 paths must not build grad_weight with ``reshape(-1, 0)``.
+    """
+    M, K, N = 8, 64, 0
+    x = torch.randn((M, K), dtype=dtype, device="cpu")
+    weight = torch.empty((N, K), dtype=dtype, device="cpu")
+    grad_proj = torch.empty((M, N), dtype=dtype, device="cpu")
+    grad_r = torch.randn((M, 1), dtype=dtype, device="cpu")
+    _, r = flag_train.megatron.fused_proj_rms_forward(
+        x, weight, _EPS, fp32_output=fp32_output
+    )
+    grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
+        x, weight, grad_proj, grad_r, r, fp32_output=fp32_output
+    )
+    if fp32_output:
+        grad_x_ref, grad_weight_ref = _oracle_backward_main(
+            x, weight, grad_proj, grad_r, _EPS, False
+        )
+        tol = _TOL[torch.float32]
+    else:
+        grad_x_ref, grad_weight_ref = _oracle_backward_legacy(
+            x, weight, grad_proj, grad_r, _EPS
+        )
+        tol = _TOL[dtype]
+
+    assert grad_x.shape == x.shape and grad_weight.shape == weight.shape
+    assert grad_x.dtype is dtype and grad_weight.dtype is dtype
+    _assert_close(grad_x, grad_x_ref, dtype, tol)
+    _assert_close(grad_weight, grad_weight_ref, dtype, tol)
+
+
+@pytest.mark.fused_proj_rms_backward
+def test_fused_proj_rms_backward_cpu_main_resists_autocast():
+    """The main fp32 contract holds for gradients under an ambient autocast."""
+    shape = (2, 3, 128)
+    x, weight, grad_proj, grad_r = _operands_nd(shape, torch.float32, device="cpu")
+    _, r = flag_train.megatron.fused_proj_rms_forward(x, weight, _EPS, fp32_output=True)
+    grad_x_ref, grad_weight_ref = flag_train.megatron.fused_proj_rms_backward(
+        x, weight, grad_proj, grad_r, r, fp32_output=True
+    )
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
+            x, weight, grad_proj, grad_r, r, fp32_output=True
+        )
+
+    assert grad_x.dtype is torch.float32 and grad_weight.dtype is torch.float32
+    _assert_close(grad_x, grad_x_ref, torch.float32, _TOL[torch.float32])
+    _assert_close(grad_weight, grad_weight_ref, torch.float32, _TOL[torch.float32])
+
+
+@pytest.mark.fused_proj_rms_backward
+@pytest.mark.skipif(not utils.fp64_is_supported, reason="device does not support fp64")
+def test_fused_proj_rms_backward_empty_n_fp64():
+    """Legacy fp64 on the accelerator uses the Triton fp64 kernels."""
+    dtype = torch.float64
+    M, K = 8, 64
+    device = flag_train.device
+    x = torch.randn((M, K), dtype=dtype, device=device)
+    weight = torch.empty((0, K), dtype=dtype, device=device)
+    grad_proj = torch.empty((M, 0), dtype=dtype, device=device)
+    grad_r = torch.randn((M, 1), dtype=dtype, device=device)
+    _, r = flag_train.megatron.fused_proj_rms_forward(
+        x, weight, _EPS, fp32_output=False
+    )
+    grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
+        x, weight, grad_proj, grad_r, r, fp32_output=False
+    )
+    grad_x_ref, grad_weight_ref = _oracle_backward_legacy(
+        x, weight, grad_proj, grad_r, _EPS
+    )
+
+    assert grad_x.dtype is dtype and grad_weight.dtype is dtype
+    assert grad_x.shape == x.shape and grad_weight.shape == weight.shape
+    _assert_close(grad_x, grad_x_ref, dtype, _TOL[dtype])
+    _assert_close(grad_weight, grad_weight_ref, dtype, _TOL[dtype])
+
+
+@pytest.mark.fused_proj_rms_backward
+@pytest.mark.skipif(not utils.fp64_is_supported, reason="device does not support fp64")
+def test_fused_proj_rms_backward_fp64_legacy():
+    """Legacy fp64 uses the Triton fp64 kernels."""
+    dtype = torch.float64
+    shape = (3, 5, 128)
+    x, weight, grad_proj, grad_r = _operands_nd(shape, dtype)
+    _, r = flag_train.megatron.fused_proj_rms_forward(
+        x, weight, _EPS, fp32_output=False
+    )
+    grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
+        x, weight, grad_proj, grad_r, r, fp32_output=False
+    )
+    grad_x_ref, grad_weight_ref = _oracle_backward_legacy(
+        x, weight, grad_proj, grad_r, _EPS
+    )
+
+    assert grad_x.dtype is dtype and grad_weight.dtype is dtype
+    _assert_close(grad_x, grad_x_ref, dtype, _TOL[dtype])
+    _assert_close(grad_weight, grad_weight_ref, dtype, _TOL[dtype])
+
+
+@pytest.mark.fused_proj_rms_backward
+@pytest.mark.skipif(not utils.fp64_is_supported, reason="device does not support fp64")
+def test_fused_proj_rms_backward_fp64_main():
+    """Main-mode fp64 inputs are cast to fp32 for the kernels."""
+    dtype = torch.float64
+    shape = (3, 5, 128)
+    x, weight, _, _ = _operands_nd(shape, dtype)
+    device = flag_train.device
+    grad_proj = torch.randn(shape[:-1] + (24,), dtype=torch.float32, device=device)
+    grad_r = torch.randn(shape[:-1] + (1,), dtype=torch.float32, device=device)
+    _, r = flag_train.megatron.fused_proj_rms_forward(x, weight, _EPS, fp32_output=True)
+    grad_x, grad_weight = flag_train.megatron.fused_proj_rms_backward(
+        x, weight, grad_proj, grad_r, r, fp32_output=True
+    )
+    grad_x_ref, grad_weight_ref = _oracle_backward_main(
+        x, weight, grad_proj, grad_r, _EPS, False
+    )
+
+    assert grad_x.dtype is dtype and grad_weight.dtype is dtype
+    # Main-mode fp64 inputs are cast to fp32, so the fp32 band applies.
+    _assert_close(grad_x, grad_x_ref, dtype, _TOL[torch.float32])
+    _assert_close(grad_weight, grad_weight_ref, dtype, _TOL[torch.float32])
+
+
 @pytest.mark.fused_proj_rms_backward
 def test_fused_proj_rms_backward_rejects_bad_arguments():
     device = flag_train.device
@@ -547,7 +883,7 @@ def test_fused_proj_rms_backward_rejects_bad_arguments():
     op = flag_train.megatron.fused_proj_rms_backward
 
     with pytest.raises(ValueError):
-        op(x.unsqueeze(0), weight, grad_proj, grad_r, r)
+        op(torch.tensor(1.0, device=device), weight, grad_proj, grad_r, r)
     with pytest.raises(ValueError):
         op(
             x,

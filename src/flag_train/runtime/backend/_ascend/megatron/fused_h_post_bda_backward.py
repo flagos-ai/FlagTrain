@@ -33,6 +33,8 @@ from flag_train.megatron.fused_h_post_bda_backward import (
 )
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["fused_h_post_bda_backward"]
+
 logger = logging.getLogger(__name__)
 
 

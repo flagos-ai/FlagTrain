@@ -20,6 +20,8 @@ from torch.autograd.function import once_differentiable
 import flag_train
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["l2_normalization"]
+
 
 @triton.jit
 def _l2_forward(X, Y, RN, eps, WIDTH: tl.constexpr, BLOCK: tl.constexpr):

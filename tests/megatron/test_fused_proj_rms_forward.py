@@ -50,6 +50,7 @@ import torch
 
 import flag_train
 import flag_train.megatron
+from flag_train.megatron.fused_proj_rms_forward import _resolve_fp32_output
 
 from .. import accuracy_utils as utils
 
@@ -117,7 +118,11 @@ _BENCHMARK_SHAPES = [
 _DTYPES = [torch.float16, torch.float32]
 if utils.bf16_is_supported:
     _DTYPES.append(torch.bfloat16)
+# FP32 correctness is already covered by ``_SHAPES``; add FP64 here so the
+# benchmark shapes also exercise the fp64 kernel path.
 _BENCHMARK_DTYPES = [dtype for dtype in _DTYPES if dtype is not torch.float32]
+if utils.fp64_is_supported:
+    _BENCHMARK_DTYPES.append(torch.float64)
 
 # Mixed dtypes are a separate contract test; see
 # ``test_fused_proj_rms_forward_mixed_dtype``.
@@ -176,6 +181,18 @@ def native_proj_rms_ref(x, weight, eps=1e-6):
     K = x.shape[-1]
     v = norm / math.sqrt(K) + eps
     r = 1.0 / v
+    return proj, r
+
+
+def native_proj_rms_main_ref(x, weight, eps=1e-6, eps_inside_sqrt=False):
+    """Megatron main's ``native_proj_rms``: fp32 projection and norm."""
+    xf = x.to(torch.float32)
+    wf = weight.to(torch.float32)
+    proj = torch.matmul(xf, wf.t())
+    if eps_inside_sqrt:
+        r = torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + eps)
+    else:
+        r = 1.0 / (xf.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1]) + eps)
     return proj, r
 
 
@@ -260,10 +277,21 @@ def _reference_arithmetic():
 # the reference rounding its own intermediates into the narrow dtype. Each
 # entry is that band with an order of magnitude (fp32) or 2-4x of headroom.
 _TOL = {
+    torch.float64: 1e-6,
     torch.float32: 1e-4,
     torch.float16: 2e-2,
     torch.bfloat16: 5e-2,
 }
+
+# CPU fp64 inputs are staged to the accelerator, so they need a Triton backend
+# that can execute fp64; fp32 CPU coverage still runs on every device.
+_FP64_CPU = pytest.param(
+    torch.float64,
+    marks=pytest.mark.skipif(
+        not utils.fp64_is_supported, reason="device does not support fp64"
+    ),
+)
+_CPU_DTYPES = [torch.float32, _FP64_CPU]
 
 
 def _assert_close(res, ref, dtype, tol):
@@ -335,12 +363,21 @@ def _operands(shape, dtype):
     return x, weight
 
 
+def _expected_out_dtype(x, weight, fp32_output=None):
+    """The forward dtype of the installed Megatron contract."""
+    if _resolve_fp32_output(False, fp32_output):
+        return torch.float32
+    return torch.promote_types(x.dtype, weight.dtype)
+
+
 def _check(x, weight, dtype, eps=_EPS):
     """Run the operator against the oracle and return its outputs."""
+    assert x.dtype == dtype and weight.dtype == dtype
+    out_dtype = _expected_out_dtype(x, weight)
     proj, r = flag_train.megatron.fused_proj_rms_forward(x, weight, eps)
     proj_ref, r_ref = _oracle_forward(x, weight, eps)
-    _assert_close(proj, proj_ref, dtype, _TOL[dtype])
-    _assert_close(r, r_ref, dtype, _TOL[dtype])
+    _assert_close(proj, proj_ref, out_dtype, _TOL[out_dtype])
+    _assert_close(r, r_ref, out_dtype, _TOL[out_dtype])
     return proj, r
 
 
@@ -382,6 +419,7 @@ def test_fused_proj_rms_forward_zero_rows(dtype):
     x[::3] = 0.0
 
     proj, r = _check(x, weight, dtype)
+    out_dtype = _expected_out_dtype(x, weight)
 
     assert torch.all(proj[::3] == 0)
     # 1/eps in the output dtype. fp16 saturates to inf there, which is what the
@@ -389,7 +427,7 @@ def test_fused_proj_rms_forward_zero_rows(dtype):
     expected = torch.full(
         r[::3].shape, 1.0 / _EPS, dtype=torch.float32, device=r.device
     )
-    expected = expected.to(dtype).float()
+    expected = expected.to(out_dtype).float()
     torch.testing.assert_close(r[::3].float(), expected, rtol=1e-3, atol=0.0)
 
 
@@ -446,9 +484,49 @@ def test_fused_proj_rms_forward_mixed_dtype(dtype, weight_dtype):
         x.to(promoted), weight.to(promoted)
     )
 
-    assert proj.dtype == promoted and r.dtype == promoted
+    out_dtype = _expected_out_dtype(x, weight)
+    assert proj.dtype == out_dtype and r.dtype == out_dtype
     assert torch.equal(proj, proj_ref)
     assert torch.equal(r, r_ref)
+
+
+@pytest.mark.fused_proj_rms_forward
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_fused_proj_rms_forward_megatron_main_contract(dtype, eps_inside_sqrt):
+    """The fp32-output/inside-sqrt contract used by Megatron main.
+
+    ``fp32_output=True`` forces that contract even on a 0.17.x install, so both
+    compatibility modes are exercised on every host.
+    """
+    shape = (7, 24, 512) if utils.QUICK_MODE else (257, 24, 1024)
+    x, weight = _operands(shape, dtype)
+
+    proj, r = flag_train.megatron.fused_proj_rms_forward(
+        x,
+        weight,
+        _EPS,
+        eps_inside_sqrt=eps_inside_sqrt,
+        fp32_output=True,
+    )
+    with _reference_arithmetic():
+        proj_ref, r_ref = native_proj_rms_main_ref(
+            x, weight, _EPS, eps_inside_sqrt=eps_inside_sqrt
+        )
+
+    assert proj.dtype is torch.float32 and r.dtype is torch.float32
+    _assert_close(proj, proj_ref, torch.float32, _TOL[torch.float32])
+    _assert_close(r, r_ref, torch.float32, _TOL[torch.float32])
+
+
+@pytest.mark.fused_proj_rms_forward
+def test_fused_proj_rms_forward_rejects_legacy_inside_sqrt():
+    """The inside-sqrt mode only exists in the fp32-output Megatron."""
+    x, weight = _operands((7, 24, 512), torch.float32)
+    with pytest.raises(ValueError, match="fp32-output"):
+        flag_train.megatron.fused_proj_rms_forward(
+            x, weight, _EPS, eps_inside_sqrt=True, fp32_output=False
+        )
 
 
 @pytest.mark.fused_proj_rms_forward
@@ -473,11 +551,122 @@ def test_fused_proj_rms_forward_contract(dtype):
     x_copy, weight_copy = x.clone(), weight.clone()
 
     proj, r = flag_train.megatron.fused_proj_rms_forward(x, weight)
+    out_dtype = _expected_out_dtype(x, weight)
 
-    assert proj.shape == (129, 24) and proj.dtype == dtype
-    assert r.shape == (129, 1) and r.dtype == dtype
+    assert proj.shape == (129, 24) and proj.dtype == out_dtype
+    assert r.shape == (129, 1) and r.dtype == out_dtype
     assert proj.is_contiguous() and r.is_contiguous()
     assert torch.equal(x, x_copy) and torch.equal(weight, weight_copy)
+
+
+def _operands_nd(shape, dtype, device=None):
+    """``(x, weight)`` for an arbitrary leading shape; weight is [24, K]."""
+    device = device or flag_train.device
+    K = shape[-1]
+    N = 24
+    x = torch.randn(shape, dtype=dtype, device=device)
+    weight = torch.randn((N, K), dtype=torch.float32, device=device)
+    weight = (weight / math.sqrt(max(K, 1))).to(dtype)
+    return x, weight
+
+
+@pytest.mark.fused_proj_rms_forward
+@pytest.mark.parametrize("shape", [(128,), (3, 5, 128), (2, 3, 4, 128)])
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_fused_proj_rms_forward_nd(shape, dtype):
+    """Leading axes are shape only; the 2-D kernel is reused via a reshape."""
+    x, weight = _operands_nd(shape, dtype)
+    _check(x, weight, dtype)
+
+
+@pytest.mark.fused_proj_rms_forward
+@pytest.mark.parametrize("dtype", _CPU_DTYPES)
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_fused_proj_rms_forward_cpu(dtype, eps_inside_sqrt):
+    """CPU stages through the accelerator and uses the Triton kernels."""
+    shape = (2, 3, 4, 128)
+    x, weight = _operands_nd(shape, dtype, device="cpu")
+
+    proj, r = flag_train.megatron.fused_proj_rms_forward(
+        x, weight, _EPS, eps_inside_sqrt=eps_inside_sqrt, fp32_output=True
+    )
+    with _reference_arithmetic():
+        proj_ref, r_ref = native_proj_rms_main_ref(
+            x, weight, _EPS, eps_inside_sqrt=eps_inside_sqrt
+        )
+
+    assert proj.shape == shape[:-1] + (24,)
+    assert r.shape == shape[:-1] + (1,)
+    assert proj.device.type == "cpu" and r.device.type == "cpu"
+    assert proj.dtype is torch.float32 and r.dtype is torch.float32
+    _assert_close(proj, proj_ref, torch.float32, _TOL[torch.float32])
+    _assert_close(r, r_ref, torch.float32, _TOL[torch.float32])
+
+
+@pytest.mark.fused_proj_rms_forward
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_fused_proj_rms_forward_cpu_main_resists_autocast(dtype):
+    """The main contract stays fp32 under an ambient CPU autocast.
+
+    Megatron main wraps its recipe in ``autocast(enabled=False)`` so the fp32
+    matmul is not downcast to bf16. The Triton kernels carry no autocast state,
+    so they preserve the same contract; this pins that behaviour.
+    """
+    shape = (2, 3, 128)
+    x, weight = _operands_nd(shape, dtype, device="cpu")
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        proj, r = flag_train.megatron.fused_proj_rms_forward(
+            x, weight, _EPS, fp32_output=True
+        )
+    with _reference_arithmetic():
+        proj_ref, r_ref = native_proj_rms_main_ref(x, weight, _EPS)
+
+    assert proj.dtype is torch.float32 and r.dtype is torch.float32
+    _assert_close(proj, proj_ref, torch.float32, _TOL[torch.float32])
+    _assert_close(r, r_ref, torch.float32, _TOL[torch.float32])
+
+
+@pytest.mark.fused_proj_rms_forward
+@pytest.mark.parametrize("dtype", _CPU_DTYPES)
+def test_fused_proj_rms_forward_cpu_legacy(dtype):
+    """The 0.17.x contract on CPU keeps the input dtype."""
+    shape = (2, 3, 128)
+    x, weight = _operands_nd(shape, dtype, device="cpu")
+
+    proj, r = flag_train.megatron.fused_proj_rms_forward(
+        x, weight, _EPS, fp32_output=False
+    )
+    proj_ref, r_ref = native_proj_rms_ref(x, weight, _EPS)
+
+    assert proj.dtype is dtype and r.dtype is dtype
+    assert proj.device.type == "cpu" and r.device.type == "cpu"
+    _assert_close(proj, proj_ref, dtype, _TOL[dtype])
+    _assert_close(r, r_ref, dtype, _TOL[dtype])
+
+
+@pytest.mark.fused_proj_rms_forward
+@pytest.mark.skipif(not utils.fp64_is_supported, reason="device does not support fp64")
+@pytest.mark.parametrize("fp32_output", [False, True])
+def test_fused_proj_rms_forward_fp64(fp32_output):
+    """fp64 runs in the Triton fp64 kernels; main casts it to fp32."""
+    dtype = torch.float64
+    shape = (3, 5, 128)
+    x, weight = _operands_nd(shape, dtype)
+
+    proj, r = flag_train.megatron.fused_proj_rms_forward(
+        x, weight, _EPS, fp32_output=fp32_output
+    )
+    if fp32_output:
+        with _reference_arithmetic():
+            proj_ref, r_ref = native_proj_rms_main_ref(x, weight, _EPS)
+        out_dtype = torch.float32
+    else:
+        proj_ref, r_ref = native_proj_rms_ref(x, weight, _EPS)
+        out_dtype = dtype
+
+    assert proj.dtype is out_dtype and r.dtype is out_dtype
+    _assert_close(proj, proj_ref, out_dtype, _TOL[out_dtype])
+    _assert_close(r, r_ref, out_dtype, _TOL[out_dtype])
 
 
 @pytest.mark.fused_proj_rms_forward
@@ -488,7 +677,9 @@ def test_fused_proj_rms_forward_rejects_bad_arguments():
     op = flag_train.megatron.fused_proj_rms_forward
 
     with pytest.raises(ValueError):
-        op(x.unsqueeze(0), weight)
+        op(torch.tensor(1.0, device=device), weight)
+    with pytest.raises(ValueError):
+        op(x, weight.unsqueeze(0))
     with pytest.raises(ValueError):
         op(x, torch.randn((8, 16), dtype=torch.float32, device=device))
     with pytest.raises(ValueError):
@@ -497,5 +688,3 @@ def test_fused_proj_rms_forward_rejects_bad_arguments():
         op(x, weight, -1e-6)
     with pytest.raises(TypeError):
         op(x, weight.tolist())
-    with pytest.raises(ValueError):
-        op(x.cpu(), weight.cpu())

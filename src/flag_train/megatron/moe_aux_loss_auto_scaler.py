@@ -17,6 +17,8 @@ import torch
 
 from .moe_aux_loss_auto_scaler_backward import moe_aux_loss_auto_scaler_backward
 
+__all__ = ["moe_aux_loss_auto_scaler"]
+
 
 class _MoEAuxLossAutoScaler(torch.autograd.Function):
     @staticmethod
