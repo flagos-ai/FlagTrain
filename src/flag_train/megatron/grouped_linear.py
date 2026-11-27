@@ -27,6 +27,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["grouped_linear"]
+
 _HPAD = 4  # host split scalars carried in the kernel signature
 
 

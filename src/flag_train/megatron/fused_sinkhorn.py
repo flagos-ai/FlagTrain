@@ -21,6 +21,8 @@ import torch
 import triton
 import triton.language as tl
 
+__all__ = ["fused_sinkhorn"]
+
 # CUDA Triton ships libdevice under extra.cuda; FlagTree (Hygon/BW1000)
 # only provides the backend-neutral extra.libdevice.
 try:

@@ -36,6 +36,8 @@ from flag_train.deepspeed.mixed_gemm import mixed_gemm as _generic_mixed_gemm
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import tl_extra_shim
 
+__all__ = ["mixed_gemm"]
+
 logger = logging.getLogger(__name__)
 
 # Threshold where the unpack pass starts to pay off.
