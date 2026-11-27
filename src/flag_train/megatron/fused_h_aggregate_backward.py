@@ -78,6 +78,11 @@ _MIN_BLOCK_C = 32
 # ``[BLOCK_M, BLOCK_C]`` gradient tile and reduced, all in fp32. The budget is
 # spent on columns rather than rows -- see ``_config``.
 _TILE_ELEMENTS = 8192
+# Lane budget for the operand tile *plus* the ``[BLOCK_M, BLOCK_C]`` gradient
+# tile that is live beside it. Measured on the 192 KiB UB: 12288 lanes compile
+# (two streams, C=4096, one row block), while 16384 lanes require 197 KiB and
+# fail to lower.
+_TILE_LANES = 12288
 _MAX_BLOCK_M = 8
 
 
@@ -102,10 +107,11 @@ def _config(C, n_pad, sb):
     """Tile geometry for one launch.
 
     The column tile takes the whole row when the row fits in ``_MAX_BLOCK_C``,
-    and the row block gets whatever the tile budget leaves -- which at the wide
-    shapes is a single row. Wide columns are what this pass wants: the stream
-    loop over ``C`` shortens to two iterations at ``C = 4096`` and one at
-    ``C = 2048``, ``grad_output`` arrives in wide coalesced runs, and
+    then shrinks if one row of it would already exceed the tile budget, and the
+    row block gets whatever the operand-plus-gradient budget leaves -- which at
+    the wide shapes is a single row. Wide columns are what this pass wants: the
+    stream loop over ``C`` shortens to two iterations at ``C = 4096`` and one
+    at ``C = 2048``, ``grad_output`` arrives in wide coalesced runs, and
     ``grad_h`` reduces one wide contiguous axis per iteration instead of a
     narrow one many times. Measured over the sweep: 1.05-1.20x over the
     ``BLOCK_C = 512`` this started with at the shapes a step runs, 1.4x where
@@ -125,8 +131,19 @@ def _config(C, n_pad, sb):
     bookkeeping; measured at 0-15% across the sweep, never worse.
     """
     block_c = min(_MAX_BLOCK_C, max(_MIN_BLOCK_C, triton.next_power_of_2(max(C, 1))))
+    # One program holds the ``[BLOCK_M, N_PAD, BLOCK_C]`` operand, its product
+    # with the gradient tile and the pipeline stages in fp32. The column tile
+    # shrinks first: a single row times a full-width column tile is
+    # ``block_c * n_pad`` elements, which at n=8 / C=4096 is twice the budget
+    # and overflows the 192 KiB UB (measured: 205 KiB required).
+    block_c = min(block_c, max(_MIN_BLOCK_C, _TILE_ELEMENTS // n_pad))
     rows = 1 << (max(sb, 1).bit_length() - 1)
-    block_m = max(1, min(_MAX_BLOCK_M, _TILE_ELEMENTS // (block_c * n_pad), rows))
+    # ``tl.arange`` needs a power-of-two range, and the lane budget divides out
+    # to any integer (n=1, C=4096 leaves room for 3 rows). Round it down: the
+    # row block must not exceed what the tile budget allows.
+    lane_rows = max(1, _TILE_LANES // (block_c * (n_pad + 1)))
+    lane_rows = 1 << (lane_rows.bit_length() - 1)
+    block_m = max(1, min(_MAX_BLOCK_M, lane_rows, rows))
     num_warps = 4 if block_m * block_c <= 4096 else 8
     num_stages = 2
     return block_m, block_c, num_warps, num_stages

@@ -27,6 +27,7 @@ the eager body underneath is what is differentiated here.
 """
 
 import importlib.metadata
+import math
 import warnings
 
 import pytest
@@ -164,13 +165,30 @@ _TOL_GRAD_H = {
     torch.bfloat16: 1e-1,
 }
 
+# A reduction over a handful of outputs can cancel below the rounding noise of
+# its terms: one output may come out near zero while the terms are O(1), which
+# makes the result's own RMS a useless error scale. ``sqrt(C) * RMS(terms)``
+# bounds the reference's term-by-term rounding and, by Cauchy-Schwarz, is never
+# below the result's RMS. Only computed where the term tensor is small; with
+# many outputs the result RMS is already the terms' scale.
+_TERM_SCALE_ELEMENTS = 1 << 22
 
-def _assert_close(res, ref, dtype, tol):
+
+def _reduction_scale(grad_output, x):
+    """``sqrt(C) * RMS`` of ``grad_output * x`` over the reduced axis."""
+    if x.numel() == 0 or x.numel() > _TERM_SCALE_ELEMENTS:
+        return 0.0
+    terms = grad_output.float().unsqueeze(2) * x.float()
+    return math.sqrt(x.shape[-1]) * terms.pow(2).mean().sqrt().item()
+
+
+def _assert_close(res, ref, dtype, tol, floor=0.0):
     """Compare with the repo ``train_assert_close`` at ``tol`` of the reference's RMS.
 
     The RMS-scaled ``atol`` holds every element to the same budget, which is the
     elementwise form of the relative Frobenius error; the helper adds its
-    standard per-dtype ``rtol`` on top.
+    standard per-dtype ``rtol`` on top. ``floor`` keeps a reduction's scale from
+    collapsing when its outputs cancel.
     """
     assert res.dtype == dtype, (res.dtype, dtype)
     assert res.shape == ref.shape, (res.shape, ref.shape)
@@ -181,7 +199,9 @@ def _assert_close(res, ref, dtype, tol):
         return
     finite = torch.isfinite(ref)
     scale = ref[finite].float().pow(2).mean().sqrt().item() if finite.any() else 0.0
-    utils.train_assert_close(res, ref, dtype, equal_nan=True, atol=tol * scale)
+    utils.train_assert_close(
+        res, ref, dtype, equal_nan=True, atol=tol * max(floor, scale)
+    )
 
 
 def _oracle_backward(grad_output, x, h_pre):
@@ -212,7 +232,14 @@ def _check(grad_output, x, h_pre, dtype, h_dtype=None):
     )
     grad_x_ref, grad_h_ref = _oracle_backward(grad_output, x, h_pre)
     _assert_close(grad_x, grad_x_ref, dtype, _TOL_GRAD_X[dtype])
-    _assert_close(grad_h, grad_h_ref, h_dtype or dtype, _TOL_GRAD_H[h_dtype or dtype])
+    h_out_dtype = h_dtype or dtype
+    _assert_close(
+        grad_h,
+        grad_h_ref,
+        h_out_dtype,
+        _TOL_GRAD_H[h_out_dtype],
+        floor=_reduction_scale(grad_output, x),
+    )
     return grad_x, grad_h
 
 
