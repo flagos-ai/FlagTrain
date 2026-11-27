@@ -36,6 +36,7 @@ contiguous buffer (a layout copy, not a compute fallback); layouts
 
 import logging
 import numbers
+from typing import NamedTuple, Optional
 
 import torch
 import triton
@@ -168,6 +169,51 @@ def _activate(
     return gate_v * lin
 
 
+@triton.jit
+def _bias_swiglu_tile(
+    x_ptr,
+    bias_ptr,
+    y_ptr,
+    row,
+    start,
+    n_cols,
+    clamp_value,
+    gate_scale,
+    linear_scale,
+    BIAS_MODE: tl.constexpr,
+    MODE: tl.constexpr,
+    HAS_LINEAR_CLAMP: tl.constexpr,
+    ADD_DTYPE: tl.constexpr,
+    COMPUTE_DTYPE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Bias add and activation for one column block of one row."""
+    hidden = n_cols * 2
+    cols = start + tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    x_row = x_ptr + row * hidden
+    y_row = y_ptr + row * n_cols
+    gate = tl.load(x_row + cols, mask=mask, other=0.0).to(ADD_DTYPE)
+    linear = tl.load(x_row + n_cols + cols, mask=mask, other=0.0).to(ADD_DTYPE)
+    if BIAS_MODE == 1:
+        gate += tl.load(bias_ptr + cols, mask=mask, other=0.0).to(ADD_DTYPE)
+        linear += tl.load(bias_ptr + n_cols + cols, mask=mask, other=0.0).to(ADD_DTYPE)
+    elif BIAS_MODE == 2:
+        bias_row = bias_ptr + row * hidden
+        gate += tl.load(bias_row + cols, mask=mask, other=0.0).to(ADD_DTYPE)
+        linear += tl.load(bias_row + n_cols + cols, mask=mask, other=0.0).to(ADD_DTYPE)
+    out = _activate(
+        gate.to(COMPUTE_DTYPE),
+        linear.to(COMPUTE_DTYPE),
+        clamp_value,
+        gate_scale,
+        linear_scale,
+        MODE,
+        HAS_LINEAR_CLAMP,
+    )
+    tl.store(y_row + cols, out.to(y_ptr.dtype.element_ty), mask=mask)
+
+
 @libentry()
 @triton.jit
 def _bias_swiglu_forward_kernel(
@@ -185,37 +231,26 @@ def _bias_swiglu_forward_kernel(
     COMPUTE_DTYPE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Portable launch: one program per row."""
     row = tle.program_id(0)
-    hidden = n_cols * 2
-    x_row = x_ptr + row * hidden
-    y_row = y_ptr + row * n_cols
-    bias_row = bias_ptr + row * hidden
-
     for start in tl.range(0, n_cols, BLOCK):
-        cols = start + tl.arange(0, BLOCK)
-        mask = cols < n_cols
-        gate = tl.load(x_row + cols, mask=mask, other=0.0).to(ADD_DTYPE)
-        linear = tl.load(x_row + n_cols + cols, mask=mask, other=0.0).to(ADD_DTYPE)
-        if BIAS_MODE == 1:
-            gate += tl.load(bias_ptr + cols, mask=mask, other=0.0).to(ADD_DTYPE)
-            linear += tl.load(bias_ptr + n_cols + cols, mask=mask, other=0.0).to(
-                ADD_DTYPE
-            )
-        elif BIAS_MODE == 2:
-            gate += tl.load(bias_row + cols, mask=mask, other=0.0).to(ADD_DTYPE)
-            linear += tl.load(bias_row + n_cols + cols, mask=mask, other=0.0).to(
-                ADD_DTYPE
-            )
-        out = _activate(
-            gate.to(COMPUTE_DTYPE),
-            linear.to(COMPUTE_DTYPE),
+        _bias_swiglu_tile(
+            x_ptr,
+            bias_ptr,
+            y_ptr,
+            row,
+            start,
+            n_cols,
             clamp_value,
             gate_scale,
             linear_scale,
+            BIAS_MODE,
             MODE,
             HAS_LINEAR_CLAMP,
+            ADD_DTYPE,
+            COMPUTE_DTYPE,
+            BLOCK,
         )
-        tl.store(y_row + cols, out.to(y_ptr.dtype.element_ty), mask=mask)
 
 
 def _launch_config(n_cols):
@@ -238,48 +273,167 @@ def _flatten_input(x):
     # error there too. The copy that follows is a layout operation, not a
     # compute fallback.
     flat = x.view(-1, hidden)
+    # Some vendor PyTorch builds (MetaX mcPyTorch) replace a view() that cannot
+    # express the target shape with contiguous().view() instead of raising, so
+    # the upstream error would never surface. A real view shares storage; a
+    # replaced one has a freshly allocated buffer, which the pointer reveals.
+    if x.numel() != 0 and flat.data_ptr() != x.data_ptr():
+        raise RuntimeError(
+            "bias_swiglu input cannot be viewed as "
+            f"(*, {hidden}): shape {tuple(x.shape)} with strides "
+            f"{tuple(x.stride())} is not compatible with view()"
+        )
     if not flat.is_contiguous():
         flat = flat.contiguous()
     out_shape = (*x.shape[:-1], hidden // 2)
     return flat, out_shape
 
 
-def _forward(flat, bias, mode, clamp, gate_scale, linear_scale, out_dtype):
-    """Run the kernel over a flattened ``[rows, hidden]`` view."""
+class _Prepared(NamedTuple):
+    """Operands and launch parameters after validation, staging and copies."""
+
+    x_flat: torch.Tensor
+    bias_arg: torch.Tensor
+    out: torch.Tensor
+    out_flat: torch.Tensor
+    rows: int
+    n_cols: int
+    bias_mode: int
+    mode: int
+    clamp: float
+    gate_scale: float
+    linear_scale: Optional[float]
+    out_dtype: torch.dtype
+    staged: bool
+    device: torch.device
+    rank: int
+    out_shape: tuple
+
+
+def _prepare(input, bias, clamp_value, gate_clamp_scale, linear_clamp_scale):
+    """Validate/normalize operands and return what a launch needs.
+
+    The host work is shared by the portable implementation and the Ascend
+    override; only the launch geometry and kernel differ.
+    """
+    if not isinstance(input, torch.Tensor):
+        raise TypeError(f"bias_swiglu input needs a tensor, got {type(input).__name__}")
+    if bias is not None and not isinstance(bias, torch.Tensor):
+        raise TypeError(
+            f"bias_swiglu bias needs a tensor or None, got {type(bias).__name__}"
+        )
+    assert input.ndim in (2, 3), (
+        f"bias_swiglu input must have rank 2 or 3, got rank {input.ndim} "
+        f"shape {tuple(input.shape)}"
+    )
+    assert gate_clamp_scale is not None or linear_clamp_scale is None
+    assert gate_clamp_scale is None or clamp_value is None
+
+    if input.dtype not in _DTYPES:
+        wanted = " / ".join(str(dtype) for dtype in _DTYPES)
+        raise ValueError(
+            f"bias_swiglu input needs a {wanted} tensor, got {input.dtype}"
+        )
+    if bias is not None:
+        if bias.dtype not in _DTYPES:
+            wanted = " / ".join(str(dtype) for dtype in _DTYPES)
+            raise ValueError(
+                f"bias_swiglu bias needs a {wanted} tensor, got {bias.dtype}"
+            )
+        if bias.device != input.device:
+            raise ValueError("bias_swiglu input and bias must be on the same device")
+
+    cpu_input = input.device.type == "cpu"
+    if cpu_input and runtime_device.name == "cpu":
+        raise ValueError(
+            "bias_swiglu needs an active accelerator to serve a CPU tensor"
+        )
+    if not cpu_input and input.device.type != runtime_device.name:
+        raise ValueError(
+            f"bias_swiglu needs a tensor on the active device, got {input.device.type}"
+        )
+    out_dtype = (
+        input.dtype if bias is None else torch.promote_types(input.dtype, bias.dtype)
+    )
+
+    mode, clamp, gate_scale, linear_scale = _variant(
+        clamp_value, gate_clamp_scale, linear_clamp_scale
+    )
+    flat, out_shape = _flatten_input(input)
+    if cpu_input:
+        # Serve CPU tensors by moving the operands to the accelerator and the
+        # result back. These are copies, not torch activation arithmetic.
+        with torch_device_fn.device(runtime_device.name):
+            flat = flat.to(runtime_device.name)
+            if bias is not None:
+                bias = bias.to(runtime_device.name)
+
     n_rows, hidden = flat.shape
     n_cols = hidden // 2
     bias_tensor, bias_mode = _prepare_bias(bias, flat)
-    if n_rows == 0 or n_cols == 0:
-        return torch.empty((n_rows, n_cols), dtype=out_dtype, device=flat.device)
+    out = torch.empty((n_rows, n_cols), dtype=out_dtype, device=flat.device)
+    return _Prepared(
+        flat,
+        # An absent bias borrows the input pointer; BIAS_MODE stops the kernel
+        # from reading it.
+        flat if bias_tensor is None else bias_tensor,
+        out,
+        out.view(n_rows, n_cols),
+        n_rows,
+        n_cols,
+        bias_mode,
+        mode,
+        clamp,
+        gate_scale,
+        linear_scale,
+        out_dtype,
+        cpu_input,
+        flat.device,
+        input.ndim,
+        out_shape,
+    )
 
-    block, num_warps = _launch_config(n_cols)
-    y = torch.empty((n_rows, n_cols), dtype=out_dtype, device=flat.device)
+
+def _launch(prep):
+    """Launch the portable one-program-per-row kernel."""
+    if prep.rows == 0 or prep.n_cols == 0:
+        return
+    block, num_warps = _launch_config(prep.n_cols)
     # Narrow outputs keep the add in fp32; this matches the rounding the
     # compiled Megatron path exhibits for the same fp16/bf16 inputs.
-    add_dtype = tl.float64 if out_dtype == torch.float64 else tl.float32
+    add_dtype = tl.float64 if prep.out_dtype == torch.float64 else tl.float32
     compute_dtype = (
-        tl.float64 if mode == _MODE_PLAIN and out_dtype == torch.float64 else tl.float32
+        tl.float64
+        if prep.mode == _MODE_PLAIN and prep.out_dtype == torch.float64
+        else tl.float32
     )
-    with torch_device_fn.device(flat.device):
-        _bias_swiglu_forward_kernel[(n_rows,)](
-            flat,
-            # An absent bias borrows the input pointer; BIAS_MODE stops the
-            # kernel from reading it.
-            flat if bias_tensor is None else bias_tensor,
-            y,
-            n_cols,
-            clamp,
-            gate_scale,
-            1.0 if linear_scale is None else linear_scale,
-            BIAS_MODE=bias_mode,
-            MODE=mode,
-            HAS_LINEAR_CLAMP=linear_scale is not None,
+    with torch_device_fn.device(prep.device):
+        _bias_swiglu_forward_kernel[(prep.rows,)](
+            prep.x_flat,
+            prep.bias_arg,
+            prep.out_flat,
+            prep.n_cols,
+            prep.clamp,
+            prep.gate_scale,
+            1.0 if prep.linear_scale is None else prep.linear_scale,
+            BIAS_MODE=prep.bias_mode,
+            MODE=prep.mode,
+            HAS_LINEAR_CLAMP=prep.linear_scale is not None,
             ADD_DTYPE=add_dtype,
             COMPUTE_DTYPE=compute_dtype,
             BLOCK=block,
             num_warps=num_warps,
         )
-    return y
+
+
+def _finish(prep):
+    """The operator's return value: a staged result comes back on the CPU."""
+    y = prep.out.to("cpu") if prep.staged else prep.out
+    # Megatron-LM restores the 3-D shape with ``view(ori_shape[0],
+    # ori_shape[1], -1)``. The ``-1`` is ambiguous for a 0-element tensor, so a
+    # 3-D input whose leading dimensions contain zero raises RuntimeError.
+    # Keep that behavior: this operator mirrors the upstream entry point.
+    return y if prep.rank == 2 else y.view(prep.out_shape[0], prep.out_shape[1], -1)
 
 
 def bias_swiglu_impl(
@@ -322,77 +476,12 @@ def bias_swiglu_impl(
         ValueError: If the input/bias is on different devices, has an
             unsupported dtype, or a CPU tensor is given without an active
             accelerator.
-        RuntimeError: If a 3-D input has zero elements. Megatron-LM restores
-            the 3-D shape with ``view(..., -1)``, which is ambiguous for a
-            0-element tensor; this operator mirrors that behavior.
+        RuntimeError: If a non-contiguous input's layout cannot be expressed as
+            ``view(-1, hidden)``, or if a 3-D input has zero elements.
+            Megatron-LM uses ``view()`` for both, so this operator mirrors that
+            behavior even on PyTorch builds that silently copy instead.
     """
     logger.debug("TRAIN BIAS_SWIGLU_IMPL")
-    if not isinstance(input, torch.Tensor):
-        raise TypeError(f"bias_swiglu input needs a tensor, got {type(input).__name__}")
-    if bias is not None and not isinstance(bias, torch.Tensor):
-        raise TypeError(
-            f"bias_swiglu bias needs a tensor or None, got {type(bias).__name__}"
-        )
-    assert input.ndim in (2, 3), (
-        f"bias_swiglu input must have rank 2 or 3, got rank {input.ndim} "
-        f"shape {tuple(input.shape)}"
-    )
-    assert gate_clamp_scale is not None or linear_clamp_scale is None
-    assert gate_clamp_scale is None or clamp_value is None
-
-    if input.dtype not in _DTYPES:
-        wanted = " / ".join(str(dtype) for dtype in _DTYPES)
-        raise ValueError(
-            f"bias_swiglu input needs a {wanted} tensor, got {input.dtype}"
-        )
-    if bias is not None:
-        if bias.dtype not in _DTYPES:
-            wanted = " / ".join(str(dtype) for dtype in _DTYPES)
-            raise ValueError(
-                f"bias_swiglu bias needs a {wanted} tensor, got {bias.dtype}"
-            )
-        if bias.device != input.device:
-            raise ValueError("bias_swiglu input and bias must be on the same device")
-
-    cpu_input = input.device.type == "cpu"
-    if cpu_input and runtime_device.name == "cpu":
-        raise ValueError(
-            "bias_swiglu needs an active accelerator to serve a CPU tensor"
-        )
-    if not cpu_input and input.device.type != runtime_device.name:
-        raise ValueError(
-            "bias_swiglu needs a tensor on the active device, got "
-            f"{input.device.type}"
-        )
-    out_dtype = (
-        input.dtype if bias is None else torch.promote_types(input.dtype, bias.dtype)
-    )
-
-    mode, clamp, gate_scale, linear_scale = _variant(
-        clamp_value, gate_clamp_scale, linear_clamp_scale
-    )
-    flat, out_shape = _flatten_input(input)
-    if cpu_input:
-        # Serve CPU tensors by moving the operands to the accelerator and the
-        # result back. These are copies, not torch activation arithmetic.
-        with torch_device_fn.device(runtime_device.name):
-            flat = flat.to(runtime_device.name)
-            bias_for_kernel = None if bias is None else bias.to(runtime_device.name)
-            y = _forward(
-                flat,
-                bias_for_kernel,
-                mode,
-                clamp,
-                gate_scale,
-                linear_scale,
-                out_dtype,
-            )
-        y = y.to("cpu")
-    else:
-        y = _forward(flat, bias, mode, clamp, gate_scale, linear_scale, out_dtype)
-
-    # Megatron-LM restores the 3-D shape with ``view(ori_shape[0],
-    # ori_shape[1], -1)``. The ``-1`` is ambiguous for a 0-element tensor, so a
-    # 3-D input whose leading dimensions contain zero raises RuntimeError.
-    # Keep that behavior: this operator mirrors the upstream entry point.
-    return y if input.ndim == 2 else y.view(out_shape[0], out_shape[1], -1)
+    prep = _prepare(input, bias, clamp_value, gate_clamp_scale, linear_clamp_scale)
+    _launch(prep)
+    return _finish(prep)
