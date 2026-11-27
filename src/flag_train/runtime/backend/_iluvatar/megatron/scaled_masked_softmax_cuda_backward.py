@@ -34,6 +34,8 @@ from flag_train.megatron.scaled_masked_softmax_cuda_backward import (
 )
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["scaled_masked_softmax_cuda_backward"]
+
 logger = logging.getLogger(__name__)
 
 

@@ -25,6 +25,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["weighted_squared_relu_impl"]
+
 logger = logging.getLogger(__name__)
 
 _WEIGHTED_SQUARED_RELU_DTYPES = (

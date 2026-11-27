@@ -56,10 +56,8 @@ class use_train:
         )
 
 
-# The operators are deliberately absent: they are reached through
-# ``flag_train.deepspeed``, which is the one place their names are enumerated and
-# the place the vendor registration rewrites. This exports only what the top level
-# itself defines.
+# Operators are exported through their DeepSpeed, Megatron, or Transformer
+# Engine packages. The top level exposes the runtime and compatibility names.
 __all__ = [
     "device",
     "use_train",

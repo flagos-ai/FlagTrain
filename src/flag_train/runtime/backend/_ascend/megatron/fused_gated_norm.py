@@ -73,6 +73,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.runtime.backend._ascend.utils import CORE_NUM
 from flag_train.utils import libentry
 
+__all__ = ["fused_gated_norm"]
+
 logger = logging.getLogger(__name__)
 
 # Elements in one program's tile; see the module docstring for why this size

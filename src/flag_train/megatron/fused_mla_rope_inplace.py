@@ -21,6 +21,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["fused_mla_rope_inplace"]
+
 
 @triton.jit
 def _mla_rope_inplace_kernel(
