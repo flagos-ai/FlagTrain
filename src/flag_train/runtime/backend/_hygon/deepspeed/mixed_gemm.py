@@ -125,6 +125,8 @@ from flag_train.deepspeed.mixed_gemm import (
 )
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["mixed_gemm"]
+
 logger = logging.getLogger(__name__)
 
 # (BLOCK_K, BLOCK_N, num_warps) of the dequantization kernel, per bit width; see the

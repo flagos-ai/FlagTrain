@@ -17,6 +17,8 @@
 
 import torch
 
+__all__ = ["dsa_indexer_loss_auto_scaler"]
+
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
