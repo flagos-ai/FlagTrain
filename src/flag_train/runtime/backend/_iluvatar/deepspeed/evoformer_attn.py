@@ -74,6 +74,8 @@ import triton.language as tl
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 
+__all__ = ["evoformer_attn"]
+
 logger = logging.getLogger(__name__)
 
 # log2(e): the softmax runs on exp2, so this converts the natural-log domain the

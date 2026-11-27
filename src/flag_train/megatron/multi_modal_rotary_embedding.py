@@ -33,6 +33,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["multi_modal_rotary_embedding"]
+
 
 @triton.jit
 def _mrope_freqs_kernel(

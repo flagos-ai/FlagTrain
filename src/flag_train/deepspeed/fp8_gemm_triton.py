@@ -29,6 +29,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["fp8_gemm_triton"]
+
 logger = logging.getLogger(__name__)
 
 

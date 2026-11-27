@@ -97,11 +97,15 @@ _BENCHMARK_SHAPES = [
     (8192, 4096, 8192),
 ]
 
-# The upstream stage runs on FP16/BF16 activations; FP32 is the correctness
-# suite's exact-arithmetic path, not what a training step pays for here.
+# The upstream stage runs on FP16/BF16 activations. FP32 and FP64 are timed on
+# the same shapes to cover the exact-arithmetic and compatibility paths; FP64 is
+# skipped on devices that cannot execute it.
 _DTYPES = [torch.float16]
 if flag_train.runtime.device.support_bf16:
     _DTYPES.append(torch.bfloat16)
+_DTYPES.append(torch.float32)
+if flag_train.runtime.device.support_fp64:
+    _DTYPES.append(torch.float64)
 
 # ---------------------------------------------------------------------------
 # Megatron baseline
@@ -293,7 +297,8 @@ class FusedProjRmsBackwardBenchmark(base.GenericBenchmark):
         io_bytes = x.numel() * element  # x
         io_bytes += weight.numel() * weight.element_size()  # weight
         io_bytes += grad_proj.numel() * grad_proj.element_size()  # grad_proj
-        io_bytes += 2 * M * element  # grad_r and r
+        io_bytes += grad_r.numel() * grad_r.element_size()  # grad_r
+        io_bytes += r.numel() * r.element_size()  # r
         io_bytes += M * K * element  # grad_x
         io_bytes += N * K * element  # grad_weight
         return io_bytes * 1e-9 / (latency * 1e-3)

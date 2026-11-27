@@ -33,6 +33,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["fused_dsa_indexer_loss"]
+
 _NEG_INF = tl.constexpr(float("-inf"))
 _TINY = tl.constexpr(1e-10)
 

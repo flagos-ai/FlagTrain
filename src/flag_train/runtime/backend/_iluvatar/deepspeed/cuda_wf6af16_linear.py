@@ -49,6 +49,8 @@ from flag_train.deepspeed.cuda_wf6af16_linear import (
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 
+__all__ = ["cuda_wf6af16_linear"]
+
 logger = logging.getLogger(__name__)
 
 

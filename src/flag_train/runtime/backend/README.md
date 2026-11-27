@@ -50,15 +50,24 @@ You should configure  `triton.autotune` params in `FlagTrain/src/flag_train/runt
 generic `flag_train` package they replace: an override for
 `flag_train.deepspeed.blocked_flash` is `deepspeed/blocked_flash.py` here, one for
 `flag_train.megatron.fused_gated_norm` is `megatron/fused_gated_norm.py`, and so
-on. Re-export each operator from its package's `__init__.py` and list it in that
-package's `__all__`; that is what `SpecOpRegistrar` registers, and a name that is
-not listed keeps the generic implementation.
+on. Declare the functions to register in each operator module's `__all__`.
+Keep the package's `__init__.py` to mark the package. It can be empty for new
+packages, and existing package-level exports remain supported.
 
-For instance, to customise `flag_train.deepspeed.lamb`, place the implementation in
-`deepspeed/lamb.py` and configure `deepspeed/__init__.py` accordingly:
+For instance, to specialise `flag_train.deepspeed.lamb`, add the implementation
+to `deepspeed/lamb.py` with this declaration:
+
 ```python
-from .blocked_flash import blocked_flash
-from .lamb import lamb
-
-__all__ = ["blocked_flash", "lamb"]
+__all__ = ["lamb"]
 ```
+
+During registration, FlagTrain imports public modules in the selected backend's
+operator packages. Prefix internal helper modules with `_` to keep them out of
+discovery. If a module has a missing dependency, FlagTrain skips that module
+and continues registering the remaining vendor overrides. Operators without a
+registered override keep their generic implementation.
+
+The public DeepSpeed, Megatron, and Transformer Engine packages use the same
+declarations for generic operators. Declare the public function in its
+implementation module's `__all__`. FlagTrain collects these names before
+applying the selected backend's overrides.
