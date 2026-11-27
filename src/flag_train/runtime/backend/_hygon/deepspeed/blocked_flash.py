@@ -37,6 +37,8 @@ from flag_train.deepspeed.blocked_flash import (
 )
 from flag_train.utils import libentry
 
+__all__ = ["blocked_flash"]
+
 logger = logging.getLogger(__name__)
 
 

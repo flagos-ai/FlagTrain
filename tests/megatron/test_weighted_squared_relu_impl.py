@@ -547,9 +547,9 @@ def test_weighted_squared_relu_rejects_complex_clamp(clamp_shape):
 # unsigned 16/32/64-bit operands on Ascend (``mul_out_npu_no_check``), so there
 # is nothing to compare against on that vendor.
 @pytest.mark.skipif(
-    flag_train.vendor_name == "ascend",
+    flag_train.vendor_name in ["ascend", "metax"],
     reason="Megatron's baseline mul rejects unsigned 16/32/64-bit weights "
-    "on Ascend (mul_out_npu_no_check)",
+    "on Ascend and MetaX",
 )
 @pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
 def test_weighted_squared_relu_accepts_unsigned_weights(dtype):

@@ -41,6 +41,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["moe_chunk_sort"]
+
 
 @triton.jit
 def _map_in_rows(

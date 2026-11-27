@@ -39,6 +39,8 @@ from flag_train.runtime.backend._ascend.utils import CORE_NUM
 from flag_train.utils import libentry, tl_extra_shim
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["bias_swiglu_impl"]
+
 logger = logging.getLogger(__name__)
 
 _BLOCK_SIZE = 1024

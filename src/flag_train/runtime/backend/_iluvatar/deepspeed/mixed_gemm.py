@@ -40,6 +40,8 @@ from flag_train.deepspeed.mixed_gemm import (
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import tl_extra_shim
 
+__all__ = ["mixed_gemm"]
+
 logger = logging.getLogger(__name__)
 
 # Largest decode tile tried on the widest benchmarked shape won (16384x4096: 2.04 / 0.88 /
