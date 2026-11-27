@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+__all__ = ["mtp_loss_auto_scaler"]
+
 
 @triton.jit
 def _fill_grad(output, scale, size, BLOCK: tl.constexpr):

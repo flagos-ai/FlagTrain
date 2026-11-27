@@ -31,6 +31,8 @@ from flag_train.runtime.backend._ascend.utils import CORE_NUM
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["quick_gelu"]
+
 logger = logging.getLogger(__name__)
 
 BLOCK = 1024

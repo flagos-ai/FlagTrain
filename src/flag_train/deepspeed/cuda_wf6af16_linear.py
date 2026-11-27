@@ -50,6 +50,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["cuda_wf6af16_linear"]
+
 logger = logging.getLogger(__name__)
 
 

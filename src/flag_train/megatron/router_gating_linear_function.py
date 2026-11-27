@@ -23,6 +23,8 @@ import triton.language as tl
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["router_gating_linear_function"]
+
 # ---------------------------------------------------------------------------
 # dtype ids:  0 -> bfloat16, 1 -> float16, 2 -> float32
 # ---------------------------------------------------------------------------

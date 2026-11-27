@@ -36,6 +36,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["moe_permute_mask_map"]
+
 
 @triton.jit
 def _moe_permute_fused(

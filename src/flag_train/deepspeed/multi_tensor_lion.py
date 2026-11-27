@@ -23,6 +23,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["multi_tensor_lion"]
+
 logger = logging.getLogger(__name__)
 
 # DeepSpeed's DISPATCH_DOUBLE_FLOAT_AND_HALF also includes BFloat16.

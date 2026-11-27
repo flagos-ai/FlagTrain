@@ -26,6 +26,8 @@ from flag_train.megatron.fused_sinkhorn import (
 )
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["fused_sinkhorn"]
+
 _BACKWARD_WORKSPACE_BYTES = 32 * 1024**2
 
 

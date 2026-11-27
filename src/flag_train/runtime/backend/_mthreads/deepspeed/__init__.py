@@ -11,18 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Backend ``deepspeed`` operators.
-
-Mirrors ``flag_train.deepspeed``: a specialised operator goes in the same-named
-module here as the generic one it replaces -- ``deepspeed/lamb.py`` beside
-``flag_train/deepspeed/lamb.py`` -- so which generic module an override belongs to
-is readable from the path.
-
-To specialise an operator, define it under this package, re-export it here
-(``from .mixed_moe_gemm import mixed_moe_gemm``) and list it in ``__all__``,
-which is what ``SpecOpRegistrar`` registers.
-"""
-
-from .mixed_moe_gemm import mixed_moe_gemm
-
-__all__ = ["mixed_moe_gemm"]
+"""Backend ``deepspeed`` operators."""
