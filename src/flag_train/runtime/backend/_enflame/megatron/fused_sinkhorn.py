@@ -24,6 +24,8 @@ from flag_train.runtime import torch_device_fn
 
 from .. import arch_version
 
+__all__ = ["fused_sinkhorn"]
+
 
 @triton.jit
 def _round(value, dtype: tl.constexpr):

@@ -65,6 +65,8 @@ from flag_train.megatron.fused_gated_norm import _check_arguments, _row_offset
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 
+__all__ = ["fused_gated_norm"]
+
 logger = logging.getLogger(__name__)
 
 # The widest tile the selector asks for, and the row count past which the

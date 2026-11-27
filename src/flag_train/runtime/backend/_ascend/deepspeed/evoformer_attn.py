@@ -51,6 +51,8 @@ from flag_train.deepspeed.evoformer_attn import (
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 
+__all__ = ["evoformer_attn"]
+
 logger = logging.getLogger(__name__)
 
 _MAX_PROGRAMS = 32768

@@ -76,6 +76,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["lamb"]
+
 logger = logging.getLogger(__name__)
 
 # Master weights and moments are kept in one of these dtypes.  fp64 is only

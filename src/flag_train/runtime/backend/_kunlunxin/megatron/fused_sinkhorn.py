@@ -21,6 +21,8 @@ import triton.language as tl
 from flag_train.megatron.fused_sinkhorn import _prepare_sinkhorn, _TorchSinkhorn
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["fused_sinkhorn"]
+
 
 @triton.jit
 def _round(value, dtype: tl.constexpr):

@@ -25,6 +25,8 @@ from flag_train.runtime import torch_device_fn
 
 from .. import arch_version
 
+__all__ = ["multi_modal_rotary_embedding"]
+
 
 @triton.jit
 def _load_position(positions, offset, mask):

@@ -11,15 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""T-Head ``deepspeed`` operators.
-
-A specialised operator goes in the same-named module here as the generic one it
-replaces -- ``deepspeed/blocked_flash.py`` beside
-``flag_train/deepspeed/blocked_flash.py`` -- and is listed in ``__all__`` below,
-which is what ``SpecOpRegistrar`` registers.
-"""
-
-from .blocked_flash import blocked_flash
-from .mixed_gemm import mixed_gemm
-
-__all__ = ["blocked_flash", "mixed_gemm"]
+"""T-Head ``deepspeed`` operators."""

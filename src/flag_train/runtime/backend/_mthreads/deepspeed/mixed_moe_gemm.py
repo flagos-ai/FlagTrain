@@ -32,6 +32,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry, tl_extra_shim
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["mixed_moe_gemm"]
+
 logger = logging.getLogger(__name__)
 
 # MUSA-specific: one stage avoids the async copy that the vendor llc cannot

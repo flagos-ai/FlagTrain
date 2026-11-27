@@ -23,6 +23,8 @@ from flag_train.megatron.multi_modal_rotary_embedding import (
 )
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["multi_modal_rotary_embedding"]
+
 
 @triton.jit
 def _frequencies(
