@@ -38,7 +38,9 @@ import torch
 from torch._dynamo import config as dynamo_config
 
 OP_NAME = "fused_proj_rms_forward"
-DTYPES = [torch.float16, torch.bfloat16]
+# FP32/FP64 cover the exact-arithmetic and compatibility paths. Re-collect the
+# checked-in NV baseline after changing this list.
+DTYPES = [torch.float16, torch.bfloat16, torch.float32, torch.float64]
 IS_INPLACE = False
 
 # benchmark/megatron/test_fused_proj_rms_forward.py::_BENCHMARK_SHAPES

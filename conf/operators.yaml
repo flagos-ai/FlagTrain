@@ -285,7 +285,8 @@ ops:
   stages:
   - beta: '0.0.0'
 - id: fused_proj_rms_forward
-  description: Fused projection (x @ weight^T) and RMS scale 1 / (||x|| / sqrt(K) + eps).
+  description: 'Fused projection (x @ weight^T) and RMS scale: 1 / (||x|| / sqrt(K) + eps), or
+    rsqrt(mean(x^2) + eps) with eps_inside_sqrt=True.'
   for:
   - fused_proj_rms_forward
   labels:

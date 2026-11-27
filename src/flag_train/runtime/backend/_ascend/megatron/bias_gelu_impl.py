@@ -63,6 +63,8 @@ from flag_train.runtime.backend._ascend.utils import CORE_NUM
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["bias_gelu_impl"]
+
 logger = logging.getLogger(__name__)
 
 

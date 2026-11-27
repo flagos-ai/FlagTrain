@@ -39,6 +39,8 @@ from flag_train.utils.codegen_config_utils import (
     get_heuristics_for_num_warps,
 )
 
+__all__ = ["tanh_soft_clamp"]
+
 logger = logging.getLogger(__name__)
 
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)

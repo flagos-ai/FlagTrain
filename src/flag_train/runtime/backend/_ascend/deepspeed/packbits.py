@@ -21,6 +21,8 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 
+__all__ = ["packbits"]
+
 try:
     from triton.language.extra.cann import extension as _cann
 except ImportError:

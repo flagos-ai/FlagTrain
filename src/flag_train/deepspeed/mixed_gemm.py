@@ -39,6 +39,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry, tl_extra_shim
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["mixed_gemm"]
+
 logger = logging.getLogger(__name__)
 
 # ``ActivationType`` values, from DeepSpeed's ``utils/activation_type.h``. ``IDENTITY`` is 6, not 0.

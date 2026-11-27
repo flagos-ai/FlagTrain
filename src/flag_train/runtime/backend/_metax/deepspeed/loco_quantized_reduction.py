@@ -46,6 +46,8 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 
+__all__ = ["loco_quantized_reduction"]
+
 logger = logging.getLogger(__name__)
 
 

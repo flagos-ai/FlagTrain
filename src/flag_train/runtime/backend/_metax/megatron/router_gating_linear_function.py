@@ -22,6 +22,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["router_gating_linear_function"]
+
 _RD_FP32 = 0
 _RD_FP16 = 1
 _RD_BF16 = 2

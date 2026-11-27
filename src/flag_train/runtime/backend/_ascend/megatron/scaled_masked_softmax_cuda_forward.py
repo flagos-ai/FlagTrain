@@ -43,6 +43,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.runtime.backend._ascend.utils import CORE_NUM
 from flag_train.utils import libentry
 
+__all__ = ["scaled_masked_softmax_cuda_forward"]
+
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)

@@ -12,6 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fused_sinkhorn import fused_sinkhorn
-
-__all__ = ["fused_sinkhorn"]
+"""Enflame Megatron operators."""

@@ -23,6 +23,8 @@ from flag_train.megatron.router_gating_linear_function import (
 )
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["router_gating_linear_function"]
+
 _FP32 = 0
 _FP16 = 1
 _BF16 = 2

@@ -22,6 +22,8 @@ import triton.language as tl
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["router_gating_linear_function"]
+
 
 @triton.jit
 def _cast_pair(X, W, X_OUT, W_OUT, nx, nw, SPLIT: tl.constexpr, BLOCK: tl.constexpr):
