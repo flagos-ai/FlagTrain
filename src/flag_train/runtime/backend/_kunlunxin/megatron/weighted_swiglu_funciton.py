@@ -24,6 +24,8 @@ from flag_train.megatron.weighted_swiglu_funciton import (
 )
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["weighted_swiglu_funciton"]
+
 
 @triton.jit
 def _round_product(value, dtype: tl.constexpr):

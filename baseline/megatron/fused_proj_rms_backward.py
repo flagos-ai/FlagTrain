@@ -62,7 +62,9 @@ except AttributeError:
     pass
 
 OP_NAME = "fused_proj_rms_backward"
-DTYPES = [torch.float16, torch.bfloat16]
+# FP32/FP64 cover the exact-arithmetic and compatibility paths. Re-collect the
+# checked-in NV baseline after changing this list.
+DTYPES = [torch.float16, torch.bfloat16, torch.float32, torch.float64]
 IS_INPLACE = False
 
 # benchmark/megatron/test_fused_proj_rms_backward.py::_BENCHMARK_SHAPES
@@ -139,7 +141,9 @@ def torch_op(x, weight, grad_proj, grad_r, r):
     return torch.autograd.grad(
         (graph["proj"], graph["r"]),
         (graph["x_leaf"], graph["weight_leaf"]),
-        (grad_proj, grad_r),
+        # Megatron main's outputs are fp32 while the harness may hand the
+        # baseline narrow gradients; narrow -> wide is exact.
+        (grad_proj.to(graph["proj"].dtype), grad_r.to(graph["r"].dtype)),
         retain_graph=True,
     )
 
@@ -186,13 +190,25 @@ def key_shape(binding):
 
 def config(binding, dtype):
     M, N, K = binding["shape"]
+    graph = _GRAPH
+    if (
+        graph is not None
+        and graph["x"].dtype == dtype
+        and tuple(graph["x"].shape) == (M, K)
+        and tuple(graph["weight"].shape) == (N, K)
+    ):
+        # ``r`` comes from the forward: Megatron main returns fp32 while 0.17.x
+        # returns the input dtype. Describe the tensor build_inputs produced.
+        r_dtype = graph["r"].dtype
+    else:
+        r_dtype = dtype
     return {
         "inputs": {
             "x": {"shape": [M, K], "dtype": str(dtype)},
             "weight": {"shape": [N, K], "dtype": str(dtype)},
             "grad_proj": {"shape": [M, N], "dtype": str(dtype)},
             "grad_r": {"shape": [M, 1], "dtype": str(dtype)},
-            "r": {"shape": [M, 1], "dtype": str(dtype)},
+            "r": {"shape": [M, 1], "dtype": str(r_dtype)},
         },
         "dims": {"M": M, "N": N, "K": K},
     }

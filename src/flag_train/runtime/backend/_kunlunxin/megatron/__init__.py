@@ -12,7 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fused_sinkhorn import fused_sinkhorn
-from .weighted_swiglu_funciton import weighted_swiglu_funciton
-
-__all__ = ["fused_sinkhorn", "weighted_swiglu_funciton"]
+"""Kunlunxin Megatron operators."""

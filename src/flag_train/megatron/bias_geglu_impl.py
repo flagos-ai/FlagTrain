@@ -33,6 +33,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry, tl_extra_shim
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["bias_geglu_impl"]
+
 logger = logging.getLogger(__name__)
 
 _NUM_WARPS = 4

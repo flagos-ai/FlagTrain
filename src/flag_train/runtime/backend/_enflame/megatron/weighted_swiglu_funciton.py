@@ -25,6 +25,8 @@ from flag_train.runtime import torch_device_fn
 
 from .. import arch_version
 
+__all__ = ["weighted_swiglu_funciton"]
+
 
 # Forward: out = round_y( round_y(silu(gate)) * linear ) * w
 # silu(g) = g * (1 / (1 + exp(-g))) evaluated in fp32 with a single rounding to
