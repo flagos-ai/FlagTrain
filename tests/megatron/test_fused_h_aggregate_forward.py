@@ -26,6 +26,7 @@ is the less accurate side and the tolerances below cover its rounding.
 """
 
 import importlib.metadata
+import math
 import warnings
 
 import pytest
@@ -151,13 +152,30 @@ _TOL = {
     torch.bfloat16: 2e-1,
 }
 
+# A reduction over a handful of outputs can cancel below the rounding noise of
+# its terms: one output may come out near zero while the terms are O(1), which
+# makes the result's own RMS a useless error scale. ``sqrt(n) * RMS(terms)``
+# bounds the reference's term-by-term rounding and, by Cauchy-Schwarz, is never
+# below the result's RMS. Only computed where the term tensor is small; with
+# many outputs the result RMS is already the terms' scale.
+_TERM_SCALE_ELEMENTS = 1 << 22
 
-def _assert_close(res, ref, dtype, tol):
+
+def _reduction_scale(x, h_pre):
+    """``sqrt(n) * RMS`` of ``x * h_pre`` over the reduced (stream) axis."""
+    if x.numel() == 0 or x.numel() > _TERM_SCALE_ELEMENTS:
+        return 0.0
+    terms = x.float() * h_pre.float().unsqueeze(-1)
+    return math.sqrt(x.shape[2]) * terms.pow(2).mean().sqrt().item()
+
+
+def _assert_close(res, ref, dtype, tol, floor=0.0):
     """Compare with the repo ``train_assert_close`` at ``tol`` of the reference's RMS.
 
     The RMS-scaled ``atol`` holds every element to the same budget, which is the
     elementwise form of the relative Frobenius error; the helper adds its
-    standard per-dtype ``rtol`` on top.
+    standard per-dtype ``rtol`` on top. ``floor`` keeps a reduction's scale from
+    collapsing when its outputs cancel.
     """
     assert res.dtype == dtype, (res.dtype, dtype)
     assert res.shape == ref.shape, (res.shape, ref.shape)
@@ -168,7 +186,9 @@ def _assert_close(res, ref, dtype, tol):
         return
     finite = torch.isfinite(ref)
     scale = ref[finite].float().pow(2).mean().sqrt().item() if finite.any() else 0.0
-    utils.train_assert_close(res, ref, dtype, equal_nan=True, atol=tol * scale)
+    utils.train_assert_close(
+        res, ref, dtype, equal_nan=True, atol=tol * max(floor, scale)
+    )
 
 
 def _operands(shape, dtype, h_dtype=None):
@@ -187,7 +207,7 @@ def _check(x, h_pre, dtype):
     # megatron-core in some images predates that cast; apply it here so the
     # comparison is against the current upstream semantics, not the snapshot.
     ref = ref.to(dtype)
-    _assert_close(out, ref, dtype, _TOL[dtype])
+    _assert_close(out, ref, dtype, _TOL[dtype], floor=_reduction_scale(x, h_pre))
     return out
 
 
