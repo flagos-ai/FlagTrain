@@ -23,6 +23,8 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
+__all__ = ["scaled_upper_triang_masked_softmax_backward"]
+
 logger = logging.getLogger(__name__)
 
 _NAME = "scaled_upper_triang_masked_softmax_backward"

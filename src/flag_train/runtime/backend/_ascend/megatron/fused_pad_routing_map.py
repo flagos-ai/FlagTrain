@@ -99,6 +99,8 @@ from flag_train.megatron.fused_pad_routing_map import (
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["fused_pad_routing_map"]
+
 logger = logging.getLogger(__name__)
 
 # A tile is capped by UB -- 192 KB on a 910B4, i.e. 16384 int32 lanes. One lane

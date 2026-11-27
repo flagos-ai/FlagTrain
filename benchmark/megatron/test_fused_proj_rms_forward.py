@@ -50,6 +50,7 @@ import torch
 
 import flag_train
 import flag_train.megatron
+from flag_train.megatron.fused_proj_rms_forward import _resolve_fp32_output
 
 from .. import base
 
@@ -78,12 +79,15 @@ _BENCHMARK_SHAPES = [
     (8192, 4096, 8192),
 ]
 
-# The upstream stage runs on FP16/BF16 activations; FP32 is measured by the
-# correctness suite (it is the exact-arithmetic path) but is not what a training
-# step pays for here.
+# The upstream stage runs on FP16/BF16 activations. FP32 and FP64 are timed on
+# the same shapes to cover the exact-arithmetic and compatibility paths; FP64 is
+# skipped on devices that cannot execute it.
 _DTYPES = [torch.float16]
 if flag_train.runtime.device.support_bf16:
     _DTYPES.append(torch.bfloat16)
+_DTYPES.append(torch.float32)
+if flag_train.runtime.device.support_fp64:
+    _DTYPES.append(torch.float64)
 
 # ---------------------------------------------------------------------------
 # Megatron baseline
@@ -205,10 +209,12 @@ class FusedProjRmsForwardBenchmark(base.GenericBenchmark):
         M, K = x.shape
         N = weight.shape[0]
         element = x.element_size()
+        # Main returns fp32 proj/r; 0.17.x returns the input dtype.
+        out_element = 4 if _resolve_fp32_output(False, None) else element
         io_bytes = x.numel() * element
         io_bytes += weight.numel() * weight.element_size()
-        io_bytes += M * N * element  # proj
-        io_bytes += M * element  # r
+        io_bytes += M * N * out_element  # proj
+        io_bytes += M * out_element  # r
         return io_bytes * 1e-9 / (latency * 1e-3)
 
     def get_tflops(self, op, *args, **kwargs):

@@ -20,6 +20,8 @@ from triton.language.extra import libdevice
 
 from flag_train.runtime import torch_device_fn
 
+__all__ = ["fused_topk_with_score_function"]
+
 _BIG = tl.constexpr(1073741824)
 _EPS = tl.constexpr(1e-20)
 
